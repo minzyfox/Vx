@@ -112,11 +112,20 @@ done
 # A virtualized instance can report two NUMA nodes, honour --membind in its page
 # accounting, and still spread the pages across both sockets underneath. The
 # guest cannot see that directly: /proc/PID/numa_maps reports the guest's belief,
-# not the hypervisor's placement. What gives it away is bandwidth no single
-# socket could deliver -- so compare a one-node bind against interleaving across
-# both. Where locality is real the bind is confined to one socket's memory
-# controllers and interleaving beats it. If the two agree, the bind confined
-# nothing, and neither did anything else measured here.
+# not the hypervisor's placement. What gives it away is that binding makes no
+# difference -- so compare a one-node bind against interleaving across both.
+#
+# The test is that they DIFFER, in either direction. With threads pinned to one
+# node, interleaving sends half the traffic across the interconnect and is
+# slower; on a machine with more threads than one node can feed it can be
+# faster. Which way it goes depends on the workload. What cannot happen on real
+# hardware is no difference at all, because that means the bind confined
+# nothing -- and then neither did anything else measured here.
+#
+# An earlier version of this check expected interleaving to WIN, and reported a
+# genuine two-socket machine as cosmetic on its first run: 121 GB/s bound
+# against 102 interleaved, which is a 15% difference in the direction the check
+# did not allow for.
 #
 # This check exists because a c4.8xlarge measured 97 GB/s bound to one node and
 # 97 GB/s interleaved, when one socket of that part peaks at 68 GB/s. Every
@@ -131,13 +140,15 @@ TOPO_REAL=$(python3 -c '
 import sys
 try:
     b, i = float(sys.argv[1]), float(sys.argv[2])
-    print("no" if b and i and i < b * 1.10 else "yes")
+    # Two-sided: binding must change the answer, whichever way it goes.
+    print("no" if b and i and abs(b - i) / b < 0.10 else "yes")
 except Exception:
     print("unknown")
 ' "${BIND_GBS:-0}" "${INTER_GBS:-0}")
 if [ "$TOPO_REAL" = "no" ]; then
   echo
-  echo "  STOP. Binding to one node is as fast as using both, so the pages are not"
+  echo "  STOP. Binding to one node measures the same as using both, so the pages"
+  echo "  are not"
   echo "  physically confined to a socket and the nodes this machine reports are"
   echo "  cosmetic. Everything above is measuring one undivided pool."
   echo
@@ -146,7 +157,7 @@ if [ "$TOPO_REAL" = "no" ]; then
   echo "  is nothing between the guest and the sockets."
   exit 3
 fi
-echo "  interleaving beats a single-node bind, so the bind confines memory: real."
+echo "  binding changes the answer, so it confines memory to a socket: real."
 echo
 
 # The measured ratio, averaged over both directions so a single asymmetric pair

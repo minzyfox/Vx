@@ -91,7 +91,21 @@ int main(int argc, char **argv) {
   for (int r = 0; r < reps; r++) {
     double t0 = now_s();
     if (is_copy) {
-      memcpy(b, a, bytes);
+      // Chunked and parallel, for the same reason the read loop is: one thread
+      // cannot saturate a socket's memory controllers, so a single-threaded
+      // memcpy measures how many misses one core can keep in flight rather than
+      // what the memory is delivering. Measured single-threaded on a two-socket
+      // Cascade Lake, the remote case came out FASTER than the local one, which
+      // is not a thing memory can do -- it was the giveaway that this kernel was
+      // not measuring bandwidth at all.
+      const size_t chunk = 1u << 20;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (size_t off = 0; off < bytes; off += chunk) {
+        size_t n = (off + chunk <= bytes) ? chunk : bytes - off;
+        memcpy(b + off, a + off, n);
+      }
     } else {
       uint64_t sum = 0;
       const uint64_t *p = (const uint64_t *)a;
