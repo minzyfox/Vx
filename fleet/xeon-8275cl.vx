@@ -13,20 +13,20 @@
 // bare-metal instance, so the topology the guest sees is the topology the
 // hardware has -- there is no hypervisor between them to synthesize it.
 //
-// EVERY FIGURE BELOW IS UNVERIFIED AND WRITTEN FROM THE SKU RATHER THAN FROM THE
-// MACHINE. That is the opposite of how xeon-e5-2666v3.vx was written, and it is
-// a temporary state: the first thing to do on the box is re-read them and
-// replace each `spec:` line with what the hardware says. In order of how much
-// rests on them:
+// Read from the machine on 2026-09-12, not transcribed from the SKU. `lscpu`
+// reports Xeon Platinum 8275CL at 3.00GHz, 24 cores per socket, 2 sockets, 2
+// threads per core; `/proc/meminfo` MemTotal = 197653284 kB; `numactl -H` two
+// nodes at 96323 MB and 96696 MB with SLIT distances 10 local and 21 remote.
 //
-//   numactl -H        node count, per-node size, and the SLIT distances
-//   lscpu             socket count, cores per socket, model name
-//   lscpu -C          LLC size and how many instances of it there are
-//   dmidecode -t 4    the UPI link count, which is the least certain input here
-//   /proc/meminfo     MemTotal, against the 192 GiB the instance is sold as
+// The interconnect figure is measured rather than only derived, which is the
+// thing xeon-e5-2666v3.vx cannot offer for its own. See the note on the UPI edge
+// below: utils/campaign/run_numa_probe.sh measured a remote/local ratio of 2.348
+// against the 2.258 this file predicts, a 4% error, and the absolute bandwidths
+// corroborate the link count as well as the ratio.
 //
-// A figure that survives that pass loses its UNVERIFIED marker. One that does
-// not is a finding, and the file is wrong rather than the machine surprising.
+// The SLIT distances are worth ignoring, incidentally: the virtualized c4.8xlarge
+// reports the same 10 and 21 while having no locality at all. Firmware saying a
+// hop is expensive is not evidence that it is.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,16 +38,24 @@
 // one domain, and reaching it from the other crosses a priced link", which is
 // the same relation node-8gpu.vx declares between two GPUs.
 //
-// spec: UNVERIFIED. c5.metal is sold as 192 GiB across two sockets, so 96 GiB
-// per node. `numactl -H` reports the real per-node size and is what this should
-// become; expect it slightly under 96 GiB once firmware and kernel reservation
-// are taken out, the same gap the E5 file records.
+// spec: `numactl -H` on the box -- node 0 at 96323 MB and node 1 at 96696 MB,
+// so 94 GiB each against the 96 GiB half of what the instance is sold as. 96 GiB
+// is declared rather than the 94 the kernel reports, per fleet/README.md:
+// declared capacity is the device, not the deployment budget, and the ~2 GiB gap
+// is firmware and kernel reservation -- the same class of gap the E5 file
+// records.
 //
-// spec: UNVERIFIED bandwidth, derived rather than quoted. Cascade Lake-SP has 6
-// DDR4 channels per socket at up to 2933 MT/s, so
+// spec: derived and then corroborated. Cascade Lake-SP has 6 DDR4 channels per
+// socket at up to 2933 MT/s, so
 //   6 channels x 2933 MT/s x 8 B = 140.8 GB/s per socket.
-// That is one socket's memory controllers' peak and not an achievable copy
-// rate. It is per node because a node is one socket.
+// That is one socket's memory controllers' peak and not an achievable rate: the
+// probe measured 121 GB/s reading node-local memory with 48 threads, which is
+// 86% of it. Declared at the peak, because that is what the hardware can do and
+// the model is meant to over-predict a real transfer rather than track it.
+//
+// Staying BELOW the peak is the part that matters. A bind that measures above
+// one socket's ceiling is a bind that is not confining anything, which is how
+// the c4.8xlarge gave itself away.
 Memory HBM {
   capacity: 96 GiB, bandwidth: 140 GB/s, managed: explicit, scope: device
 }
@@ -64,19 +72,24 @@ Memory PEER_HBM {
 // The last-level cache. `L2` names the role (last level on die) rather than the
 // level number, which on this part is L3.
 //
-// spec: UNVERIFIED. Cascade Lake-SP carries 1.375 MiB of L3 per core, and this
-// part is 24 cores per socket, so 33 MiB per socket -- but the 8275CL is an AWS
-// custom part and is commonly quoted at 35.75 MiB, which is 26 cores' worth and
-// suggests two cores are present and disabled. `lscpu -C` settles it, and the
-// declared figure should be ONE socket's LLC rather than both, because a tile is
-// resident in one socket's cache and the other socket's copy is a coherence
-// problem rather than extra capacity.
+// spec: `lscpu -C` on the box -- L3, ONE-SIZE 35.8M, ALL-SIZE 71.5M, 11-way, 64 B
+// line, two instances. So 35.8 MiB per socket, and the larger of the two figures
+// the SKU is quoted at: 35.75 MiB is 26 cores' worth of Cascade Lake's 1.375 MiB
+// per core against 24 enabled cores, so two cores are present and disabled.
+//
+// ONE socket's LLC is declared rather than both, because a tile is resident in
+// one socket's cache and the other socket's copy is a coherence problem rather
+// than extra capacity.
+//
+// Written in KiB because 35.75 MiB is not a whole number of MiB and the parser
+// refuses a fractional one -- 35.75 x 1024 = 36608 KiB. `lscpu -C` prints 35.8M,
+// which is its own rounding of the same number.
 //
 // spec: UNVERIFIED bandwidth. Intel publishes no L3 figure for this part; 400
 // GB/s is a placeholder of the right order for a mesh-interconnect LLC on a
 // 24-core die and no claim rests on it.
 Memory L2 {
-  within: Memory::HBM, capacity: 33 MiB, bandwidth: 400 GB/s, managed: cached, scope: device
+  within: Memory::HBM, capacity: 36608 KiB, bandwidth: 400 GB/s, managed: cached, scope: device
 }
 
 // No `SMEM`, for the reason xeon-e5-2666v3.vx sets out at length: the fleet's
@@ -91,21 +104,26 @@ Memory L2 {
 // at least 2x because a memcpy reads and writes and so moves two bytes of
 // traffic per byte copied.
 //
-// THE UPI EDGE IS WHAT THIS FILE EXISTS FOR, and it is the least certain figure
-// in it. Cascade Lake carries UPI at 10.4 GT/s, 2 bytes per transfer, so
-//   10.4 GT/s x 2 B = 20.8 GB/s per link per direction.
-// Platinum parts have three UPI links, and a two-socket system may wire two or
-// three of them between the pair. Three gives 62.4 GB/s; two gives 41.6. This
-// file assumes three, which is the optimistic end, and a bound that is wrong in
-// the optimistic direction is the wrong kind of wrong -- so confirm the link
-// count with `dmidecode -t 4` before trusting any prediction derived from it.
+// THE UPI EDGE IS WHAT THIS FILE EXISTS FOR, and it is now measured rather than
+// assumed. Cascade Lake carries UPI at 10.4 GT/s, 2 bytes per transfer, so
+//   10.4 GT/s x 2 B = 20.8 GB/s per link per direction,
+// and the link count was the open question: three links give 62.4 GB/s, two give
+// 41.6, and this file had to guess three.
 //
-// Against a node's own 140 GB/s that predicts a remote access costs about 2.3x a
-// local one. On two links it would be 3.4x. The measurement settles both the
-// ratio and the link count at once: run utils/campaign/run_numa_probe.sh, which
-// compares its measured ratio against whatever this file declares.
+// The measurement settles it two ways. `lspci` shows three UPI register devices
+// per socket (buses 7a and f3). And the probe measured 51.55 GB/s reading across
+// the link, in both directions, which two links could not carry at all -- 41.6
+// is their ceiling. Three links it is, at 83% of their combined peak.
+//
+// Against a node's own 140 GB/s this predicts a remote access costs 2.258x a
+// local one. The probe measured 2.348x, a 4% error. That is the figure this
+// whole file existed to produce, and it is the first interconnect cost in
+// fleet/ that has been checked against the hardware rather than derived and
+// left alone.
+//
+// Re-run with: utils/campaign/run_numa_probe.sh (MACHINE= defaults to this file).
 Topology Device {
-  // spec: UNVERIFIED. Intel Cascade Lake-SP, as a compute target rather than a host.
+  // spec: `lscpu` on the box -- Intel Cascade Lake-SP, as a compute target rather than a host.
   arch: x86_64,
   memory: Memory::HBM,
   visible: [Memory::HBM, Memory::PEER_HBM, Memory::L2],
