@@ -772,6 +772,13 @@ pub struct SubspaceInfo {
     /// every other field here it is not descriptive: dropping it silently turns
     /// a compile error into a segmentation fault on a GPU (#251, #348).
     pub managed: Option<String>,
+    /// `node: N` -- the NUMA domain this space's memory lives on, when it is one.
+    ///
+    /// Unlike every other field here it does not become an attribute. It replaces the
+    /// `target_topology` the transfer carries, because that integer is the only thing the
+    /// backend receives and `numa_alloc_onnode` needs a node number. See
+    /// `arch::numa_dispatch_id`.
+    pub numa_node: Option<u64>,
 }
 
 /// Runtime helpers the JIT links rather than the module defining: a body that calls one gets a
@@ -851,6 +858,7 @@ pub fn subspaces_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<SubspaceInfo> {
                     }
                     .to_string(),
                 ),
+                numa_node: decl.numa_node,
             }
         })
         .collect();

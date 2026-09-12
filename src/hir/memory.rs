@@ -610,6 +610,7 @@ mod tests {
             scope: None,
             overcommit: false,
             crossing: crate::syntax::Crossing::default(),
+            numa_node: None,
             doc_comment: None,
         }
     }

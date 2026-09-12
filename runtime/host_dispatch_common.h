@@ -157,6 +157,96 @@ inline void vx_describe_arg(int64_t i, int32_t tag, void *arg) {
 
 } // namespace
 
+/// Binding an allocation to the NUMA node the machine model named.
+///
+/// A memory space that declares `node: N` is dispatched with a banded id rather than the hash of
+/// its name (`arch::numa_dispatch_id`), because a hash cannot be turned back into a node number
+/// and `mbind` needs one. THIS RANGE MIRRORS src/arch.rs AND THE TWO MUST CHANGE TOGETHER.
+///
+/// The syscall is used directly rather than libnuma, so the runtime gains no build dependency and
+/// no link flag: `mbind` is a kernel interface, and libnuma is a convenience wrapper over it.
+/// Everything here is Linux-only and compiles out elsewhere -- macOS has one memory and nothing to
+/// choose between.
+#define VX_NUMA_DISPATCH_BASE 1000u
+#define VX_NUMA_MAX_NODE 999u
+
+/// The node an id names, or -1 if the id is not a NUMA one.
+static int vx_numa_node_of(uint32_t topology_id) {
+  if (topology_id >= VX_NUMA_DISPATCH_BASE &&
+      topology_id <= VX_NUMA_DISPATCH_BASE + VX_NUMA_MAX_NODE) {
+    return (int)(topology_id - VX_NUMA_DISPATCH_BASE);
+  }
+  return -1;
+}
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+
+/// One page in front of every NUMA allocation, holding the mapping's length.
+///
+/// `munmap` needs the size and `vx_plugin_free` is handed only a pointer. A side table would work
+/// and would need a lock on every allocation and free; a header costs one page and no
+/// synchronization. The page also keeps the returned pointer page-aligned, which is what `mbind`
+/// wants anyway.
+#define VX_NUMA_HEADER 4096
+
+/// Map `bytes` and bind the mapping to `node`. `*bound` says whether the BINDING took; the
+/// mapping either happened or the call returns null. Keeping those two outcomes apart is what
+/// lets the free path stay unambiguous: every allocation for a NUMA-banded id is an mmap with a
+/// header, whether or not the bind succeeded, so the free always unmaps and never has to guess
+/// which allocator produced a pointer.
+static void *vx_numa_alloc(size_t bytes, int node, int *bound) {
+  *bound = 0;
+  size_t total = bytes + VX_NUMA_HEADER;
+  void *base = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED) {
+    return nullptr;
+  }
+
+  // A bitmask over nodes, wide enough for the largest node the band can carry.
+  unsigned long mask[VX_NUMA_MAX_NODE / (8 * sizeof(unsigned long)) + 1] = {0};
+  mask[node / (int)(8 * sizeof(unsigned long))] |=
+      1UL << (node % (int)(8 * sizeof(unsigned long)));
+
+  // MPOL_BIND rather than MPOL_PREFERRED: the model said this memory is on that node, and a
+  // policy that silently falls back to another one would make the declaration advisory. If the
+  // node cannot satisfy it the allocation should fail loudly rather than land somewhere else and
+  // be measured as though it had not.
+  long rc = syscall(__NR_mbind, base, total, MPOL_BIND, mask,
+                    (unsigned long)(sizeof(mask) * 8), MPOL_MF_MOVE);
+  // A failed bind keeps the mapping: the memory is valid and merely unplaced, and unmapping it
+  // here would turn a performance outcome into an allocation failure.
+  *bound = (rc == 0);
+
+  *(size_t *)base = total;
+  return (char *)base + VX_NUMA_HEADER;
+}
+
+static void vx_numa_free(void *ptr) {
+  char *base = (char *)ptr - VX_NUMA_HEADER;
+  size_t total = *(size_t *)base;
+  munmap(base, total);
+}
+#else
+static void *vx_numa_alloc(size_t bytes, int node, int *bound) {
+  (void)bytes;
+  (void)node;
+  *bound = 0;
+  return nullptr;
+}
+static void vx_numa_free(void *ptr) { (void)ptr; }
+#endif
+
 extern "C" {
 
 /// Allocate in this backend's memory and copy into it.
@@ -181,6 +271,49 @@ void *vx_plugin_alloc_and_transfer(size_t bytes, void *host_ptr,
   }
   if (bytes == 0) {
     return nullptr;
+  }
+
+  // A space that named a NUMA node gets its bytes on that node, rather than wherever the first
+  // touch happens to fall. This is the whole difference between the model pricing a placement and
+  // the placement actually happening.
+  //
+  // Two failures, kept apart because they mean different things. Failing to MAP is an ordinary
+  // out-of-memory and aborts, like the fallback below. Failing to BIND is not an error at all --
+  // the node may be offline, the kernel may have no NUMA support, or this may not be Linux --
+  // and the program is correct in every one of those cases, only unplaced. It warns rather than
+  // aborting, because a machine with one memory has nothing this could have been faster than.
+  int numa_node = vx_numa_node_of(topology_id);
+  if (numa_node >= 0) {
+    int bound = 0;
+    void *placed = vx_numa_alloc(bytes, numa_node, &bound);
+    if (!placed) {
+      fprintf(stderr,
+              "[Vx " VX_BACKEND_NAME "] FATAL: could not map %zu bytes for NUMA node %d\n",
+              bytes, numa_node);
+      abort();
+    }
+    if (!bound) {
+      // The mapping is valid and unplaced. Said once, because a run expected to be placed must
+      // not quietly read as one that was -- the measurement would be of the wrong thing, and
+      // nothing else about the program would look different.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        fprintf(stderr,
+                "[Vx " VX_BACKEND_NAME "] WARNING: could not bind an allocation to NUMA node %d; "
+                "the memory is unplaced. The program is correct and the placement the machine "
+                "model declared is not in effect.\n",
+                numa_node);
+      }
+    }
+    if (host_ptr) {
+      memcpy(placed, host_ptr, bytes);
+    }
+    if (vx_verbose()) {
+      fprintf(stderr, "[Vx " VX_BACKEND_NAME "] staged %zu bytes on NUMA node %d%s\n", bytes,
+              numa_node, bound ? "" : " (bind failed; unplaced)");
+    }
+    return placed;
   }
 
   // Rounded up because aligned_alloc requires a size that is a multiple of the
@@ -214,6 +347,22 @@ void vx_plugin_free(void *device_ptr, uint32_t topology_id) {
     return;
   }
   vx_routing_refuse_handle("a free", device_ptr, topology_id);
+  // Paired with the allocator above by the same id that chose it. A NUMA allocation is an
+  // `mmap` with a header and has to be unmapped; handing it to `free` would be the same class of
+  // error the comment on this function already warns about for device memory.
+  //
+  // The id alone decides, and that is a claim about every allocator in this file rather than
+  // about this function. Each one that can be handed a NUMA-banded id -- the staging transfer
+  // and the peer handoff -- maps with a header, so a banded id always means an mmap. A failed
+  // MAPPING aborts and a failed BIND keeps the mapping, so there is no third outcome.
+  //
+  // An earlier version of this comment asserted the same thing while `vx_plugin_transfer_peer`
+  // still returned `malloc` memory, and the first program to transfer between two domains
+  // aborted here. Anything added later that allocates for a banded id has to map too.
+  if (vx_numa_node_of(topology_id) >= 0) {
+    vx_numa_free(device_ptr);
+    return;
+  }
   free(device_ptr);
 }
 
@@ -333,8 +482,29 @@ void *vx_plugin_transfer_peer(void *src_device_ptr, uint32_t src_topology_id,
   // against (#347).
   vx_routing_refuse_handle("a peer handoff", src_device_ptr, src_topology_id);
   (void)src_topology_id;
-  (void)dst_topology_id;
-  void *dst = malloc(bytes);
+
+  // A handoff INTO a NUMA domain places the destination there, for the same reason a staging
+  // transfer does: the model named a node and the bytes should end up on it. `transfer(x,
+  // Memory::PEER_HBM)` between two domains of one host is the ordinary way to say "move this to
+  // the other socket", and a `malloc` here would leave it wherever the allocator felt like.
+  //
+  // It is also what keeps `vx_plugin_free` decidable. The free is handed the destination's id
+  // and nothing else, so every allocation carrying a NUMA-banded id has to come from the same
+  // allocator -- otherwise the free reads a header that was never written. That is not a
+  // hypothetical: this function returned `malloc` memory while the free saw a banded id, and the
+  // result was a SIGABRT inside `vx_plugin_free` on the first two-domain program that ran.
+  int dst_node = vx_numa_node_of(dst_topology_id);
+  void *dst = nullptr;
+  if (dst_node >= 0) {
+    int bound = 0;
+    dst = vx_numa_alloc(bytes, dst_node, &bound);
+    if (dst && vx_verbose()) {
+      fprintf(stderr, "[Vx " VX_BACKEND_NAME "] handed %zu bytes to NUMA node %d%s\n", bytes,
+              dst_node, bound ? "" : " (bind failed; unplaced)");
+    }
+  } else {
+    dst = malloc(bytes);
+  }
   if (dst && src_device_ptr) {
     memcpy(dst, src_device_ptr, bytes);
   }

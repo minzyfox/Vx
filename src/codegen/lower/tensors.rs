@@ -198,7 +198,21 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
 
         // Map memory space to its canonical topology's dispatch id (single source of truth
         // in `arch`, adjacent to `topology_dispatch_id` so the two mappings stay in sync).
-        let target_topology_id = crate::arch::memory_space_dispatch_id(&self.space);
+        //
+        // A space that declares `node: N` is given its NUMA band id instead. The name-derived
+        // id says which space; the backend needs to know which NODE, and cannot recover that
+        // from an FNV hash. This is the one place the two differ, and it is deliberate: the
+        // hash identifies a space, and a NUMA domain has to be acted on rather than identified.
+        //
+        // A node too large for the band keeps the hash, so the allocation lands wherever
+        // first-touch puts it -- the behaviour before any of this, rather than an id that would
+        // alias onto a slice.
+        let target_topology_id = gen
+            .memories
+            .get(&self.space)
+            .and_then(|d| d.numa_node)
+            .and_then(crate::arch::numa_dispatch_id)
+            .unwrap_or_else(|| crate::arch::memory_space_dispatch_id(&self.space));
 
         let top_attr = IntegerAttribute::new(gen.i32_ty, target_topology_id as i64).into();
 

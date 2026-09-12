@@ -421,6 +421,7 @@ impl<'a> Parser<'a> {
         let mut bandwidth: Option<crate::syntax::Bandwidth> = None;
         let mut clock_hz: Option<u64> = None;
         let mut replicas: Option<u64> = None;
+        let mut numa_node: Option<u64> = None;
         let mut managed = crate::syntax::Management::default();
         let mut granule: Option<crate::syntax::ByteSize> = None;
         let mut scope: Option<crate::syntax::Scope> = None;
@@ -473,6 +474,7 @@ impl<'a> Parser<'a> {
                 "bandwidth" => bandwidth = Some(self.parse_bandwidth()?),
                 "clock" => clock_hz = Some(self.parse_clock()?),
                 "replicas" => replicas = Some(self.parse_count()?),
+                "node" => numa_node = Some(self.parse_numa_node()?),
                 "crossing" => {
                     let kind = match &self.advance().kind {
                         TokenType::Identifier(s) => s.to_string(),
@@ -531,6 +533,7 @@ impl<'a> Parser<'a> {
             bandwidth,
             clock_hz,
             replicas,
+            numa_node,
             managed,
             granule,
             scope,
@@ -610,6 +613,25 @@ impl<'a> Parser<'a> {
         })?;
         if n == 0 {
             return Err(self.error("`replicas:` must be positive"));
+        }
+        Ok(n)
+    }
+
+    /// A NUMA node number. Unlike `replicas:`, zero is valid and ordinary -- node 0 is the
+    /// first node on every machine -- so this cannot borrow `parse_count`, whose whole job is
+    /// to reject it. The bound is the dispatch band's, not the hardware's: an id outside it
+    /// would alias onto a slice's.
+    fn parse_numa_node(&mut self) -> ParseResult<'a, u64> {
+        let text = self.parse_number_text("a NUMA node number")?;
+        let n: u64 = text
+            .parse()
+            .map_err(|_| self.error(&format!("`node:` expects a whole number, got '{}'", text)))?;
+        if n > crate::arch::NUMA_DISPATCH_MAX_NODE {
+            return Err(self.error(&format!(
+                "`node: {}` is out of range; the largest node a dispatch id can carry is {}",
+                n,
+                crate::arch::NUMA_DISPATCH_MAX_NODE
+            )));
         }
         Ok(n)
     }

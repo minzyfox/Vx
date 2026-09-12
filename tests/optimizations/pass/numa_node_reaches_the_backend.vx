@@ -1,0 +1,43 @@
+//===- numa_node_reaches_the_backend.vx - Vx Compiler -----------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A memory space that declares `node: N` reaches the backend as a number the
+// backend can act on.
+//
+// Every other property of a space is checked against the program and then
+// described to the backend. This one has to be OBEYED: `mbind` takes a node
+// number, and there is nowhere else for it to come from. A space is otherwise
+// identified by an FNV hash of its name, and a hash cannot be turned back into
+// a node -- so a space declaring a node is dispatched by a banded id instead,
+// `arch::NUMA_DISPATCH_BASE + N`.
+//
+// That is what these checks pin: node 0 becomes 1000 and node 1 becomes 1001,
+// carried on the `vx.transfer` the backend reads. The `space =` attribute is
+// checked alongside so a renumbering cannot quietly swap which node a space
+// gets -- the pair is the assertion, not either line alone.
+//
+// Both codegen paths, because they compute the id in different places: the AST
+// path in lower/tensors.rs and the flat path in flat/emit/parallel.rs, from a
+// `SubspaceInfo` built out of the same declaration. Two implementations of one
+// rule is exactly the shape that drifts.
+//
+// REQUIRES: flat-codegen
+// RUN: vxc %s --host default --machine fleet/xeon-8275cl.vx --action emit-mlir -o /dev/null 2>&1 | FileCheck %s
+// RUN: vxc %s --legacy-codegen --host default --machine fleet/xeon-8275cl.vx --action emit-mlir -o /dev/null 2>&1 | FileCheck %s
+// CHECK: vx.transfer
+// CHECK-SAME: target_topology = 1000
+// CHECK-SAME: space = "HBM"
+// CHECK: vx.transfer
+// CHECK-SAME: target_topology = 1001
+// CHECK-SAME: space = "PEER_HBM"
+
+fn main() -> i32 {
+  let t : Tensor<f32, [64, 64]> = Tensor<f32, [64, 64]>::uninit();
+  let near = transfer(t, Memory::HBM);
+  let far = transfer(near, Memory::PEER_HBM);
+  return 0;
+}

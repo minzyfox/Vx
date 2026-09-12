@@ -274,9 +274,40 @@ fn fnv32(s: &str) -> u32 {
 }
 
 /// The lowest id a declared name can be given. Everything below is spoken for: the built-in
-/// topologies and their canonical memory spaces occupy 0..999 in hundred-wide bands, and slices
-/// occupy 2000..2999.
+/// topologies and their canonical memory spaces occupy 0..999 in hundred-wide bands, NUMA
+/// domains occupy 1000..1999, and slices occupy 2000..2999.
 pub const CUSTOM_DISPATCH_ID_BASE: i32 = 3000;
+
+/// The band a memory space declaring `node: N` is given, so a backend can decode WHICH node it
+/// is rather than only which space.
+///
+/// Every other id here answers "what kind of thing is this". This one has to answer "where",
+/// because the backend has to act on it: `numa_alloc_onnode` takes a node number and there is
+/// nowhere else for it to come from. A name cannot carry it -- names reach the backend as an
+/// FNV hash by design, and two domains of one machine are otherwise indistinguishable.
+///
+/// 1000..1999 was the old declared-name band, vacated when that moved to 3000 because 1000
+/// slots collided constantly. A node number needs three digits and will not.
+pub const NUMA_DISPATCH_BASE: i32 = 1000;
+
+/// The largest node number the band can carry. Machines with more than 1000 NUMA domains do
+/// not exist; if one ever does, this refuses rather than aliasing onto a slice id.
+pub const NUMA_DISPATCH_MAX_NODE: u64 = 999;
+
+/// The dispatch id for a space on NUMA node `node`, or `None` when the node is out of band.
+pub fn numa_dispatch_id(node: u64) -> Option<i32> {
+    (node <= NUMA_DISPATCH_MAX_NODE).then(|| NUMA_DISPATCH_BASE + node as i32)
+}
+
+/// The NUMA node an id names, or `None` if it is not in the band. The inverse of
+/// [`numa_dispatch_id`], and `runtime/host_dispatch_common.h` decodes the same range -- the two
+/// must change together.
+pub fn numa_node_of_dispatch_id(id: i32) -> Option<u64> {
+    let node = id.checked_sub(NUMA_DISPATCH_BASE)?;
+    (0..=NUMA_DISPATCH_MAX_NODE as i32)
+        .contains(&node)
+        .then_some(node as u64)
+}
 
 /// How many ids a declared name can be given: `CUSTOM_DISPATCH_ID_BASE..=i32::MAX`.
 ///
@@ -1361,6 +1392,7 @@ mod tests {
             scope,
             overcommit: false,
             crossing: crate::syntax::Crossing::default(),
+            numa_node: None,
             doc_comment: None,
         }
     }

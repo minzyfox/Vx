@@ -57,7 +57,7 @@
 // one socket's ceiling is a bind that is not confining anything, which is how
 // the c4.8xlarge gave itself away.
 Memory HBM {
-  capacity: 96 GiB, bandwidth: 140 GB/s, managed: explicit, scope: device
+  capacity: 96 GiB, bandwidth: 140 GB/s, managed: explicit, scope: device, node: 0
 }
 
 // node1's half. A space of its own, because that is the whole content of NUMA:
@@ -65,8 +65,12 @@ Memory HBM {
 // bytes does not.
 //
 // spec: as `HBM` above -- the two sockets are the same part.
+//
+// `node: 1` is what a backend acts on. Everything else here lets the compiler admit or refuse
+// a placement; this says where to put the bytes, and without it an admitted placement lands
+// wherever the first touch happened to be.
 Memory PEER_HBM {
-  capacity: 96 GiB, bandwidth: 140 GB/s, managed: explicit, scope: device
+  capacity: 96 GiB, bandwidth: 140 GB/s, managed: explicit, scope: device, node: 1
 }
 
 // The last-level cache. `L2` names the role (last level on die) rather than the

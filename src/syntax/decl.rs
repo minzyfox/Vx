@@ -273,6 +273,17 @@ pub struct MemoryDecl {
     /// walk through it sums its legs or takes the slowest. Defaults to `sequenced`,
     /// which is the pre-existing behaviour.
     pub crossing: Crossing,
+    /// `node: 1` -- the NUMA node this space's memory physically lives on.
+    ///
+    /// The one field here a backend has to ACT on rather than check against. Every other
+    /// property describes the space so the compiler can admit or refuse a placement; this one
+    /// says where to put the bytes, and a runtime that ignores it hands back memory on
+    /// whichever node happened to fault first. The space name cannot carry it: a name reaches
+    /// the backend as a hash, and two nodes of one machine are otherwise indistinguishable.
+    ///
+    /// `None` means the space is not a NUMA domain, which is every space on every accelerator
+    /// in fleet/ -- a GPU has one memory and nothing to choose between.
+    pub numa_node: Option<u64>,
     pub doc_comment: Option<String>,
 }
 

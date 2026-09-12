@@ -449,6 +449,11 @@ impl CompilerDriver {
                     scope: None,
                     overcommit: false,
                     crossing: crate::syntax::Crossing::default(),
+                    // `--host default` describes the machine compiling this, and which NUMA
+                    // node its DRAM sits on is not a property of that machine -- it is a
+                    // property of an allocation nobody has made yet. A host file that wants
+                    // to name its domains declares them itself.
+                    numa_node: None,
                     doc_comment: Some(
                         "the machine this was compiled on (--host default)".to_string(),
                     ),

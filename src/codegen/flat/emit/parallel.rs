@@ -46,7 +46,18 @@ impl FnEmit<'_> {
             (srcty, dstty, Some(elem.clone()), Some(shape.clone()))
         };
         let n = format!("%v{idx}");
-        let mut attrs = format!("target_topology = {} : i32", ins.imm);
+        // A space declaring `node: N` is dispatched by its NUMA band id rather than by the hash
+        // of its name. The hash says which space; the backend has to know which NODE, and cannot
+        // recover a node number from a hash. Copied out rather than held, so the descriptor's
+        // borrow ends before the bump allocation below takes `&mut self`.
+        let numa_target = self
+            .ctx
+            .subspaces
+            .get(&ins.imm)
+            .and_then(|d| d.numa_node)
+            .and_then(crate::arch::numa_dispatch_id);
+        let target = numa_target.map(|i| i as u64).unwrap_or(ins.imm);
+        let mut attrs = format!("target_topology = {} : i32", target);
         if let Some(desc) = self.ctx.subspaces.get(&ins.imm) {
             // Descriptor attrs, in the AST path's emission order (MLIR sorts on print, so the
             // final parsed form is byte-identical regardless of the order emitted here).
