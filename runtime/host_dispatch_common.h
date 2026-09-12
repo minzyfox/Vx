@@ -180,6 +180,11 @@ static int vx_numa_node_of(uint32_t topology_id) {
 }
 
 #if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -198,6 +203,9 @@ static int vx_numa_node_of(uint32_t topology_id) {
 /// synchronization. The page also keeps the returned pointer page-aligned, which is what `mbind`
 /// wants anyway.
 #define VX_NUMA_HEADER 4096
+
+static void vx_numa_registry_record(void *ptr, size_t bytes, int node);
+static void vx_numa_registry_forget(void *ptr);
 
 /// Map `bytes` and bind the mapping to `node`. `*bound` says whether the BINDING took; the
 /// mapping either happened or the call returns null. Keeping those two outcomes apart is what
@@ -235,7 +243,114 @@ static void *vx_numa_alloc(size_t bytes, int node, int *bound) {
 static void vx_numa_free(void *ptr) {
   char *base = (char *)ptr - VX_NUMA_HEADER;
   size_t total = *(size_t *)base;
+  vx_numa_registry_forget(ptr);
   munmap(base, total);
+}
+
+/// Which node each live placed allocation is on.
+///
+/// The allocations already know -- the node is implied by the id that made them -- but a
+/// DISPATCH does not: `vx_plugin_dispatch_async` is handed argument pointers and a payload, and
+/// the payload's `topo=` names the topology the kernel spawned on, which on a host is
+/// `Topology::CPU` and says nothing about a socket. So the node has to be recovered from the
+/// arguments, and that means remembering where each one went.
+///
+/// Small and linear on purpose: a program has a handful of placed tiles, and both the insert and
+/// the lookup happen once per transfer and once per dispatch. Neither is on a path where a hash
+/// map would repay its own complexity.
+struct vx_numa_entry {
+  void *ptr;
+  size_t bytes;
+  int node;
+};
+static vx_numa_entry vx_numa_table[256];
+static size_t vx_numa_table_len = 0;
+static pthread_mutex_t vx_numa_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void vx_numa_registry_record(void *ptr, size_t bytes, int node) {
+  pthread_mutex_lock(&vx_numa_table_lock);
+  if (vx_numa_table_len < sizeof(vx_numa_table) / sizeof(vx_numa_table[0])) {
+    vx_numa_table[vx_numa_table_len++] = {ptr, bytes, node};
+  }
+  // Overflowing is not an error and must not be fatal: the allocation is placed either way, and
+  // the only thing lost is the dispatch's ability to follow it. A program with more than 256 live
+  // placed tiles gets correct results and unpinned threads.
+  pthread_mutex_unlock(&vx_numa_table_lock);
+}
+
+static void vx_numa_registry_forget(void *ptr) {
+  pthread_mutex_lock(&vx_numa_table_lock);
+  for (size_t i = 0; i < vx_numa_table_len; i++) {
+    if (vx_numa_table[i].ptr == ptr) {
+      vx_numa_table[i] = vx_numa_table[vx_numa_table_len - 1];
+      vx_numa_table_len--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&vx_numa_table_lock);
+}
+
+/// The node a pointer was placed on, or -1 if it was not one of ours. Exact rather than a guess:
+/// only pointers this file placed are in the table, so an ordinary heap pointer answers -1 and
+/// nothing reads a header it does not have.
+static int vx_numa_registry_node_of(void *ptr) {
+  int node = -1;
+  pthread_mutex_lock(&vx_numa_table_lock);
+  for (size_t i = 0; i < vx_numa_table_len; i++) {
+    if (vx_numa_table[i].ptr == ptr) {
+      node = vx_numa_table[i].node;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&vx_numa_table_lock);
+  return node;
+}
+
+/// Pin the calling thread to the CPUs of `node`, read from sysfs rather than libnuma.
+///
+/// Best effort throughout: a machine without the sysfs entry, or a thread whose affinity is
+/// already constrained by something outside this process, keeps whatever it had. Being unable to
+/// pin is not an error -- the kernel still runs and reads the same bytes, more slowly.
+static bool vx_numa_pin_to_node(int node) {
+  char path[128];
+  snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return false;
+  }
+  char list[1024];
+  if (!fgets(list, sizeof(list), f)) {
+    fclose(f);
+    return false;
+  }
+  fclose(f);
+
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  // "0-23,48-71" -- ranges and singletons, comma separated.
+  const char *p = list;
+  while (*p) {
+    int lo = 0, hi = 0, consumed = 0;
+    if (sscanf(p, "%d-%d%n", &lo, &hi, &consumed) == 2) {
+    } else if (sscanf(p, "%d%n", &lo, &consumed) == 1) {
+      hi = lo;
+    } else {
+      break;
+    }
+    for (int c = lo; c <= hi && c < CPU_SETSIZE; c++) {
+      CPU_SET(c, &set);
+    }
+    p += consumed;
+    if (*p == ',') {
+      p++;
+    } else {
+      break;
+    }
+  }
+  if (CPU_COUNT(&set) == 0) {
+    return false;
+  }
+  return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
 #else
 static void *vx_numa_alloc(size_t bytes, int node, int *bound) {
@@ -245,6 +360,19 @@ static void *vx_numa_alloc(size_t bytes, int node, int *bound) {
   return nullptr;
 }
 static void vx_numa_free(void *ptr) { (void)ptr; }
+static void vx_numa_registry_record(void *ptr, size_t bytes, int node) {
+  (void)ptr;
+  (void)bytes;
+  (void)node;
+}
+static int vx_numa_registry_node_of(void *ptr) {
+  (void)ptr;
+  return -1;
+}
+static bool vx_numa_pin_to_node(int node) {
+  (void)node;
+  return false;
+}
 #endif
 
 extern "C" {
@@ -305,6 +433,9 @@ void *vx_plugin_alloc_and_transfer(size_t bytes, void *host_ptr,
                 "model declared is not in effect.\n",
                 numa_node);
       }
+    }
+    if (bound) {
+      vx_numa_registry_record(placed, bytes, numa_node);
     }
     if (host_ptr) {
       memcpy(placed, host_ptr, bytes);
@@ -374,6 +505,68 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
   if (vx_routing_try_dispatch(binary_payload, payload_size, device_args,
                               arg_tags, num_args)) {
     return 1;
+  }
+
+  // Run where the data is.
+  //
+  // The outlined kernel is one `ffi_call` on this thread -- there is no pool to spread -- so if
+  // its arguments were placed on a node, this thread should be on that node too. Otherwise the
+  // placement bought nothing: the bytes are local to a socket the thread is not on, and every
+  // access crosses the interconnect exactly as it would have unplaced.
+  //
+  // Measured single-threaded on a two-socket c5.metal, reading 2 GiB: 12.7-13.8 GB/s local
+  // against 8.7-9.0 remote, so this is worth about 1.5x on memory-bound work. The larger figure
+  // a placed multi-threaded run reaches (242 GB/s against 180 interleaved) is not available
+  // here and will not be until the host backend runs a kernel on more than one thread.
+  //
+  // Whichever node holds the most placed bytes wins, because a kernel reading two tiles on
+  // different nodes has to be somewhere and the bigger one is the better guess. Arguments that
+  // were never placed do not vote.
+  {
+    // An argument is a memref DESCRIPTOR, not the data. The placed pointer is its aligned base,
+    // one indirection in -- and a slot argument holds the descriptor itself by reference, so it
+    // is two. Looking the descriptor up in the registry finds nothing, which is exactly what
+    // happened the first time this ran: every transfer placed correctly and the dispatch pinned
+    // nothing, with no error anywhere to say why.
+    size_t by_node[VX_NUMA_MAX_NODE + 1] = {0};
+    bool any = false;
+    for (int64_t i = 0; i < num_args; ++i) {
+      if (!device_args || !device_args[i]) {
+        continue;
+      }
+      if (VX_ABI_KIND(arg_tags[i]) != VX_ABI_KIND_MEMREF) {
+        continue;
+      }
+      const void *desc = device_args[i];
+      if (VX_ABI_IS_SLOT(arg_tags[i])) {
+        desc = *(void *const *)desc;
+        if (!desc) {
+          continue;
+        }
+      }
+      int nd = vx_numa_registry_node_of(vx_memref_aligned(desc));
+      if (nd >= 0 && (uint32_t)nd <= VX_NUMA_MAX_NODE) {
+        by_node[nd] += 1;
+        any = true;
+      }
+    }
+    // An opt-out, because a process that manages its own affinity should not have it changed
+    // underneath it -- a benchmark harness pinning threads itself, or a caller running several
+    // Vx dispatches on a thread it placed deliberately. It is also how the effect of this is
+    // measured at all: the same binary, one variable.
+    if (any && !getenv("VX_NUMA_NO_AFFINITY")) {
+      int best = 0;
+      for (uint32_t nd = 1; nd <= VX_NUMA_MAX_NODE; nd++) {
+        if (by_node[nd] > by_node[best]) {
+          best = (int)nd;
+        }
+      }
+      bool pinned = vx_numa_pin_to_node(best);
+      if (vx_verbose()) {
+        fprintf(stderr, "[Vx " VX_BACKEND_NAME "] %s to NUMA node %d for this dispatch\n",
+                pinned ? "pinned" : "could NOT pin", best);
+      }
+    }
   }
 
   if (vx_verbose()) {
@@ -498,6 +691,9 @@ void *vx_plugin_transfer_peer(void *src_device_ptr, uint32_t src_topology_id,
   if (dst_node >= 0) {
     int bound = 0;
     dst = vx_numa_alloc(bytes, dst_node, &bound);
+    if (dst && bound) {
+      vx_numa_registry_record(dst, bytes, dst_node);
+    }
     if (dst && vx_verbose()) {
       fprintf(stderr, "[Vx " VX_BACKEND_NAME "] handed %zu bytes to NUMA node %d%s\n", bytes,
               dst_node, bound ? "" : " (bind failed; unplaced)");
