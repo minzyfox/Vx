@@ -45,6 +45,12 @@ is admitted against one of them, not their sum.
 **`granule`** — the allocation quantum. A 1 KiB granule means a 100-byte tensor occupies 1 KiB, and
 admission rounds accordingly.
 
+**`node`** — which NUMA domain of the host this space's memory physically is. The only field here a
+backend *acts* on rather than checks against: a placement into a space that declares one is bound
+to that node, and a dispatch reading it pins itself there. Absent on every accelerator in `fleet/`,
+because a GPU has one memory and nothing to choose between. Zero is a real node rather than an
+absence. See [NUMA and the host's memory domains](numa.md).
+
 ## Units are exact
 
 SI prefixes are decimal and IEC prefixes are binary:

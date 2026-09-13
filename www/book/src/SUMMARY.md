@@ -25,6 +25,7 @@
 - [Machine files](machine-files.md)
 - [Carrying facts across boundaries](correlation.md)
 - [Writing a flash attention kernel](flash-attention.md)
+- [NUMA and the host's memory domains](numa.md)
 
 # Reference
 
