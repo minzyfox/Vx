@@ -107,8 +107,10 @@ that is a number you can go and falsify.</p>
 <p>We started on a <code>c4.8xlarge</code>, because it is the exact part the machine file describes:
 a dual-socket Xeon E5-2666 v3. Everything checked out. <code>lscpu</code> matched. <code>numactl -H</code>
 reported two nodes with the right CPU lists. The ACPI distance table declared 10 for local and 21 for
-remote. And <code>/proc/PID/numa_maps</code> confirmed that binding an allocation to a node put
-<em>every single page</em> there.</p>
+remote. <code>/proc/PID/numa_maps</code> confirmed that binding an allocation to a node put
+<em>every single page</em> there — and so did <code>move_pages()</code>, which is the kernel's own
+answer to the question "which node is this page on", reporting 64 of 64 probed pages on the node we
+asked for, in both directions.</p>
 
 <p>Then the measurements came back:</p>
 
@@ -126,10 +128,18 @@ that link cannot exceed 38.4.</li>
 <li>Binding to one node measured the same as interleaving across both.</li>
 </ul>
 
-<p>The guest's NUMA topology is cosmetic. Xen synthesizes the firmware tables, the pages are spread
-across both sockets whatever the guest is told, and <code>numa_maps</code> reports the guest's own
-page accounting rather than the hypervisor's placement. <strong>Every verification step passed while
-the thing being verified was fiction.</strong></p>
+<p>The guest's NUMA topology is cosmetic. Xen synthesizes the firmware tables, and the pages are
+spread across both sockets whatever the guest is told. The kernel is not lying: it is answering
+truthfully about <em>guest</em> nodes, and those are the thing that is not backed by locality. But
+the practical effect is worse than a lie, because the answer is indistinguishable from a correct
+one — <code>move_pages()</code> reports the same 64 of 64 on a <code>c5.metal</code> where the
+placement is real and a remote read costs 2.35&times;, and on this machine where it costs nothing
+at all. <strong>Every verification step passed while the thing being verified was fiction.</strong></p>
+
+<p>We checked it was not one unlucky instance. A second <code>c4.8xlarge</code>, provisioned
+separately on a different host, gives the same picture: reads of 98.9, 98.0, 98.0 and 99.1 GB/s
+across the four pairs, pointer-chase latencies within 1.5% of each other, and a single-node bind
+measuring 99.4 against 96.7 interleaved. It is policy, not placement.</p>
 
 <p>The lesson is not about AWS. It is that a check and the thing it checks are not the same thing,
 and the only evidence that survived here was a rate the hardware could not produce. So the tooling

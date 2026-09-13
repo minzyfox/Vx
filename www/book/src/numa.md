@@ -112,13 +112,17 @@ On a `c5.metal` the model predicts 2.258 and the hardware gives 2.348, a 4% erro
 
 ## The probe refuses some machines, and that is the point
 
-A virtualized instance can report two NUMA nodes, honour `--membind` in its page accounting, and
-still spread the pages across both sockets underneath. `/proc/PID/numa_maps` will not tell you:
-it reports the guest's own accounting rather than the hypervisor's placement.
+A virtualized instance can report two NUMA nodes, honour `--membind`, and still spread the pages
+across both sockets underneath. Neither `/proc/PID/numa_maps` nor `move_pages()` will tell you.
+Both answer truthfully about *guest* nodes, and it is the guest nodes that are not backed by
+locality — `move_pages()` reports 64 of 64 probed pages on the requested node on a `c5.metal` where
+a remote read really does cost 2.35×, and the identical 64 of 64 on a `c4.8xlarge` where it costs
+nothing. The kernel's own placement query cannot separate the two.
 
-An AWS `c4.8xlarge` does exactly this. Its CPU lists, node sizes and ACPI distance table all look
-right, and then all four pairs measure identically — at a bandwidth **above what one socket can
-deliver**, which is the only thing in the whole picture that cannot be explained away.
+An AWS `c4.8xlarge` does exactly this, on two separately provisioned instances. CPU lists, node
+sizes and ACPI distance table all look right, and then all four pairs measure identically — at a
+bandwidth **above what one socket can deliver**, which is the only thing in the whole picture that
+cannot be explained away.
 
 So the probe tests the machine before it reports anything: bind to one node, interleave across
 both, and if the two agree within 10% then the bind confined nothing and every number above it is
