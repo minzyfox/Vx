@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The NUMA that wasn't there — Vx</title>
+<meta name="description" content="Modelling a CPU's NUMA domains the same way Vx models two GPUs: what the compiler predicted, what the hardware said, and the machine that reported a topology it did not have.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+
+<meta property="og:title" content="The NUMA that wasn't there">
+<meta property="og:description" content="The compiler predicted a remote memory access costs 2.26x a local one. The hardware said 2.35x. Getting there meant first discovering that the machine we started on reports two NUMA nodes it does not have.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://vxlang.org/blog/the-numa-that-wasnt-there.html">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="alternate" type="application/atom+xml" title="Vx" href="/blog/feed.xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="nav">
+  <a class="brand" href="/">
+    <span class="mark">Vx</span>
+  </a>
+  <nav>
+    <a href="/docs/getting-started.html">Install</a>
+    <a href="/docs/tour.html">Language tour</a>
+    <a href="/docs/">Docs</a>
+    <a href="/blog/">Blog</a>
+    <a href="https://github.com/vx-lang/Vx">GitHub</a>
+  </nav>
+</header>
+
+<main>
+
+<article class="post">
+
+<h1>The NUMA that wasn't there</h1>
+<p class="post-meta">12 September 2026</p>
+
+<blockquote class="tldr"><strong>TL;DR</strong> — Vx already models a GPU's memory as a space you
+can be refused access to. A CPU's NUMA domains are the same relation, so modelling them needed no
+new machinery. The compiler predicted that a remote access costs <strong>2.26&times;</strong> a
+local one; the hardware said <strong>2.35&times;</strong>. Getting to that number meant first
+throwing away a day of measurements taken on a machine that reports two NUMA nodes it does not
+have.</blockquote>
+
+<p class="lede">Every memory space in Vx's fleet so far has been silicon you have to rent. NUMA is
+the one that is already inside the machine on your desk — and it turns out to be the sharpest test
+of the idea, because the two memories are physically identical.</p>
+
+<h2>Why NUMA is a better demo than a GPU</h2>
+
+<p>Vx puts the memory space in the type. A tensor in <code>GPU_HBM</code> is a different type from
+one in <code>CPU_DRAM</code>, and a host read of the first is
+<a href="/docs/correlation.html">refused at compile time</a> rather than faulting at run time.</p>
+
+<p>Someone can reasonably dismiss that as tracking hardware <em>kinds</em>. Of course HBM and DRAM
+are different — they are different chips. The type system is just writing down which one you have.</p>
+
+<p>NUMA removes that objection entirely. On a two-socket server, node 0's memory and node 1's memory
+are the same DDR4, at the same speed, from the same order. Nothing about the bytes differs. The only
+thing separating them is <strong>which core is asking</strong>. If a type system can express that,
+it is expressing locality itself rather than a taxonomy of parts.</p>
+
+<h2>The model needed nothing new</h2>
+
+<p>A NUMA domain is a memory that some execution units reach cheaply and others reach across a link.
+That is structurally identical to two GPUs on a node, which Vx already describes as
+<code>HBM</code> and <code>PEER_HBM</code> with a priced edge between them. So the machine file for
+a two-socket Xeon is the same shape:</p>
+
+<pre><code><span class="k">Memory</span> HBM {
+  capacity: <span class="n">96</span> GiB, bandwidth: <span class="n">140</span> GB/s, managed: explicit, scope: device, node: <span class="n">0</span>
+}
+<span class="k">Memory</span> PEER_HBM {
+  capacity: <span class="n">96</span> GiB, bandwidth: <span class="n">140</span> GB/s, managed: explicit, scope: device, node: <span class="n">1</span>
+}
+
+<span class="k">Topology</span> Device {
+  arch: x86_64,
+  memory: <span class="k">Memory</span>::HBM,
+  visible: [<span class="k">Memory</span>::HBM, <span class="k">Memory</span>::PEER_HBM, <span class="k">Memory</span>::L2],
+  <span class="k">transfer</span> <span class="k">Memory</span>::HBM -&gt; <span class="k">Memory</span>::PEER_HBM : <span class="n">62</span> GB/s,
+  <span class="k">transfer</span> <span class="k">Memory</span>::PEER_HBM -&gt; <span class="k">Memory</span>::HBM : <span class="n">62</span> GB/s
+}</code></pre>
+
+<p>The names say which <em>role</em> a space plays, not what it is made of — there is no HBM anywhere
+near this part. What the pair says is "a tile lives in one domain, and reaching it from the other
+crosses a priced link", and that is true of two sockets exactly as it is of two GPUs.</p>
+
+<p>The immediate payoff is a program the compiler now refuses. Before, the whole box was one
+60&nbsp;GiB space, so a 40&nbsp;GiB tile was admitted — and it could not possibly be local, because
+no node holds 40&nbsp;GiB:</p>
+
+<pre><code>Error[E6009]: transferred tensor needs 42949672960 bytes
+              but memory space 'HBM' has capacity 32212254720 bytes</code></pre>
+
+<p>That refusal costs nothing to obtain. It runs on a laptop, before a machine is booked.</p>
+
+<h2>The machine that lied</h2>
+
+<p>The interesting half is the prediction. Two declared rates — 140&nbsp;GB/s to a node's own memory,
+62&nbsp;GB/s across the interconnect — imply a remote access costs about 2.3&times; a local one, and
+that is a number you can go and falsify.</p>
+
+<p>We started on a <code>c4.8xlarge</code>, because it is the exact part the machine file describes:
+a dual-socket Xeon E5-2666 v3. Everything checked out. <code>lscpu</code> matched. <code>numactl -H</code>
+reported two nodes with the right CPU lists. The ACPI distance table declared 10 for local and 21 for
+remote. And <code>/proc/PID/numa_maps</code> confirmed that binding an allocation to a node put
+<em>every single page</em> there.</p>
+
+<p>Then the measurements came back:</p>
+
+<pre><code>read, all four (cpu node, memory node) pairs :  98.0  96.7  98.1  98.8  GB/s
+pointer-chase latency                        : 119.0 117.3 117.8 117.8  ns</code></pre>
+
+<p>Under 1% spread. No NUMA effect at all — and worse than that, the numbers are not merely flat,
+they are <strong>impossible</strong>:</p>
+
+<ul>
+<li>One socket of that part peaks at <strong>68.3&nbsp;GB/s</strong> (four DDR4-2133 channels). We
+measured 98 bound to a single node. One socket cannot deliver that.</li>
+<li>QPI peaks at <strong>38.4&nbsp;GB/s</strong>. We measured a "remote" read at 96.7. Data crossing
+that link cannot exceed 38.4.</li>
+<li>Binding to one node measured the same as interleaving across both.</li>
+</ul>
+
+<p>The guest's NUMA topology is cosmetic. Xen synthesizes the firmware tables, the pages are spread
+across both sockets whatever the guest is told, and <code>numa_maps</code> reports the guest's own
+page accounting rather than the hypervisor's placement. <strong>Every verification step passed while
+the thing being verified was fiction.</strong></p>
+
+<p>The lesson is not about AWS. It is that a check and the thing it checks are not the same thing,
+and the only evidence that survived here was a rate the hardware could not produce. So the tooling
+now refuses rather than reporting: bind to one node, interleave across both, and if the two agree
+within 10% the bind confined nothing and every number above it is measuring one undivided pool.</p>
+
+<h2>The number</h2>
+
+<p>On a <code>c5.metal</code> — bare metal, no hypervisor between the guest and the sockets — the
+same probe gives a clean signal:</p>
+
+<table>
+<tr><th>Measurement</th><th>Local</th><th>Remote</th></tr>
+<tr><td>Read, 48 threads</td><td>121.0 GB/s</td><td>51.55 GB/s</td></tr>
+<tr><td>Read, one thread</td><td>12.7&ndash;13.8 GB/s</td><td>8.7&ndash;9.0 GB/s</td></tr>
+</table>
+
+<p>The 48-thread pair is a ratio of <strong>2.348&times;</strong>. The single-threaded pair is
+1.50&times;, and lower for a reason worth knowing: one core cannot saturate a socket's memory
+controllers, so that row is bounded by how many misses it can keep in flight rather than by the
+memory. It matters later.</p>
+
+<p><strong>Predicted 2.258&times;. Measured 2.348&times;. A 4% error</strong> on a figure derived from
+a datasheet and never previously checked.</p>
+
+<p>The measurement also settled something the model had to guess. Cascade Lake carries UPI at
+20.8&nbsp;GB/s per link per direction, and a two-socket board may wire two or three links between
+the pair; the file assumed three, which is the optimistic end. The measured 51.55&nbsp;GB/s is more
+than two links could physically carry — their ceiling is 41.6 — so three it is. The guess was right,
+which is not a reason to have made it.</p>
+
+<p>And the sanity check that the <code>c4</code> failed: 121&nbsp;GB/s is 86% of one socket's
+140&nbsp;GB/s peak, and comfortably <em>below</em> it. Staying below peak is the load-bearing
+property. A bind that measures above one socket's ceiling is not confining anything.</p>
+
+<h2>What placement is actually worth</h2>
+
+<p>Pricing a hop is one thing; making the allocation land there is another. A <code>Memory</code>
+space declaring <code>node: N</code> now reaches the runtime as a number it can act on, and the
+backend binds the pages with <code>mbind</code>. The kernel agrees: <code>move_pages</code> reports
+64 of 64 probed pages on the requested node, in both directions.</p>
+
+<p>So what does that buy? Here is the honest table, and the middle row is the one that matters:</p>
+
+<table>
+<tr><th>Placement</th><th>Bandwidth</th><th>vs interleaved</th></tr>
+<tr><td>First-touch (the naive default)</td><td>96.8 GB/s</td><td>0.54&times;</td></tr>
+<tr><td><code>numactl --interleave=all</code></td><td>180.5 GB/s</td><td>1.00&times;</td></tr>
+<tr><td>Placed per node</td><td>242.1 GB/s</td><td>1.34&times;</td></tr>
+</table>
+
+<p><strong>1.34&times; is the number, and 2.50&times; is not.</strong> Interleaving costs nothing,
+needs no source change, and is what anyone already does on a two-socket box. Quoting the speedup
+against naive first-touch would be comparing against the worst case — the same move as a benchmark
+reporting a fourfold speedup for a quarter of the work.</p>
+
+<h2>What it delivers today, which is less</h2>
+
+<p>That 1.34&times; needs the threads placed as well as the pages, and Vx's host backend runs an
+outlined kernel on <strong>one thread</strong> — <code>vx_host_call_kernel</code> is a single
+<code>ffi_call</code>, with no pool to spread across. So the aggregate figure is not reachable
+through that path at all.</p>
+
+<p>What is reachable is one thread's local-versus-remote. A dispatch now pins itself to the node
+holding its arguments, and single-threaded that is worth about <strong>1.5&times;</strong> on
+memory-bound work — 12.7–13.8&nbsp;GB/s local against 8.7–9.0 remote. A threaded host backend is
+what would turn that into the larger number, and it is a different piece of work.</p>
+
+<p>It is worth being plain about this rather than quoting the best figure in the post. The
+compile-time half — refusing a tile no node can hold, pricing the hop, and doing both on a laptop —
+is complete and validated. The runtime half is real, verified against the kernel, and currently
+capped by something unrelated to NUMA.</p>
+
+<h2>The thing that kept recurring</h2>
+
+<p>Three separate bugs this week had one shape: <strong>a declaration nobody downstream was obliged
+to honour.</strong></p>
+
+<p>A machine reported a NUMA topology the hardware did not have. A memory space declared
+<code>managed: cached</code>, meaning the host may read it, and the runtime then allocated it with
+<code>cudaMalloc</code> where the host cannot — a segfault three layers from the declaration that
+caused it. And an allocator tagged memory with an id that promised one thing while a different code
+path had produced it, which aborted the first program that transferred between two domains.</p>
+
+<p>In every case the checks passed. A declaration that nothing downstream must respect looks exactly
+like one that is honoured, right up until you measure something that could not be true. That is the
+argument for putting placement in the type system, and it is also the argument for the guards: the
+NUMA probe now refuses to report a ratio from a machine whose nodes are cosmetic, and the runtime
+warns when it cannot honour what a model claimed.</p>
+
+<p class="post-foot">The machine files, the probe, and the placement benchmark are all in the
+repository — <code>fleet/xeon-8275cl.vx</code>, <code>utils/campaign/run_numa_probe.sh</code> and
+<code>utils/campaign/placement_bench.c</code>. The tracking issue is
+<a href="https://github.com/vx-lang/Vx/issues/515">Vx#515</a>. Vx is Apache 2.0 with the LLVM
+exception — <a href="/docs/getting-started.html">install it</a>, or read
+<a href="/docs/correlation.html">Carrying facts across boundaries</a> for the other five places a
+fact is carried across a boundary rather than re-derived.</p>
+
+</article>
+
+</main>
+
+<footer>
+  <p>Vx is Apache 2.0 with the LLVM exception. <a href="https://github.com/vx-lang/Vx">Source</a>.</p>
+</footer>
+
+</body>
+</html>
