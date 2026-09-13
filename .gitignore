@@ -1,6 +1,5 @@
 target/
 scratch/
-.claude/
 .cargo/
 .rustup/
 review/
@@ -23,7 +22,6 @@ review/
 test_log.txt
 ast.txt
 config.local
-AGENTS.md
 .claude/settings.local.json
 .gemini/settings.local.json
 temp_hover.vx
