@@ -635,6 +635,14 @@ impl<'a> TypeChecker<'a> {
                     Self::extract_uses_stmt(s, uses);
                 }
             }
+            Expr::ComptimeBlock(c) => {
+                for stmt in &c.stmts {
+                    Self::extract_uses_stmt(stmt, uses);
+                }
+                if let Some(ret) = &c.ret {
+                    Self::extract_uses_expr(ret, uses);
+                }
+            }
             Expr::AsCast(c) => Self::extract_uses_expr(&c.expr, uses),
             Expr::Closure(c) => {
                 Self::extract_uses_expr(&c.body, uses);

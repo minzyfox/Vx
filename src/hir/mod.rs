@@ -396,6 +396,29 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     }
 
     #[test]
+    fn liveness_includes_a_use_in_a_comptime_block_result() {
+        let input = r#"
+        fn f() -> i32 {
+            let value = 1;
+            let result = comptime { value };
+            return result;
+        }
+        "#;
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let program = parser.parse().expect("comptime block parses");
+
+        let liveness = TypeChecker::compute_block_liveness(&program.functions[0].body);
+
+        assert_eq!(
+            liveness.get("value"),
+            Some(&1),
+            "a value used by a comptime block result remains live at that statement"
+        );
+    }
+
+    #[test]
     fn test_sema_linear_move_consumed() {
         // A Tensor<f32, [?, ?]> is linear: using it once consumes it, second use is an error.
         let input = r#"
