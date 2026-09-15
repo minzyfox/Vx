@@ -80,9 +80,9 @@ impl<'a> TypeChecker<'a> {
     /// per-buffer instance of the paper's `post /\ ~conclusion` schema; the value-contract
     /// form (`flag => data`) is the message-passing worked example (`seam::check_seam`).
     /// Pre-scan a statement block, recording `assert(var == const)` facts (the value a
-    /// consumer requires of `var`). Recurses into nested blocks (`spawn`, `if`, loops),
-    /// so a transfer seam checked *before* the consumer's `spawn` body can still consult
-    /// the contract the consumer will impose on the transferred buffer.
+    /// consumer requires of `var`). Recurses through every evaluated expression and nested
+    /// statement block, so a transfer seam checked *before* the consumer's `spawn` body can
+    /// still consult the contract the consumer will impose on the transferred buffer.
     pub(crate) fn collect_assert_contracts(
         stmts: &[Statement],
         out: &mut std::collections::HashMap<String, u64>,
@@ -97,14 +97,31 @@ impl<'a> TypeChecker<'a> {
                         Self::scan_expr_for_asserts(e, out);
                     }
                 }
-                Statement::ForLoop(f) => Self::collect_assert_contracts(&f.body, out),
-                // Other statements cannot contain an assert that defines a seam contract.
-                _ => {}
+                Statement::ForLoop(f) => {
+                    Self::scan_expr_for_asserts(&f.iterable, out);
+                    Self::collect_assert_contracts(&f.body, out);
+                }
+                Statement::Assign(a) => {
+                    Self::scan_expr_for_asserts(&a.lhs, out);
+                    Self::scan_expr_for_asserts(&a.rhs, out);
+                }
+                Statement::CompoundAssign(a) => {
+                    Self::scan_expr_for_asserts(&a.lhs, out);
+                    Self::scan_expr_for_asserts(&a.rhs, out);
+                }
+                Statement::Loop(l) => Self::collect_assert_contracts(&l.body, out),
+                // These statements have no evaluated child expression or statement block.
+                Statement::Break(_)
+                | Statement::Continue(_)
+                | Statement::MacroCall(_)
+                | Statement::Error(_) => {}
             }
         }
     }
 
-    /// Descend into the block-bearing expressions that can hold consumer asserts.
+    /// Descend through every evaluated expression which may contain a consumer assert in a
+    /// nested block. Closures are deliberately skipped: creating a closure does not execute its
+    /// body, so an assertion within it is not a contract imposed by this consumer.
     pub(crate) fn scan_expr_for_asserts(
         e: &Expr,
         out: &mut std::collections::HashMap<String, u64>,
@@ -129,13 +146,127 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Expr::If(i) => {
+                Self::scan_expr_for_asserts(&i.cond, out);
                 Self::collect_assert_contracts(&i.then_block, out);
                 if let Some(eb) = &i.else_block {
                     Self::collect_assert_contracts(eb, out);
                 }
             }
-            // Other expression variants are not traversed by this pre-scan.
-            _ => {}
+            Expr::Match(m) => {
+                Self::scan_expr_for_asserts(&m.expr, out);
+                for arm in &m.arms {
+                    Self::collect_assert_contracts(&arm.body, out);
+                }
+            }
+            Expr::Transfer(t) => Self::scan_expr_for_asserts(&t.expr, out),
+            Expr::EnumVariant(v) => {
+                for payload in v.payload.iter().flatten() {
+                    Self::scan_expr_for_asserts(payload, out);
+                }
+            }
+            Expr::FunctionCall(c) => {
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::IndirectCall(c) => {
+                Self::scan_expr_for_asserts(&c.callee, out);
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Array(a) => {
+                for element in &a.elements {
+                    Self::scan_expr_for_asserts(element, out);
+                }
+            }
+            Expr::MemberAccess(m) => Self::scan_expr_for_asserts(&m.base, out),
+            Expr::IndexAccess(i) => {
+                Self::scan_expr_for_asserts(&i.base, out);
+                Self::scan_expr_for_asserts(&i.index, out);
+            }
+            Expr::MethodCall(c) => {
+                Self::scan_expr_for_asserts(&c.base, out);
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::BinaryOp(b) => {
+                Self::scan_expr_for_asserts(&b.lhs, out);
+                Self::scan_expr_for_asserts(&b.rhs, out);
+            }
+            Expr::RelationalOp(r) => {
+                Self::scan_expr_for_asserts(&r.lhs, out);
+                Self::scan_expr_for_asserts(&r.rhs, out);
+            }
+            Expr::LogicalOp(l) => {
+                Self::scan_expr_for_asserts(&l.lhs, out);
+                Self::scan_expr_for_asserts(&l.rhs, out);
+            }
+            Expr::UnaryOp(u) => Self::scan_expr_for_asserts(&u.expr, out),
+            Expr::Borrow(b) => Self::scan_expr_for_asserts(&b.expr, out),
+            Expr::Dereference(d) => Self::scan_expr_for_asserts(&d.expr, out),
+            Expr::StructInit(s) => {
+                for (_, field) in &s.fields {
+                    Self::scan_expr_for_asserts(field, out);
+                }
+            }
+            Expr::Range(r) => {
+                Self::scan_expr_for_asserts(&r.start, out);
+                Self::scan_expr_for_asserts(&r.end, out);
+            }
+            Expr::Grad(g) => {
+                for arg in &g.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Vjp(v) => {
+                for arg in &v.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+                Self::scan_expr_for_asserts(&v.cotangent, out);
+            }
+            Expr::Jvp(j) => {
+                for arg in &j.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+                Self::scan_expr_for_asserts(&j.tangent, out);
+            }
+            Expr::VecMacro(v) => {
+                for element in &v.elements {
+                    Self::scan_expr_for_asserts(element, out);
+                }
+            }
+            Expr::AsCast(c) => Self::scan_expr_for_asserts(&c.expr, out),
+            Expr::Print(p) => {
+                for arg in &p.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Println(p) => {
+                for arg in &p.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::InlineMlir(i) => {
+                for (_, input, _) in &i.inputs {
+                    Self::scan_expr_for_asserts(input, out);
+                }
+                for clobber in &i.clobbers {
+                    Self::scan_expr_for_asserts(clobber, out);
+                }
+            }
+            // A closure body is deferred until the closure is invoked, so it is not a consumer
+            // contract at the point where the closure expression is evaluated.
+            Expr::Closure(_) => {}
+            Expr::Identifier(_)
+            | Expr::Number(_)
+            | Expr::StringLiteral(_)
+            | Expr::TransferPredicate(_)
+            | Expr::MemorySpace(_)
+            | Expr::Topology(_)
+            | Expr::MacroCall(_)
+            | Expr::SizeOf(_) => {}
         }
     }
 

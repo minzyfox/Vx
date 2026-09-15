@@ -575,7 +575,7 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
     }
 
     #[test]
-    fn seam_assert_prescan_skips_an_assert_nested_in_a_binary_expression() {
+    fn seam_assert_prescan_collects_an_assert_nested_in_a_binary_expression() {
         let source = r#"
 fn f(value: i32) -> i32 {
     let result = 1 + if 1 == 1 {
@@ -596,9 +596,10 @@ fn f(value: i32) -> i32 {
         let mut contracts = std::collections::HashMap::new();
         TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
 
-        assert!(
-            !contracts.contains_key("value"),
-            "the current pre-scan skips an assert below a binary-expression child: {contracts:?}"
+        assert_eq!(
+            contracts.get("value"),
+            Some(&42u64),
+            "the pre-scan must collect asserts inside binary-expression operands: {contracts:?}"
         );
 
         let program_arr = [program.clone()];

@@ -50,8 +50,8 @@ Two contract forms are extracted automatically, in priority order:
 
 The seam at a transfer is checked *before* the consumer (`spawn` body) that reads
 the buffer. To use a contract the consumer states downstream, the compiler runs a
-**pre-scan** of the function body that records `assert(var == const)` facts
-(descending into `spawn`/`if`/loop blocks). At the transfer, the value the
+**pre-scan** of the function body that records `assert(var == const)` facts by
+walking evaluated expressions and nested statement blocks. At the transfer, the value the
 consumer requires of the produced buffer (matched by the `let` binding it feeds,
 e.g. `local_a`) is consulted as the contract's conclusion.
 
