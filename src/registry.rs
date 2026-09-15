@@ -144,6 +144,45 @@ pub struct ImmutableGlobalRegistry {
     /// import-vs-import conflict (the name then resolves in *neither* artifact, whatever order
     /// they merged in). Merge-session state only — never serialized (#291).
     pub merge_state: MergeState,
+    /// Base name -> layout GID, for [`Self::layout_gid_by_base_name`]. Built wherever `layouts`
+    /// is: at the freeze, after a merge, and when an interface is deserialized. Eager rather than
+    /// on first use, because the registry is shared read-only across every worker and a compiler
+    /// with no shared mutable state has nowhere to build one lazily.
+    pub(crate) layout_by_base_name: LayoutNameIndex,
+}
+
+/// The base-name index over a registry's layouts: `Some(gid)` for a name exactly one non-stub
+/// layout has, `None` (present) for a name two distinct ones share, absent when no non-stub
+/// layout has it. Carries the length of the table it was built from, so a lookup can refuse an
+/// index the table has outgrown.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutNameIndex {
+    built_from: usize,
+    by_base_name: FxHashMap<String, Option<TypeId>>,
+}
+
+impl LayoutNameIndex {
+    pub fn build(layouts: &FxHashMap<TypeId, TypeDefinition>) -> Self {
+        let mut by_base_name: FxHashMap<String, Option<TypeId>> = FxHashMap::default();
+        for def in layouts.values() {
+            if def.align_bytes == 0 {
+                continue;
+            }
+            match by_base_name.get(&def.name) {
+                Some(Some(existing)) if *existing != def.id => {
+                    by_base_name.insert(def.name.clone(), None);
+                }
+                Some(_) => {}
+                None => {
+                    by_base_name.insert(def.name.clone(), Some(def.id));
+                }
+            }
+        }
+        Self {
+            built_from: layouts.len(),
+            by_base_name,
+        }
+    }
 }
 
 /// See [`ImmutableGlobalRegistry::merge_state`]. The `poisoned_*` tombstones are read back through
@@ -285,6 +324,7 @@ impl ImmutableGlobalRegistry {
             return Err("Infinite-sized recursive layout detected.".to_string());
         }
 
+        let layout_by_base_name = LayoutNameIndex::build(&layouts);
         Ok(Self {
             layouts,
             module_indices,
@@ -295,7 +335,31 @@ impl ImmutableGlobalRegistry {
             structs: FxHashMap::default(),
             enum_data: FxHashMap::default(),
             merge_state: MergeState::default(),
+            layout_by_base_name,
         })
+    }
+
+    /// The unique modelled layout of a struct or enum, by base name (`Vec<i32>` asks for `Vec`): the
+    /// fallback for a monomorphized cross-module instance whose base GID name resolution left
+    /// unattached. Only a non-stub layout counts, and a name two distinct layouts share answers
+    /// `None`, so a wrong layout is never chosen.
+    ///
+    /// One hash probe. This used to walk every layout comparing names, once per nominal-typed
+    /// parameter the lowerer met, and on a 1,000-module corpus that scan was 80% of the compile.
+    /// The index is checked on every call, because `layouts` is a public field: a table grown
+    /// behind the index would otherwise answer from a table that no longer exists.
+    pub fn layout_gid_by_base_name(&self, name: &str) -> Option<TypeId> {
+        let base = name.split('<').next().unwrap_or(name);
+        assert_eq!(
+            self.layout_by_base_name.built_from,
+            self.layouts.len(),
+            "layouts changed after the name index was built; a lookup would answer from a stale table"
+        );
+        self.layout_by_base_name
+            .by_base_name
+            .get(base)
+            .copied()
+            .flatten()
     }
 
     /// Resolve a method `recv.method(..)` to its signature by `(receiver GID, method name)` -- the
@@ -347,6 +411,8 @@ impl ImmutableGlobalRegistry {
         for (id, def) in other.layouts {
             self.layouts.entry(id).or_insert(def);
         }
+        // The merge is the one path that grows `layouts` after the freeze, so the index follows it.
+        self.layout_by_base_name = LayoutNameIndex::build(&self.layouts);
         for (module_hash, by_name) in other.module_indices {
             let dst = self.module_indices.entry(module_hash).or_default();
             for (name, gid) in by_name {
@@ -503,6 +569,80 @@ mod tests {
             fields: Vec::new(),
             by_value_dependencies: deps,
         }
+    }
+
+    /// The base-name index answers what the old scan of every layout answered, in one probe: the
+    /// unique modelled layout, or nothing for an ambiguous or unknown name, with a stub (alignment
+    /// 0) never counted and a generic instance asking for its base.
+    #[test]
+    fn layout_gid_by_base_name_answers_as_the_scan_did() {
+        let mut stub = make_def("Vec", 1, 100, vec![]);
+        stub.align_bytes = 0; // a generic base whose layout could not be computed
+        let vec_b = make_def("Vec", 2, 100, vec![]);
+        let point_a = make_def("Point", 1, 300, vec![]);
+        let point_b = make_def("Point", 2, 300, vec![]);
+        let reg = ImmutableGlobalRegistry::build_and_validate(vec![stub, vec_b, point_a, point_b])
+            .unwrap();
+
+        // Unique among the non-stub layouts, asked for through an instance's spelling.
+        assert_eq!(
+            reg.layout_gid_by_base_name("Vec<i32>"),
+            Some(TypeId::new(2, 100, 0, 0))
+        );
+        // Two distinct non-stub layouts share the name: ambiguous, so no answer.
+        assert_eq!(reg.layout_gid_by_base_name("Point"), None);
+        // No such layout at all.
+        assert_eq!(reg.layout_gid_by_base_name("Nope"), None);
+    }
+
+    /// A merge grows `layouts`, and the index has to follow it: a name that was unique before
+    /// the merge and is shared after it answers ambiguous, and a name the merge brought in
+    /// resolves.
+    #[test]
+    fn layout_name_index_follows_a_merge() {
+        let mut a = ImmutableGlobalRegistry::build_and_validate(vec![
+            make_def("Point", 1, 100, vec![]),
+            make_def("Only", 1, 200, vec![]),
+        ])
+        .unwrap();
+        let b = ImmutableGlobalRegistry::build_and_validate(vec![
+            make_def("Point", 2, 100, vec![]),
+            make_def("Other", 2, 300, vec![]),
+        ])
+        .unwrap();
+        assert_eq!(
+            a.layout_gid_by_base_name("Point"),
+            Some(TypeId::new(1, 100, 0, 0))
+        );
+        a.merge_from(b);
+        assert_eq!(
+            a.layout_gid_by_base_name("Point"),
+            None,
+            "shared after the merge"
+        );
+        assert_eq!(
+            a.layout_gid_by_base_name("Other"),
+            Some(TypeId::new(2, 300, 0, 0)),
+            "brought in by the merge"
+        );
+        assert_eq!(
+            a.layout_gid_by_base_name("Only"),
+            Some(TypeId::new(1, 200, 0, 0)),
+            "untouched by the merge"
+        );
+    }
+
+    /// `layouts` is a public field, so a table grown behind the index describes a table that no
+    /// longer exists. The lookup refuses rather than answering from it.
+    #[test]
+    #[should_panic(expected = "layouts changed after the name index was built")]
+    fn layout_name_index_refuses_a_table_that_grew_under_it() {
+        let mut reg =
+            ImmutableGlobalRegistry::build_and_validate(vec![make_def("A", 1, 1, vec![])]).unwrap();
+        assert!(reg.layout_gid_by_base_name("A").is_some());
+        let late = make_def("B", 1, 2, vec![]);
+        reg.layouts.insert(late.id, late);
+        let _ = reg.layout_gid_by_base_name("B");
     }
 
     #[test]
