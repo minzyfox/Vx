@@ -1025,6 +1025,7 @@ impl CompilerDriver {
             return Err(format!("MLIR passes failed for {}: {}", filename, e));
         }
 
+        ensure_output_action(&self.options.action);
         match self.options.action {
             Action::EmitMlir | Action::EmitLlvm => {
                 // `--emit-llvm` alone prints the portable, target-independent LLVM-dialect
@@ -1118,7 +1119,7 @@ impl CompilerDriver {
                     ));
                 }
             }
-            _ => {}
+            _ => unreachable!("output action was validated before handling emitted output"),
         }
 
         Ok(())
@@ -1386,6 +1387,13 @@ impl CompilerDriver {
     }
 }
 
+fn ensure_output_action(action: &Action) {
+    match action {
+        Action::EmitMlir | Action::EmitLlvm | Action::RunJit | Action::EmitObj => {}
+        _ => panic!("unexpected action while handling emitted output"),
+    }
+}
+
 fn get_optimization_pipeline(
     opt_level: u8,
     llvm_lower: bool,
@@ -1584,6 +1592,12 @@ mod flat_codegen_tests {
         let mut p = parser.parse().expect("parse");
         p.module_path = "crate::t".into();
         p
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected action while handling emitted output")]
+    fn output_handler_rejects_actions_that_do_not_emit_output() {
+        ensure_output_action(&Action::ParseOnly);
     }
 
     /// `--flat-codegen` produces a module for an in-subset program (scalar arithmetic, a scalar helper

@@ -98,6 +98,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 Statement::ForLoop(f) => Self::collect_assert_contracts(&f.body, out),
+                // Other statements cannot contain an assert that defines a seam contract.
                 _ => {}
             }
         }
@@ -133,6 +134,7 @@ impl<'a> TypeChecker<'a> {
                     Self::collect_assert_contracts(eb, out);
                 }
             }
+            // Other expression variants are not traversed by this pre-scan.
             _ => {}
         }
     }

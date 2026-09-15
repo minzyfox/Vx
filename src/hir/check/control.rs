@@ -519,6 +519,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+            // Wildcards, literals, and payload-free enum variants introduce no bindings.
             _ => {}
         }
     }
