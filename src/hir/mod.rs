@@ -348,6 +348,35 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
             checker.errors
         );
     }
+
+    #[test]
+    fn unsupported_cast_reports_a_diagnostic() {
+        let input = r#"
+struct Pair { x: i32, y: i32 }
+fn invalid_cast(p: Pair) -> i32 {
+    return p as i32;
+}
+        "#;
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let mut program = parser.parse().expect("parse");
+        let program_arr = [program.clone()];
+        let env = GlobalAstEnv::build(&program_arr);
+        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
+            crate::session::GlobalSession::new(1),
+        ));
+        let mut checker = TypeChecker::new(&env, &mut worker);
+
+        for function in &mut program.functions {
+            checker.check_function(function);
+        }
+
+        assert!(checker
+            .errors
+            .iter()
+            .any(|error| { error.message.contains("Unsupported cast: cannot cast from") }));
+    }
     #[test]
     fn test_sema_liveness_analysis() {
         let input = r#"
@@ -542,6 +571,50 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
             Some(&42u64),
             "pre-scan should extract local_a == 42 from the spawn body, got {:?}",
             contracts
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_skips_an_assert_nested_in_a_binary_expression() {
+        let source = r#"
+fn f(value: i32) -> i32 {
+    let result = 1 + if 1 == 1 {
+        assert(value == 42);
+        2
+    } else {
+        3
+    };
+    return result;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let mut program = parser.parse().expect("nested if expression parses");
+        let function = program.functions.last().expect("function parses");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert!(
+            !contracts.contains_key("value"),
+            "the current pre-scan skips an assert below a binary-expression child: {contracts:?}"
+        );
+
+        let program_arr = [program.clone()];
+        let env = GlobalAstEnv::build(&program_arr);
+        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
+            crate::session::GlobalSession::new(1),
+        ));
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        for function in &mut program.functions {
+            checker.check_function(function);
+        }
+        assert_eq!(
+            checker.errors.error_count(),
+            0,
+            "the nested-if fixture must be valid Vx: {:?}",
+            checker.errors
         );
     }
 

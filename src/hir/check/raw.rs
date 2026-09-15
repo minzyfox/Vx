@@ -1045,6 +1045,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+            // Other calls cannot start, complete, or conflict with an async copy.
             _ => {}
         }
     }
