@@ -643,6 +643,11 @@ impl<'a> TypeChecker<'a> {
                     Self::extract_uses_expr(ret, uses);
                 }
             }
+            Expr::Grad(g) => {
+                for arg in &g.args {
+                    Self::extract_uses_expr(arg, uses);
+                }
+            }
             Expr::AsCast(c) => Self::extract_uses_expr(&c.expr, uses),
             Expr::Closure(c) => {
                 Self::extract_uses_expr(&c.body, uses);

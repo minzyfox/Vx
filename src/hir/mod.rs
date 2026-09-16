@@ -419,6 +419,26 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     }
 
     #[test]
+    fn liveness_includes_an_autodiff_argument() {
+        let input = r#"
+        fn cube(v: f32) -> f32 { return v * v * v; }
+        fn f(x: f32) -> f32 { return grad(cube, x); }
+        "#;
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let program = parser.parse().expect("autodiff program parses");
+
+        let liveness = TypeChecker::compute_block_liveness(&program.functions[1].body);
+
+        assert_eq!(
+            liveness.get("x"),
+            Some(&0),
+            "an autodiff argument is read by the expression that contains it"
+        );
+    }
+
+    #[test]
     fn test_sema_linear_move_consumed() {
         // A Tensor<f32, [?, ?]> is linear: using it once consumes it, second use is an error.
         let input = r#"
