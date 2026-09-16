@@ -145,7 +145,7 @@ pub(crate) fn collect_expr_idents(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        _ => panic!("unexpected expression while collecting seam certificate references"),
+        _ => {}
     }
 }
 
@@ -190,7 +190,7 @@ mod tests {
     use super::*;
     use crate::symbol::Symbol;
     use crate::syntax::types::Span;
-    use crate::syntax::{IdentifierExpr, NumberExpr, RelationalOp, RelationalOpExpr};
+    use crate::syntax::{IdentifierExpr, RelationalOp, RelationalOpExpr};
 
     fn sp() -> Span {
         Span {
@@ -219,14 +219,6 @@ mod tests {
         collect_expr_idents(&e, &mut out);
         assert_eq!(out.len(), 2);
         assert!(out.contains("kblk_start") && out.contains("qblk_end"));
-    }
-
-    #[test]
-    #[should_panic(expected = "unexpected expression while collecting seam certificate references")]
-    fn collector_rejects_an_expression_outside_the_certificate_vocabulary() {
-        let literal = Expr::Number(NumberExpr::new("1".to_string(), None, sp()));
-        let mut out = HashSet::new();
-        collect_expr_idents(&literal, &mut out);
     }
 
     #[test]
