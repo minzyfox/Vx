@@ -89,7 +89,7 @@ fn normalize_and_expand_blocks(mut tokens: Vec<Token>) -> Vec<Token> {
                     match new_tokens[j].kind {
                         TokenType::Whitespace(_)
                         | TokenType::Comment(_)
-                        | TokenType::DocComment(_) => continue,
+                        | TokenType::DocComment(_) => {},
                         TokenType::Unsafe => {
                             is_unsafe_block = true;
                             break;

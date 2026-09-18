@@ -1301,7 +1301,7 @@ impl<'a> TypeChecker<'a> {
                 let g_name = param.name();
                 let bounds = match param {
                     decl::GenericParam::Type { bounds, .. } => bounds.clone(),
-                    _ => Vec::new(),
+                    decl::GenericParam::Const { .. } => Vec::new(),
                 };
                 // Every bound has to hold, and every failing one is reported: told about
                 // only the first, a caller fixes it and is handed the next.

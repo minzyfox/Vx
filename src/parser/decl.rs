@@ -1057,9 +1057,8 @@ impl<'a> Parser<'a> {
             path.push(ident.into());
             if self.match_token(&TokenType::DoubleColon) {
                 continue;
-            } else {
-                break;
             }
+            break;
         }
         self.consume(&TokenType::Semicolon, "Expected ';' after import path")?;
         Ok(ImportDecl { path })

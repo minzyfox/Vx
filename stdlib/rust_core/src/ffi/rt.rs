@@ -229,12 +229,9 @@ pub extern "C-unwind" fn vx_panic() -> i32 {
 #[no_mangle]
 pub extern "C-unwind" fn vx_catch_unwind(f: extern "C-unwind" fn() -> i32) -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f()));
-    match result {
-        Ok(v) => v,
-        Err(_) => {
-            println!("Caught panic!");
-            1
-        }
+    if let Ok(v) = result { v } else {
+        println!("Caught panic!");
+        1
     }
 }
 

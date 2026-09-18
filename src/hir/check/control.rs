@@ -218,7 +218,7 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 }))
             }
-            _ => None,
+            Value::Topology(_) => None,
         }
     }
 
@@ -539,7 +539,7 @@ impl<'a> TypeChecker<'a> {
                     match &arm.pattern {
                         Pattern::Wildcard | Pattern::Identifier(_) => has_wildcard = true,
                         Pattern::EnumVariant(_, variant, _) => covered.push(variant.clone()),
-                        _ => {}
+                        Pattern::Literal(_) => {}
                     }
                     self.push_scope();
                     self.check_literal_pattern_range(&arm.pattern, &expr_ty);
