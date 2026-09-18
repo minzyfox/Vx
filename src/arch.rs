@@ -500,8 +500,7 @@ pub fn builtin_address_space(mem: &MemorySpace) -> Option<AddressSpace> {
         MemorySpace::LocalSRAM => Some(AddressSpace::Workgroup),
         // Network-attached memory is not addressable from a GPU kernel; there is no honest
         // mapping, so callers must diagnose rather than silently pick one.
-        MemorySpace::NicRam | MemorySpace::RemoteHbm => None,
-        MemorySpace::Custom(_) => None,
+        MemorySpace::NicRam | MemorySpace::RemoteHbm | MemorySpace::Custom(_) => None,
     }
 }
 

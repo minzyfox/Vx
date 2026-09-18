@@ -196,7 +196,7 @@ fn tensor_memref_of_type(ty: &Type) -> Option<String> {
             for d in dims {
                 shape.push(match d {
                     Dim::Dyn => DYN_DIM.to_string(),
-                    _ => d.literal()?.parse::<i64>().ok()?.to_string(),
+                    Dim::Static(_) => d.literal()?.parse::<i64>().ok()?.to_string(),
                 });
             }
             tensor_memref_ty(elem, &shape)
@@ -1973,8 +1973,7 @@ impl<'a> FnEmit<'a> {
             // element pointer), `operand2` the value, and the pointee element type comes from the
             // place. (#242)
             Opcode::PtrStore => self.op_ptr_store(idx, ins),
-            // Anything else (spawn, matmul, …) is outside this subset.
-            _ => Err(Decline::Unsupported {
+            Opcode::Nop => Err(Decline::Unsupported {
                 what: "an opcode the emitter has no case for",
             }),
         }

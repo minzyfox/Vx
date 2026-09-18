@@ -472,7 +472,7 @@ impl<'a> TypeChecker<'a> {
                             format!("dimension {i} is the runtime value '{}'", id.name)
                         }
                         Dim::Dyn => format!("dimension {i} is a run-time extent"),
-                        _ => format!("dimension {i} is not a compile-time constant"),
+                        Dim::Static(_) => format!("dimension {i} is not a compile-time constant"),
                     })
                     .unwrap_or_else(|| "the shape is not statically known".to_string());
                 self.errors
