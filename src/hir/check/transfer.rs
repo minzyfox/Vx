@@ -89,7 +89,7 @@ impl<'a> TypeChecker<'a> {
     ) {
         for s in stmts {
             match s {
-                Statement::Assert(a) => Self::extract_eq_const(&a.expr, out),
+                Statement::Assert(a) => Self::collect_assert_condition(&a.expr, out),
                 Statement::LetDecl(l) => Self::scan_expr_for_asserts(&l.expr, out),
                 Statement::ExprStmt(e) => Self::scan_expr_for_asserts(&e.expr, out),
                 Statement::Return(r) => {
@@ -99,6 +99,9 @@ impl<'a> TypeChecker<'a> {
                 }
                 Statement::ForLoop(f) => {
                     Self::scan_expr_for_asserts(&f.iterable, out);
+                    for invariant in &f.invariants {
+                        Self::collect_assert_condition(invariant, out);
+                    }
                     Self::collect_assert_contracts(&f.body, out);
                 }
                 Statement::Assign(a) => {
@@ -109,7 +112,12 @@ impl<'a> TypeChecker<'a> {
                     Self::scan_expr_for_asserts(&a.lhs, out);
                     Self::scan_expr_for_asserts(&a.rhs, out);
                 }
-                Statement::Loop(l) => Self::collect_assert_contracts(&l.body, out),
+                Statement::Loop(l) => {
+                    for invariant in &l.invariants {
+                        Self::collect_assert_condition(invariant, out);
+                    }
+                    Self::collect_assert_contracts(&l.body, out);
+                }
                 // These statements have no evaluated child expression or statement block.
                 Statement::Break(_)
                 | Statement::Continue(_)
@@ -119,9 +127,23 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Descend through every evaluated expression which may contain a consumer assert in a
-    /// nested block. Closures are deliberately skipped: creating a closure does not execute its
-    /// body, so an assertion within it is not a contract imposed by this consumer.
+    /// Collect facts established by an assertion or loop invariant. Both operands of a logical
+    /// condition are required when the condition holds, unlike an ordinary `&&` or `||` expression
+    /// whose right operand may not run.
+    fn collect_assert_condition(e: &Expr, out: &mut std::collections::HashMap<String, u64>) {
+        Self::extract_eq_const(e, out);
+        match e {
+            Expr::LogicalOp(logical) => {
+                Self::collect_assert_condition(&logical.lhs, out);
+                Self::collect_assert_condition(&logical.rhs, out);
+            }
+            _ => Self::scan_expr_for_asserts(e, out),
+        }
+    }
+
+    /// Descend through expressions which may contain a consumer assert in a nested block.
+    /// Closures are deliberately skipped: creating a closure does not execute its body, so an
+    /// assertion within it is not a contract imposed by this consumer.
     pub(crate) fn scan_expr_for_asserts(
         e: &Expr,
         out: &mut std::collections::HashMap<String, u64>,
@@ -154,8 +176,19 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::Match(m) => {
                 Self::scan_expr_for_asserts(&m.expr, out);
-                for arm in &m.arms {
-                    Self::collect_assert_contracts(&arm.body, out);
+                if let Some((first_arm, remaining_arms)) = m.arms.split_first() {
+                    let mut shared = std::collections::HashMap::new();
+                    Self::collect_assert_contracts(&first_arm.body, &mut shared);
+
+                    for arm in remaining_arms {
+                        let mut arm_contracts = std::collections::HashMap::new();
+                        Self::collect_assert_contracts(&arm.body, &mut arm_contracts);
+                        shared.retain(|name, value| arm_contracts.get(name) == Some(value));
+                    }
+
+                    // An assertion from a single arm is conditional. Only facts every arm
+                    // establishes can describe the consumer after this match.
+                    out.extend(shared);
                 }
             }
             Expr::Transfer(t) => Self::scan_expr_for_asserts(&t.expr, out),
@@ -201,7 +234,8 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::LogicalOp(l) => {
                 Self::scan_expr_for_asserts(&l.lhs, out);
-                Self::scan_expr_for_asserts(&l.rhs, out);
+                // The right operand of `&&` and `||` may not run, so its assertions cannot
+                // establish a consumer contract.
             }
             Expr::UnaryOp(u) => Self::scan_expr_for_asserts(&u.expr, out),
             Expr::Borrow(b) => Self::scan_expr_for_asserts(&b.expr, out),

@@ -655,6 +655,257 @@ fn f(value: i32) -> i32 {
     }
 
     #[test]
+    fn seam_assert_prescan_collects_each_conjunct_of_an_assert() {
+        let source = r#"
+fn f(left: i32, right: i32) -> i32 {
+    assert(left == 42 && right == 7);
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("assertion fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert_eq!(
+            contracts.get("left"),
+            Some(&42u64),
+            "the first assertion conjunct must be collected: {contracts:?}"
+        );
+        assert_eq!(
+            contracts.get("right"),
+            Some(&7u64),
+            "the second assertion conjunct must be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_collects_an_assert_nested_in_an_assert_condition() {
+        let source = r#"
+fn f(value: i32) -> i32 {
+    assert(if 1 == 1 {
+        assert(value == 42);
+        true
+    } else {
+        true
+    });
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("nested assertion fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert_eq!(
+            contracts.get("value"),
+            Some(&42u64),
+            "an assertion nested in an assertion condition must be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_collects_for_loop_invariant_contracts() {
+        let source = r#"
+fn f(value: i32) -> i32 {
+    for i in 0..4 invariant value == 42 {
+        let copy = i;
+    }
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("for-loop invariant fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert_eq!(
+            contracts.get("value"),
+            Some(&42u64),
+            "a for-loop invariant contract must be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_collects_loop_invariant_contracts() {
+        let source = r#"
+fn f(value: i32) -> i32 {
+    loop invariant value == 42 {
+        break;
+    }
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("loop invariant fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert_eq!(
+            contracts.get("value"),
+            Some(&42u64),
+            "a loop invariant contract must be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_discards_contracts_that_differ_between_match_arms() {
+        let source = r#"
+fn f(selector: i32, value: i32) -> i32 {
+    match selector {
+        0 => { assert(value == 42); }
+        _ => { assert(value == 7); }
+    }
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("match fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert!(
+            !contracts.contains_key("value"),
+            "a contract that differs by match arm must not be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_keeps_contracts_shared_by_every_match_arm() {
+        let source = r#"
+fn f(selector: i32, value: i32) -> i32 {
+    match selector {
+        0 => { assert(value == 42); }
+        _ => { assert(value == 42); }
+    }
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("match fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert_eq!(
+            contracts.get("value"),
+            Some(&42u64),
+            "a contract shared by every match arm must be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_skips_short_circuited_and_rhs() {
+        let source = r#"
+fn f(predicate: bool, value: i32) -> i32 {
+    let result = predicate && if 1 == 1 {
+        assert(value == 42);
+        true
+    } else {
+        false
+    };
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("logical-and fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert!(
+            !contracts.contains_key("value"),
+            "a contract in a short-circuited && right operand must not be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_skips_short_circuited_or_rhs() {
+        let source = r#"
+fn f(predicate: bool, value: i32) -> i32 {
+    let result = predicate || if 1 == 1 {
+        assert(value == 42);
+        true
+    } else {
+        false
+    };
+    return 0;
+}
+        "#;
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, source);
+        let program = parser.parse().expect("logical-or fixture parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
+
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
+
+        assert!(
+            !contracts.contains_key("value"),
+            "a contract in a short-circuited || right operand must not be collected: {contracts:?}"
+        );
+    }
+
+    #[test]
     fn test_seam_check_off_by_default() {
         // With seam verification disabled (the default), a relaxed transfer raises no
         // E6004 -- the obligation (and its z3 dependency) is opt-in via --verify-seams.
