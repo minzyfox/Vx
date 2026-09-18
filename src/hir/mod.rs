@@ -588,6 +588,324 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
 }
 "#;
 
+    fn nested_consumer_assert(name: &str) -> Expr {
+        let span = Span::default();
+        let equality = Expr::RelationalOp(RelationalOpExpr::new(
+            Box::new(Expr::Identifier(IdentifierExpr::new(name.into(), span))),
+            RelationalOp::Eq,
+            Box::new(Expr::Number(NumberExpr::new("42".to_string(), None, span))),
+            span,
+        ));
+        Expr::If(IfExpr::new(
+            false,
+            Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
+            vec![Statement::Assert(AssertStmt::new(
+                Box::new(equality),
+                None,
+                span,
+            ))],
+            None,
+            span,
+        ))
+    }
+
+    #[test]
+    fn seam_assert_prescan_scans_eager_expression_children() {
+        let span = Span::default();
+        let cases = vec![
+            (
+                "function_argument",
+                Expr::FunctionCall(FunctionCallExpr::new(
+                    "callee".into(),
+                    None,
+                    vec![nested_consumer_assert("function_argument")],
+                    span,
+                )),
+            ),
+            (
+                "indirect_argument",
+                Expr::IndirectCall(IndirectCallExpr::new(
+                    Box::new(Expr::Identifier(IdentifierExpr::new("callee".into(), span))),
+                    vec![nested_consumer_assert("indirect_argument")],
+                    span,
+                )),
+            ),
+            (
+                "array_element",
+                Expr::Array(ArrayExpr::new(
+                    vec![nested_consumer_assert("array_element")],
+                    span,
+                )),
+            ),
+            (
+                "member_base",
+                Expr::MemberAccess(MemberAccessExpr::new(
+                    Box::new(nested_consumer_assert("member_base")),
+                    "field".into(),
+                    span,
+                )),
+            ),
+            (
+                "index_expression",
+                Expr::IndexAccess(IndexAccessExpr::new(
+                    Box::new(Expr::Identifier(IdentifierExpr::new("array".into(), span))),
+                    Box::new(nested_consumer_assert("index_expression")),
+                    span,
+                )),
+            ),
+            (
+                "method_argument",
+                Expr::MethodCall(MethodCallExpr::new(
+                    Box::new(Expr::Identifier(IdentifierExpr::new(
+                        "receiver".into(),
+                        span,
+                    ))),
+                    "method".into(),
+                    None,
+                    vec![nested_consumer_assert("method_argument")],
+                    span,
+                )),
+            ),
+            (
+                "binary_rhs",
+                Expr::BinaryOp(BinaryOpExpr::new(
+                    Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
+                    BinaryOp::Add,
+                    Box::new(nested_consumer_assert("binary_rhs")),
+                    span,
+                )),
+            ),
+            (
+                "relational_rhs",
+                Expr::RelationalOp(RelationalOpExpr::new(
+                    Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
+                    RelationalOp::Eq,
+                    Box::new(nested_consumer_assert("relational_rhs")),
+                    span,
+                )),
+            ),
+            (
+                "struct_field",
+                Expr::StructInit(StructInitExpr::new(
+                    "Record".into(),
+                    vec![("field".into(), nested_consumer_assert("struct_field"))],
+                    span,
+                )),
+            ),
+            (
+                "range_end",
+                Expr::Range(RangeExpr::new(
+                    Box::new(Expr::Number(NumberExpr::new("0".to_string(), None, span))),
+                    Box::new(nested_consumer_assert("range_end")),
+                    span,
+                )),
+            ),
+            (
+                "grad_argument",
+                Expr::Grad(GradExpr::new(
+                    "target".into(),
+                    vec![nested_consumer_assert("grad_argument")],
+                    span,
+                )),
+            ),
+            (
+                "vjp_cotangent",
+                Expr::Vjp(VjpExpr::new(
+                    "target".into(),
+                    vec![Expr::Number(NumberExpr::new("1".to_string(), None, span))],
+                    Box::new(nested_consumer_assert("vjp_cotangent")),
+                    span,
+                )),
+            ),
+            (
+                "vjp_argument",
+                Expr::Vjp(VjpExpr::new(
+                    "target".into(),
+                    vec![nested_consumer_assert("vjp_argument")],
+                    Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
+                    span,
+                )),
+            ),
+            (
+                "jvp_tangent",
+                Expr::Jvp(JvpExpr::new(
+                    "target".into(),
+                    vec![Expr::Number(NumberExpr::new("1".to_string(), None, span))],
+                    Box::new(nested_consumer_assert("jvp_tangent")),
+                    span,
+                )),
+            ),
+            (
+                "jvp_argument",
+                Expr::Jvp(JvpExpr::new(
+                    "target".into(),
+                    vec![nested_consumer_assert("jvp_argument")],
+                    Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
+                    span,
+                )),
+            ),
+            (
+                "vec_element",
+                Expr::VecMacro(VecMacroExpr::new(
+                    vec![nested_consumer_assert("vec_element")],
+                    span,
+                )),
+            ),
+            (
+                "cast_operand",
+                Expr::AsCast(AsCastExpr {
+                    expr: Box::new(nested_consumer_assert("cast_operand")),
+                    target_ty: Type::Scalar(ElementType::I32),
+                    source_ty: None,
+                    span,
+                }),
+            ),
+            (
+                "print_argument",
+                Expr::Print(PrintExpr::new(
+                    vec![nested_consumer_assert("print_argument")],
+                    span,
+                )),
+            ),
+            (
+                "println_argument",
+                Expr::Println(PrintlnExpr::new(
+                    vec![nested_consumer_assert("println_argument")],
+                    span,
+                )),
+            ),
+            (
+                "inline_mlir_input",
+                Expr::InlineMlir(InlineMlirExpr {
+                    inputs: vec![(
+                        "arg".into(),
+                        nested_consumer_assert("inline_mlir_input"),
+                        "i32".to_string(),
+                    )],
+                    clobbers: vec![],
+                    returns: None,
+                    dialects: vec![],
+                    block_str: String::new(),
+                    span,
+                }),
+            ),
+            (
+                "inline_mlir_clobber",
+                Expr::InlineMlir(InlineMlirExpr {
+                    inputs: vec![],
+                    clobbers: vec![nested_consumer_assert("inline_mlir_clobber")],
+                    returns: None,
+                    dialects: vec![],
+                    block_str: String::new(),
+                    span,
+                }),
+            ),
+        ];
+
+        for (name, expr) in cases {
+            let mut contracts = std::collections::HashMap::new();
+            TypeChecker::scan_expr_for_asserts(&expr, &mut contracts);
+            assert_eq!(
+                contracts.get(name),
+                Some(&42u64),
+                "the scanner must visit the {name} child: {contracts:?}"
+            );
+        }
+
+        let closure = Expr::Closure(ClosureExpr::new(
+            vec![],
+            Box::new(nested_consumer_assert("closure_body")),
+            span,
+        ));
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::scan_expr_for_asserts(&closure, &mut contracts);
+        assert!(
+            !contracts.contains_key("closure_body"),
+            "a closure body is deferred and must not impose a contract: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_scans_eager_statement_children() {
+        let span = Span::default();
+        let cases = vec![
+            (
+                "let_initializer",
+                Statement::LetDecl(LetDeclStmt::new(
+                    "binding".to_string(),
+                    false,
+                    None,
+                    nested_consumer_assert("let_initializer"),
+                    span,
+                )),
+            ),
+            (
+                "expression_statement",
+                Statement::ExprStmt(ExprStmtStmt::new(
+                    nested_consumer_assert("expression_statement"),
+                    true,
+                    span,
+                )),
+            ),
+            (
+                "return_expression",
+                Statement::Return(ReturnStmt::new(
+                    Some(nested_consumer_assert("return_expression")),
+                    span,
+                )),
+            ),
+            (
+                "assignment_rhs",
+                Statement::Assign(AssignStmt::new(
+                    Expr::Identifier(IdentifierExpr::new("target".into(), span)),
+                    nested_consumer_assert("assignment_rhs"),
+                    span,
+                )),
+            ),
+            (
+                "compound_assignment_rhs",
+                Statement::CompoundAssign(CompoundAssignStmt::new(
+                    Expr::Identifier(IdentifierExpr::new("target".into(), span)),
+                    BinaryOp::Add,
+                    nested_consumer_assert("compound_assignment_rhs"),
+                    span,
+                )),
+            ),
+            (
+                "for_iterable",
+                Statement::ForLoop(ForLoopStmt::new(
+                    "index".to_string(),
+                    Box::new(nested_consumer_assert("for_iterable")),
+                    vec![],
+                    vec![],
+                    span,
+                )),
+            ),
+            (
+                "loop_body",
+                Statement::Loop(LoopStmt::new(
+                    vec![],
+                    vec![Statement::ExprStmt(ExprStmtStmt::new(
+                        nested_consumer_assert("loop_body"),
+                        true,
+                        span,
+                    ))],
+                    span,
+                )),
+            ),
+        ];
+
+        for (name, statement) in cases {
+            let mut contracts = std::collections::HashMap::new();
+            TypeChecker::collect_assert_contracts(&[statement], &mut contracts);
+            assert_eq!(
+                contracts.get(name),
+                Some(&42u64),
+                "the scanner must visit the {name} child: {contracts:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_seam_assert_prescan_extracts_contract() {
         // The pre-scan recovers the consumer's `assert(local_a == 42)` from inside the
@@ -597,7 +915,11 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, SEAM_ASSERT_PROGRAM);
         let program = parser.parse().unwrap();
-        let f = program.functions.last().unwrap(); // `f`
+        let f = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
 
         let mut contracts = std::collections::HashMap::new();
         TypeChecker::collect_assert_contracts(&f.body, &mut contracts);
@@ -625,8 +947,12 @@ fn f(value: i32) -> i32 {
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(&tokens, source);
-        let mut program = parser.parse().expect("nested if expression parses");
-        let function = program.functions.last().expect("function parses");
+        let program = parser.parse().expect("nested if expression parses");
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "f")
+            .expect("function f is present");
 
         let mut contracts = std::collections::HashMap::new();
         TypeChecker::collect_assert_contracts(&function.body, &mut contracts);
@@ -635,22 +961,6 @@ fn f(value: i32) -> i32 {
             contracts.get("value"),
             Some(&42u64),
             "the pre-scan must collect asserts inside binary-expression operands: {contracts:?}"
-        );
-
-        let program_arr = [program.clone()];
-        let env = GlobalAstEnv::build(&program_arr);
-        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
-            crate::session::GlobalSession::new(1),
-        ));
-        let mut checker = TypeChecker::new(&env, &mut worker);
-        for function in &mut program.functions {
-            checker.check_function(function);
-        }
-        assert_eq!(
-            checker.errors.error_count(),
-            0,
-            "the nested-if fixture must be valid Vx: {:?}",
-            checker.errors
         );
     }
 

@@ -68,21 +68,10 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Discharge the per-seam local-completeness / soundness obligation for one transfer
-    /// hop `src -> dst` (see "Precision at the Boundary" and `crate::hir::seam`).
-    ///
-    /// The footprint is the actual `buffer` crossing this seam. Because tensor *contents*
-    /// are opaque, the obligation tracks the coarsest abstraction — definite (`CONST`) vs
-    /// possibly-stale (`TOP`): the producer establishes the buffer (definite), a
-    /// synchronizing transfer is the identity (obligation `unsat` => ACCEPT), and a relaxed
-    /// transfer sends the published buffer to `TOP`, so a consumer can read it stale
-    /// (`sat` => REJECT, with a concrete counterexample naming the buffer). This is the
-    /// per-buffer instance of the paper's `post /\ ~conclusion` schema; the value-contract
-    /// form (`flag => data`) is the message-passing worked example (`seam::check_seam`).
     /// Pre-scan a statement block, recording `assert(var == const)` facts (the value a
-    /// consumer requires of `var`). Recurses through every evaluated expression and nested
-    /// statement block, so a transfer seam checked *before* the consumer's `spawn` body can
-    /// still consult the contract the consumer will impose on the transferred buffer.
+    /// consumer requires of `var`). It walks nested consumer expressions and statement blocks,
+    /// excluding closure bodies and a short-circuited logical right operand, so a transfer seam
+    /// checked before the consumer's `spawn` body can still consult its contract.
     pub(crate) fn collect_assert_contracts(
         stmts: &[Statement],
         out: &mut std::collections::HashMap<String, u64>,
@@ -119,10 +108,9 @@ impl<'a> TypeChecker<'a> {
                     Self::collect_assert_contracts(&l.body, out);
                 }
                 // These statements have no evaluated child expression or statement block.
-                Statement::Break(_)
-                | Statement::Continue(_)
-                | Statement::MacroCall(_)
-                | Statement::Error(_) => {}
+                Statement::Break(_) | Statement::Continue(_) | Statement::Error(_) => {}
+                // Macro expansion happens before type checking, so no macro body remains here.
+                Statement::MacroCall(_) => {}
             }
         }
     }
@@ -1649,8 +1637,17 @@ impl<'a> TypeChecker<'a> {
             });
     }
 
-    /// Discharge this hop's local-completeness and soundness obligation, so the buffer crossing
-    /// the seam is one the program has said enough about.
+    /// Discharge the per-seam local-completeness / soundness obligation for one transfer
+    /// hop `src -> dst` (see "Precision at the Boundary" and `crate::hir::seam`).
+    ///
+    /// The footprint is the actual `buffer` crossing this seam. Because tensor *contents*
+    /// are opaque, the obligation tracks the coarsest abstraction — definite (`CONST`) vs
+    /// possibly-stale (`TOP`): the producer establishes the buffer (definite), a
+    /// synchronizing transfer is the identity (obligation `unsat` => ACCEPT), and a relaxed
+    /// transfer sends the published buffer to `TOP`, so a consumer can read it stale
+    /// (`sat` => REJECT, with a concrete counterexample naming the buffer). This is the
+    /// per-buffer instance of the paper's `post /\ ~conclusion` schema; the value-contract
+    /// form (`flag => data`) is the message-passing worked example (`seam::check_seam`).
     fn discharge_seam_obligation(&mut self, t: &TransferExpr, edge: &ResolvedEdge, relaxed: bool) {
         let source_mem = edge.source_mem.clone();
         let target_mem = edge.target_mem.clone();
