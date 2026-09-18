@@ -439,6 +439,29 @@ fn bad_matmul() -> Tensor<f32, [?, ?]> {
     }
 
     #[test]
+    fn liveness_includes_a_use_in_an_unsafe_block_result() {
+        let input = r#"
+        fn f() -> i32 {
+            let value = 1;
+            let result = unsafe { value };
+            return result;
+        }
+        "#;
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let program = parser.parse().expect("unsafe block parses");
+
+        let liveness = TypeChecker::compute_block_liveness(&program.functions[0].body);
+
+        assert_eq!(
+            liveness.get("value"),
+            Some(&1),
+            "a value used by an unsafe block result remains live at that statement"
+        );
+    }
+
+    #[test]
     fn liveness_includes_an_autodiff_argument() {
         let input = r#"
         fn cube(v: f32) -> f32 { return v * v * v; }

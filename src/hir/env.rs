@@ -634,6 +634,9 @@ impl<'a> TypeChecker<'a> {
                 for s in &u.stmts {
                     Self::extract_uses_stmt(s, uses);
                 }
+                if let Some(ret) = &u.ret {
+                    Self::extract_uses_expr(ret, uses);
+                }
             }
             Expr::ComptimeBlock(c) => {
                 for stmt in &c.stmts {
