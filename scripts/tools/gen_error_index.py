@@ -57,6 +57,9 @@ and so on. A `W` prefix is a warning rather than an error.
 > This file is generated from `src/diagnostic.rs` by `scripts/tools/gen_error_index.py`. Edit the
 > doc comments on the codes there, not this file.
 
+Every code below links to its own page, which carries the message the compiler emits and, where
+the test suite has one, a program that triggers it.
+
 """
 
 
@@ -112,7 +115,9 @@ def render(entries):
         out.append("| Code | Meaning |")
         out.append("| --- | --- |")
         for code, desc in items:
-            out.append(f"| `{code}` | {desc or '—'} |")
+            # Each code also has a page of its own at vxlang.org/errors/, with the message and a
+            # program that triggers it. Root-relative, so mdBook leaves it alone.
+            out.append(f"| [`{code}`](/errors/{code}/) | {desc or '—'} |")
         out.append("")
 
     total = sum(len(v) for v in by_section.values())

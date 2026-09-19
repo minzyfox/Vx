@@ -545,6 +545,14 @@ footer > p {
   overflow-x: auto;
 }
 
+/* A diagnostic message is prose rather than code, and the part that names the fix tends to
+   sit at the end of the line. Wrap it instead of hiding it behind a sideways scroll. */
+.post pre.diag {
+  overflow-x: visible;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
 .post-foot {
   margin-top: 3.5rem;
   padding-top: 1.5rem;

@@ -7,6 +7,11 @@ on:
     branches: [ main ]
     paths:
       - 'www/**'
+      # The per-code diagnostic pages are generated from the compiler's diagnostic table and
+      # the fixtures that assert each code, so a change to either changes the site.
+      - 'src/diagnostic.rs'
+      - 'tests/**'
+      - 'scripts/tools/gen_error_pages.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -41,6 +46,21 @@ jobs:
       - name: Build the book
         run: mdbook build www/book
 
+      # One page per diagnostic code, so an error pasted into a search engine has somewhere to
+      # land. Generated rather than committed: the content comes from src/diagnostic.rs and the
+      # fixtures, and 121 pages of build output do not belong in the tree.
+      - name: Generate the diagnostic pages
+        run: |
+          set -euo pipefail
+          python3 scripts/tools/gen_error_pages.py
+          pages=$(find www/errors -mindepth 2 -name index.html | wc -l)
+          codes=$(grep -cE '^    [EW][0-9]{4},$' src/diagnostic.rs)
+          if [ "$pages" -ne "$codes" ]; then
+            echo "Generated $pages pages for $codes declared codes."
+            exit 1
+          fi
+          echo "$pages diagnostic pages, one per declared code."
+
       - name: Assemble the site
         run: |
           set -euo pipefail
@@ -61,6 +81,9 @@ jobs:
           # No generator: posts are infrequent, and a build step is a thing that can rot.
           cp -R www/blog _site/blog
 
+          # One directory per code, so /errors/E6003 resolves without a .html suffix.
+          cp -R www/errors _site/errors
+
           # A 404 that looks like the site rather than like GitHub.
           cp www/index.html _site/404.html
 
@@ -73,7 +96,11 @@ jobs:
           # Every root-relative href on the landing page should resolve to a file in the built
           # site. Failures are collected to a file rather than a variable: the loop runs in a
           # subshell, so an assignment inside it would not survive to the exit check.
-          grep -o 'href="/[^"]*"' _site/index.html \
+          # The landing page plus the generated diagnostic pages, which link into the book by
+          # section and to each other. Deduplicated first: 121 pages share a handful of targets.
+          find _site/errors -name index.html -print0 \
+            | xargs -0 grep -ho 'href="/[^"]*"' \
+            | cat - <(grep -o 'href="/[^"]*"' _site/index.html) \
             | sed 's/href="//; s/"$//' \
             | sort -u > /tmp/links.txt
 
