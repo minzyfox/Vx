@@ -50,12 +50,13 @@ Two contract forms are extracted automatically, in priority order:
 
 The seam at a transfer is checked *before* the consumer (`spawn` body) that reads
 the buffer. To use a contract the consumer states downstream, the compiler runs a
-**pre-scan** of the function body that records `assert(var == const)` facts by
-walking nested consumer expressions and statement blocks. It skips closure bodies
-and a short-circuited logical right operand; a `match` contributes only facts on
-which every arm agrees. At the transfer, the value the consumer requires of the
-produced buffer (matched by the `let` binding it feeds, e.g. `local_a`) is
-consulted as the contract's conclusion.
+**pre-scan** of the function body that records unconditional `assert(var == const)`
+facts. It skips closure bodies and a short-circuited logical right operand; an
+`if` or `match` contributes only facts on which every branch agrees, and loop
+bodies contribute none because they may not run. Loop invariants are collected.
+At the transfer, the value the consumer requires of the produced buffer (matched
+by the `let` binding it feeds, e.g. `local_a`) is consulted as the contract's
+conclusion.
 
 ```vx
 fn f(a: Tensor<i32, [4]>) -> Pinned<Tensor<i32, [4]>, Topology::NPU[0]> {

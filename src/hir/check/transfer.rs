@@ -68,10 +68,9 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Pre-scan a statement block, recording `assert(var == const)` facts (the value a
-    /// consumer requires of `var`). It walks nested consumer expressions and statement blocks,
-    /// excluding closure bodies and a short-circuited logical right operand, so a transfer seam
-    /// checked before the consumer's `spawn` body can still consult its contract.
+    /// Pre-scan a statement block for unconditional `assert(var == const)` facts that a
+    /// consumer requires of `var`. It excludes closure bodies, short-circuited logical right
+    /// operands, and loop bodies; branch facts are retained only when every branch agrees.
     pub(crate) fn collect_assert_contracts(
         stmts: &[Statement],
         out: &mut std::collections::HashMap<String, u64>,
@@ -91,7 +90,6 @@ impl<'a> TypeChecker<'a> {
                     for invariant in &f.invariants {
                         Self::collect_assert_condition(invariant, out);
                     }
-                    Self::collect_assert_contracts(&f.body, out);
                 }
                 Statement::Assign(a) => {
                     Self::scan_expr_for_asserts(&a.lhs, out);
@@ -105,7 +103,6 @@ impl<'a> TypeChecker<'a> {
                     for invariant in &l.invariants {
                         Self::collect_assert_condition(invariant, out);
                     }
-                    Self::collect_assert_contracts(&l.body, out);
                 }
                 // These statements have no evaluated child expression or statement block.
                 Statement::Break(_) | Statement::Continue(_) | Statement::Error(_) => {}
@@ -115,17 +112,61 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Collect facts established by an assertion or loop invariant. Both operands of a logical
-    /// condition are required when the condition holds, unlike an ordinary `&&` or `||` expression
-    /// whose right operand may not run.
+    /// Collect facts established by an assertion or loop invariant. An asserted conjunction
+    /// establishes both operands; an asserted disjunction establishes neither operand alone.
     fn collect_assert_condition(e: &Expr, out: &mut std::collections::HashMap<String, u64>) {
         Self::extract_eq_const(e, out);
         match e {
-            Expr::LogicalOp(logical) => {
+            Expr::LogicalOp(logical) if logical.op == LogicalOp::And => {
                 Self::collect_assert_condition(&logical.lhs, out);
                 Self::collect_assert_condition(&logical.rhs, out);
             }
+            Expr::LogicalOp(logical) => Self::scan_expr_for_asserts(&logical.lhs, out),
             _ => Self::scan_expr_for_asserts(e, out),
+        }
+    }
+
+    /// Merge only facts established by every branch. A branch which may not run cannot impose an
+    /// unconditional consumer contract.
+    fn collect_shared_contracts(
+        branches: &[&[Statement]],
+        out: &mut std::collections::HashMap<String, u64>,
+    ) {
+        let Some((first, remaining)) = branches.split_first() else {
+            return;
+        };
+        let mut shared = std::collections::HashMap::new();
+        Self::collect_assert_contracts(first, &mut shared);
+        for branch in remaining {
+            let mut branch_contracts = std::collections::HashMap::new();
+            Self::collect_assert_contracts(branch, &mut branch_contracts);
+            shared.retain(|name, value| branch_contracts.get(name) == Some(value));
+        }
+        out.extend(shared);
+    }
+
+    /// Descend through a topology's index expressions. Topology nodes occur in ordinary
+    /// expressions as well as transfer predicates and spawn targets.
+    fn scan_topology_for_asserts(
+        topology: &Topology,
+        out: &mut std::collections::HashMap<String, u64>,
+    ) {
+        match topology {
+            Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
+                Self::scan_expr_for_asserts(index, out);
+            }
+            Topology::Slice(base, start, end) => {
+                Self::scan_topology_for_asserts(base, out);
+                Self::scan_expr_for_asserts(start, out);
+                Self::scan_expr_for_asserts(end, out);
+            }
+            Topology::CPU
+            | Topology::AMX
+            | Topology::ANE
+            | Topology::CpuAvx512
+            | Topology::CpuNeon
+            | Topology::Custom(_)
+            | Topology::Current => {}
         }
     }
 
@@ -138,6 +179,7 @@ impl<'a> TypeChecker<'a> {
     ) {
         match e {
             Expr::SpawnOn(s) => {
+                Self::scan_topology_for_asserts(&s.top, out);
                 Self::collect_assert_contracts(&s.stmts, out);
                 if let Some(r) = &s.ret {
                     Self::scan_expr_for_asserts(r, out);
@@ -157,27 +199,18 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::If(i) => {
                 Self::scan_expr_for_asserts(&i.cond, out);
-                Self::collect_assert_contracts(&i.then_block, out);
                 if let Some(eb) = &i.else_block {
-                    Self::collect_assert_contracts(eb, out);
+                    Self::collect_shared_contracts(&[&i.then_block, eb], out);
                 }
             }
             Expr::Match(m) => {
                 Self::scan_expr_for_asserts(&m.expr, out);
-                if let Some((first_arm, remaining_arms)) = m.arms.split_first() {
-                    let mut shared = std::collections::HashMap::new();
-                    Self::collect_assert_contracts(&first_arm.body, &mut shared);
-
-                    for arm in remaining_arms {
-                        let mut arm_contracts = std::collections::HashMap::new();
-                        Self::collect_assert_contracts(&arm.body, &mut arm_contracts);
-                        shared.retain(|name, value| arm_contracts.get(name) == Some(value));
-                    }
-
-                    // An assertion from a single arm is conditional. Only facts every arm
-                    // establishes can describe the consumer after this match.
-                    out.extend(shared);
-                }
+                let branches = m
+                    .arms
+                    .iter()
+                    .map(|arm| arm.body.as_slice())
+                    .collect::<Vec<_>>();
+                Self::collect_shared_contracts(&branches, out);
             }
             Expr::Transfer(t) => Self::scan_expr_for_asserts(&t.expr, out),
             Expr::EnumVariant(v) => {
@@ -281,12 +314,15 @@ impl<'a> TypeChecker<'a> {
             // A closure body is deferred until the closure is invoked, so it is not a consumer
             // contract at the point where the closure expression is evaluated.
             Expr::Closure(_) => {}
+            Expr::TransferPredicate(t) => {
+                Self::scan_topology_for_asserts(&t.from, out);
+                Self::scan_topology_for_asserts(&t.to, out);
+            }
+            Expr::Topology(t) => Self::scan_topology_for_asserts(&t.top, out),
             Expr::Identifier(_)
             | Expr::Number(_)
             | Expr::StringLiteral(_)
-            | Expr::TransferPredicate(_)
             | Expr::MemorySpace(_)
-            | Expr::Topology(_)
             | Expr::MacroCall(_)
             | Expr::SizeOf(_) => {}
         }

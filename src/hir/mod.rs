@@ -588,23 +588,33 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
 }
 "#;
 
-    fn nested_consumer_assert(name: &str) -> Expr {
+    fn equality_condition(name: &str, value: &str) -> Expr {
         let span = Span::default();
-        let equality = Expr::RelationalOp(RelationalOpExpr::new(
+        Expr::RelationalOp(RelationalOpExpr::new(
             Box::new(Expr::Identifier(IdentifierExpr::new(name.into(), span))),
             RelationalOp::Eq,
-            Box::new(Expr::Number(NumberExpr::new("42".to_string(), None, span))),
+            Box::new(Expr::Number(NumberExpr::new(value.to_string(), None, span))),
             span,
-        ));
-        Expr::If(IfExpr::new(
-            false,
-            Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
-            vec![Statement::Assert(AssertStmt::new(
-                Box::new(equality),
+        ))
+    }
+
+    fn assert_eq_const(name: &str, value: &str) -> Statement {
+        Statement::Assert(AssertStmt::new(
+            Box::new(equality_condition(name, value)),
+            None,
+            Span::default(),
+        ))
+    }
+
+    fn nested_consumer_assert(name: &str) -> Expr {
+        let span = Span::default();
+        Expr::UnsafeBlock(UnsafeBlockExpr::new(
+            vec![assert_eq_const(name, "42")],
+            Some(Box::new(Expr::Number(NumberExpr::new(
+                "1".to_string(),
                 None,
                 span,
-            ))],
-            None,
+            )))),
             span,
         ))
     }
@@ -627,6 +637,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                 Expr::IndirectCall(IndirectCallExpr::new(
                     Box::new(Expr::Identifier(IdentifierExpr::new("callee".into(), span))),
                     vec![nested_consumer_assert("indirect_argument")],
+                    span,
+                )),
+            ),
+            (
+                "indirect_callee",
+                Expr::IndirectCall(IndirectCallExpr::new(
+                    Box::new(nested_consumer_assert("indirect_callee")),
+                    vec![],
                     span,
                 )),
             ),
@@ -654,6 +672,14 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                 )),
             ),
             (
+                "index_base",
+                Expr::IndexAccess(IndexAccessExpr::new(
+                    Box::new(nested_consumer_assert("index_base")),
+                    Box::new(Expr::Number(NumberExpr::new("0".to_string(), None, span))),
+                    span,
+                )),
+            ),
+            (
                 "method_argument",
                 Expr::MethodCall(MethodCallExpr::new(
                     Box::new(Expr::Identifier(IdentifierExpr::new(
@@ -663,6 +689,16 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     "method".into(),
                     None,
                     vec![nested_consumer_assert("method_argument")],
+                    span,
+                )),
+            ),
+            (
+                "method_base",
+                Expr::MethodCall(MethodCallExpr::new(
+                    Box::new(nested_consumer_assert("method_base")),
+                    "method".into(),
+                    None,
+                    vec![],
                     span,
                 )),
             ),
@@ -681,6 +717,46 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     Box::new(Expr::Number(NumberExpr::new("1".to_string(), None, span))),
                     RelationalOp::Eq,
                     Box::new(nested_consumer_assert("relational_rhs")),
+                    span,
+                )),
+            ),
+            (
+                "unary_operand",
+                Expr::UnaryOp(UnaryOpExpr::new(
+                    UnaryOp::Not,
+                    Box::new(nested_consumer_assert("unary_operand")),
+                    span,
+                )),
+            ),
+            (
+                "borrow_operand",
+                Expr::Borrow(BorrowExpr::new(
+                    Box::new(nested_consumer_assert("borrow_operand")),
+                    false,
+                    span,
+                )),
+            ),
+            (
+                "dereference_operand",
+                Expr::Dereference(DereferenceExpr::new(
+                    Box::new(nested_consumer_assert("dereference_operand")),
+                    span,
+                )),
+            ),
+            (
+                "transfer_operand",
+                Expr::Transfer(TransferExpr::new(
+                    Box::new(nested_consumer_assert("transfer_operand")),
+                    MemorySpace::CPUDRAM,
+                    span,
+                )),
+            ),
+            (
+                "enum_payload",
+                Expr::EnumVariant(EnumVariantExpr::new(
+                    "Result".into(),
+                    "Ok".into(),
+                    Some(vec![nested_consumer_assert("enum_payload")]),
                     span,
                 )),
             ),
@@ -800,6 +876,50 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 }),
             ),
+            (
+                "topology_index",
+                Expr::Topology(TopologyExpr::new(
+                    Topology::NPU(Box::new(nested_consumer_assert("topology_index"))),
+                    span,
+                )),
+            ),
+            (
+                "transfer_predicate_index",
+                Expr::TransferPredicate(TransferPredicateExpr {
+                    from: Topology::GPU(Box::new(nested_consumer_assert(
+                        "transfer_predicate_index",
+                    ))),
+                    to: Topology::CPU,
+                    span,
+                }),
+            ),
+            ("unsafe_block", nested_consumer_assert("unsafe_block")),
+            (
+                "comptime_block",
+                Expr::ComptimeBlock(ComptimeBlockExpr::new(
+                    vec![assert_eq_const("comptime_block", "42")],
+                    None,
+                    span,
+                )),
+            ),
+            (
+                "spawn_body",
+                Expr::SpawnOn(SpawnOnExpr::new(
+                    Topology::CPU,
+                    vec![assert_eq_const("spawn_body", "42")],
+                    None,
+                    span,
+                )),
+            ),
+            (
+                "spawn_topology_index",
+                Expr::SpawnOn(SpawnOnExpr::new(
+                    Topology::NPU(Box::new(nested_consumer_assert("spawn_topology_index"))),
+                    vec![],
+                    None,
+                    span,
+                )),
+            ),
         ];
 
         for (name, expr) in cases {
@@ -823,6 +943,36 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
             !contracts.contains_key("closure_body"),
             "a closure body is deferred and must not impose a contract: {contracts:?}"
         );
+    }
+
+    #[test]
+    fn seam_assert_prescan_scans_topology_children() {
+        let span = Span::default();
+        let expr = Expr::TransferPredicate(TransferPredicateExpr {
+            from: Topology::Slice(
+                Box::new(Topology::NPU(Box::new(nested_consumer_assert(
+                    "slice_base_index",
+                )))),
+                Box::new(nested_consumer_assert("slice_start")),
+                Box::new(nested_consumer_assert("slice_end")),
+            ),
+            to: Topology::AccCore(Box::new(nested_consumer_assert("predicate_to_index"))),
+            span,
+        });
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::scan_expr_for_asserts(&expr, &mut contracts);
+        for name in [
+            "slice_base_index",
+            "slice_start",
+            "slice_end",
+            "predicate_to_index",
+        ] {
+            assert_eq!(
+                contracts.get(name),
+                Some(&42),
+                "the scanner must visit the {name} topology child: {contracts:?}"
+            );
+        }
     }
 
     #[test]
@@ -863,11 +1013,28 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                 )),
             ),
             (
+                "assignment_lhs",
+                Statement::Assign(AssignStmt::new(
+                    nested_consumer_assert("assignment_lhs"),
+                    Expr::Number(NumberExpr::new("0".to_string(), None, span)),
+                    span,
+                )),
+            ),
+            (
                 "compound_assignment_rhs",
                 Statement::CompoundAssign(CompoundAssignStmt::new(
                     Expr::Identifier(IdentifierExpr::new("target".into(), span)),
                     BinaryOp::Add,
                     nested_consumer_assert("compound_assignment_rhs"),
+                    span,
+                )),
+            ),
+            (
+                "compound_assignment_lhs",
+                Statement::CompoundAssign(CompoundAssignStmt::new(
+                    nested_consumer_assert("compound_assignment_lhs"),
+                    BinaryOp::Add,
+                    Expr::Number(NumberExpr::new("0".to_string(), None, span)),
                     span,
                 )),
             ),
@@ -881,18 +1048,6 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                     span,
                 )),
             ),
-            (
-                "loop_body",
-                Statement::Loop(LoopStmt::new(
-                    vec![],
-                    vec![Statement::ExprStmt(ExprStmtStmt::new(
-                        nested_consumer_assert("loop_body"),
-                        true,
-                        span,
-                    ))],
-                    span,
-                )),
-            ),
         ];
 
         for (name, statement) in cases {
@@ -902,6 +1057,148 @@ fn f(a: Tensor<i32, [?, ?]>) -> Pinned<Tensor<i32, [?, ?]>, Topology::NPU[0]> {
                 contracts.get(name),
                 Some(&42u64),
                 "the scanner must visit the {name} child: {contracts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seam_assert_prescan_keeps_only_unconditional_branch_and_loop_contracts() {
+        let span = Span::default();
+        let condition = Box::new(Expr::Identifier(IdentifierExpr::new(
+            "condition".into(),
+            span,
+        )));
+
+        let cases = vec![
+            (
+                "if_disagrees",
+                Expr::If(IfExpr::new(
+                    false,
+                    condition.clone(),
+                    vec![assert_eq_const("if_disagrees", "42")],
+                    Some(vec![assert_eq_const("if_disagrees", "7")]),
+                    span,
+                )),
+                None,
+            ),
+            (
+                "if_single_branch",
+                Expr::If(IfExpr::new(
+                    false,
+                    condition.clone(),
+                    vec![assert_eq_const("if_single_branch", "42")],
+                    None,
+                    span,
+                )),
+                None,
+            ),
+            (
+                "if_shared",
+                Expr::If(IfExpr::new(
+                    false,
+                    condition,
+                    vec![assert_eq_const("if_shared", "42")],
+                    Some(vec![assert_eq_const("if_shared", "42")]),
+                    span,
+                )),
+                Some(42),
+            ),
+        ];
+
+        for (name, expr, expected) in cases {
+            let mut contracts = std::collections::HashMap::new();
+            TypeChecker::scan_expr_for_asserts(&expr, &mut contracts);
+            assert_eq!(
+                contracts.get(name).copied(),
+                expected,
+                "the scanner must retain only unconditional if facts: {contracts:?}"
+            );
+        }
+
+        let loop_stmt = Statement::Loop(LoopStmt::new(
+            vec![equality_condition("loop_invariant", "42")],
+            vec![assert_eq_const("loop_body", "7")],
+            span,
+        ));
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&[loop_stmt], &mut contracts);
+        assert_eq!(contracts.get("loop_invariant"), Some(&42));
+        assert!(
+            !contracts.contains_key("loop_body"),
+            "a loop body may not run and cannot impose a contract: {contracts:?}"
+        );
+
+        let for_loop = Statement::ForLoop(ForLoopStmt::new(
+            "index".to_string(),
+            Box::new(Expr::Number(NumberExpr::new("0".to_string(), None, span))),
+            vec![equality_condition("for_invariant", "42")],
+            vec![assert_eq_const("for_body", "7")],
+            span,
+        ));
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(&[for_loop], &mut contracts);
+        assert_eq!(contracts.get("for_invariant"), Some(&42));
+        assert!(
+            !contracts.contains_key("for_body"),
+            "a for-loop body may not run and cannot impose a contract: {contracts:?}"
+        );
+    }
+
+    #[test]
+    fn seam_assert_prescan_handles_asserted_disjunctions_and_short_circuiting() {
+        let span = Span::default();
+        let disjunction = Statement::Assert(AssertStmt::new(
+            Box::new(Expr::LogicalOp(LogicalOpExpr::new(
+                Box::new(equality_condition("left_disjunct", "42")),
+                LogicalOp::Or,
+                Box::new(equality_condition("right_disjunct", "7")),
+                span,
+            ))),
+            None,
+            span,
+        ));
+        let asserted_short_circuit = Statement::Assert(AssertStmt::new(
+            Box::new(Expr::LogicalOp(LogicalOpExpr::new(
+                Box::new(Expr::Identifier(IdentifierExpr::new(
+                    "predicate".into(),
+                    span,
+                ))),
+                LogicalOp::Or,
+                Box::new(nested_consumer_assert("asserted_rhs")),
+                span,
+            ))),
+            None,
+            span,
+        ));
+        let mut contracts = std::collections::HashMap::new();
+        TypeChecker::collect_assert_contracts(
+            &[disjunction, asserted_short_circuit],
+            &mut contracts,
+        );
+        assert!(
+            !contracts.contains_key("left_disjunct")
+                && !contracts.contains_key("right_disjunct")
+                && !contracts.contains_key("asserted_rhs"),
+            "an asserted disjunction establishes neither operand: {contracts:?}"
+        );
+
+        for operator in [LogicalOp::And, LogicalOp::Or] {
+            let expr = Expr::LogicalOp(LogicalOpExpr::new(
+                Box::new(nested_consumer_assert("logical_lhs")),
+                operator,
+                Box::new(nested_consumer_assert("logical_rhs")),
+                span,
+            ));
+            let mut contracts = std::collections::HashMap::new();
+            TypeChecker::scan_expr_for_asserts(&expr, &mut contracts);
+            assert_eq!(
+                contracts.get("logical_lhs"),
+                Some(&42),
+                "the always-evaluated logical left operand must be scanned: {contracts:?}"
+            );
+            assert!(
+                !contracts.contains_key("logical_rhs"),
+                "the short-circuited logical right operand must be skipped: {contracts:?}"
             );
         }
     }
@@ -939,6 +1236,7 @@ fn f(value: i32) -> i32 {
         assert(value == 42);
         2
     } else {
+        assert(value == 42);
         3
     };
     return result;
@@ -1005,6 +1303,7 @@ fn f(value: i32) -> i32 {
         assert(value == 42);
         true
     } else {
+        assert(value == 42);
         true
     });
     return 0;
