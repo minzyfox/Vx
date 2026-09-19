@@ -68,28 +68,16 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Discharge the per-seam local-completeness / soundness obligation for one transfer
-    /// hop `src -> dst` (see "Precision at the Boundary" and `crate::hir::seam`).
-    ///
-    /// The footprint is the actual `buffer` crossing this seam. Because tensor *contents*
-    /// are opaque, the obligation tracks the coarsest abstraction — definite (`CONST`) vs
-    /// possibly-stale (`TOP`): the producer establishes the buffer (definite), a
-    /// synchronizing transfer is the identity (obligation `unsat` => ACCEPT), and a relaxed
-    /// transfer sends the published buffer to `TOP`, so a consumer can read it stale
-    /// (`sat` => REJECT, with a concrete counterexample naming the buffer). This is the
-    /// per-buffer instance of the paper's `post /\ ~conclusion` schema; the value-contract
-    /// form (`flag => data`) is the message-passing worked example (`seam::check_seam`).
-    /// Pre-scan a statement block, recording `assert(var == const)` facts (the value a
-    /// consumer requires of `var`). Recurses into nested blocks (`spawn`, `if`, loops),
-    /// so a transfer seam checked *before* the consumer's `spawn` body can still consult
-    /// the contract the consumer will impose on the transferred buffer.
+    /// Pre-scan a statement block for unconditional `assert(var == const)` facts that a
+    /// consumer requires of `var`. It excludes closure bodies, short-circuited logical right
+    /// operands, and loop bodies; branch facts are retained only when every branch agrees.
     pub(crate) fn collect_assert_contracts(
         stmts: &[Statement],
         out: &mut std::collections::HashMap<String, u64>,
     ) {
         for s in stmts {
             match s {
-                Statement::Assert(a) => Self::extract_eq_const(&a.expr, out),
+                Statement::Assert(a) => Self::collect_assert_condition(&a.expr, out),
                 Statement::LetDecl(l) => Self::scan_expr_for_asserts(&l.expr, out),
                 Statement::ExprStmt(e) => Self::scan_expr_for_asserts(&e.expr, out),
                 Statement::Return(r) => {
@@ -97,19 +85,101 @@ impl<'a> TypeChecker<'a> {
                         Self::scan_expr_for_asserts(e, out);
                     }
                 }
-                Statement::ForLoop(f) => Self::collect_assert_contracts(&f.body, out),
-                _ => {}
+                Statement::ForLoop(f) => {
+                    Self::scan_expr_for_asserts(&f.iterable, out);
+                    for invariant in &f.invariants {
+                        Self::collect_assert_condition(invariant, out);
+                    }
+                }
+                Statement::Assign(a) => {
+                    Self::scan_expr_for_asserts(&a.lhs, out);
+                    Self::scan_expr_for_asserts(&a.rhs, out);
+                }
+                Statement::CompoundAssign(a) => {
+                    Self::scan_expr_for_asserts(&a.lhs, out);
+                    Self::scan_expr_for_asserts(&a.rhs, out);
+                }
+                Statement::Loop(l) => {
+                    for invariant in &l.invariants {
+                        Self::collect_assert_condition(invariant, out);
+                    }
+                }
+                // These statements have no evaluated child expression or statement block.
+                Statement::Break(_) | Statement::Continue(_) | Statement::Error(_) => {}
+                // Macro expansion happens before type checking, so no macro body remains here.
+                Statement::MacroCall(_) => {}
             }
         }
     }
 
-    /// Descend into the block-bearing expressions that can hold consumer asserts.
+    /// Collect facts established by an assertion or loop invariant. An asserted conjunction
+    /// establishes both operands; an asserted disjunction establishes neither operand alone.
+    fn collect_assert_condition(e: &Expr, out: &mut std::collections::HashMap<String, u64>) {
+        Self::extract_eq_const(e, out);
+        match e {
+            Expr::LogicalOp(logical) if logical.op == LogicalOp::And => {
+                Self::collect_assert_condition(&logical.lhs, out);
+                Self::collect_assert_condition(&logical.rhs, out);
+            }
+            Expr::LogicalOp(logical) => Self::scan_expr_for_asserts(&logical.lhs, out),
+            _ => Self::scan_expr_for_asserts(e, out),
+        }
+    }
+
+    /// Merge only facts established by every branch. A branch which may not run cannot impose an
+    /// unconditional consumer contract.
+    fn collect_shared_contracts(
+        branches: &[&[Statement]],
+        out: &mut std::collections::HashMap<String, u64>,
+    ) {
+        let Some((first, remaining)) = branches.split_first() else {
+            return;
+        };
+        let mut shared = std::collections::HashMap::new();
+        Self::collect_assert_contracts(first, &mut shared);
+        for branch in remaining {
+            let mut branch_contracts = std::collections::HashMap::new();
+            Self::collect_assert_contracts(branch, &mut branch_contracts);
+            shared.retain(|name, value| branch_contracts.get(name) == Some(value));
+        }
+        out.extend(shared);
+    }
+
+    /// Descend through a topology's index expressions. Topology nodes occur in ordinary
+    /// expressions as well as transfer predicates and spawn targets.
+    fn scan_topology_for_asserts(
+        topology: &Topology,
+        out: &mut std::collections::HashMap<String, u64>,
+    ) {
+        match topology {
+            Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
+                Self::scan_expr_for_asserts(index, out);
+            }
+            Topology::Slice(base, start, end) => {
+                Self::scan_topology_for_asserts(base, out);
+                Self::scan_expr_for_asserts(start, out);
+                Self::scan_expr_for_asserts(end, out);
+            }
+            Topology::CPU
+            | Topology::AMX
+            | Topology::ANE
+            | Topology::CpuAvx512
+            | Topology::CpuNeon
+            | Topology::Custom(_)
+            | Topology::Current => {}
+        }
+    }
+
+    /// Descend through expressions which may contain a consumer assert in a nested block.
+    /// Closures are deliberately skipped: creating a closure does not execute its body, so an
+    /// assertion within it is not a contract imposed by this consumer.
     pub(crate) fn scan_expr_for_asserts(
         e: &Expr,
         out: &mut std::collections::HashMap<String, u64>,
     ) {
         match e {
             Expr::SpawnOn(s) => {
+                Self::scan_topology_for_asserts(&s.top, out);
                 Self::collect_assert_contracts(&s.stmts, out);
                 if let Some(r) = &s.ret {
                     Self::scan_expr_for_asserts(r, out);
@@ -128,12 +198,133 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Expr::If(i) => {
-                Self::collect_assert_contracts(&i.then_block, out);
+                Self::scan_expr_for_asserts(&i.cond, out);
                 if let Some(eb) = &i.else_block {
-                    Self::collect_assert_contracts(eb, out);
+                    Self::collect_shared_contracts(&[&i.then_block, eb], out);
                 }
             }
-            _ => {}
+            Expr::Match(m) => {
+                Self::scan_expr_for_asserts(&m.expr, out);
+                let branches = m
+                    .arms
+                    .iter()
+                    .map(|arm| arm.body.as_slice())
+                    .collect::<Vec<_>>();
+                Self::collect_shared_contracts(&branches, out);
+            }
+            Expr::Transfer(t) => Self::scan_expr_for_asserts(&t.expr, out),
+            Expr::EnumVariant(v) => {
+                for payload in v.payload.iter().flatten() {
+                    Self::scan_expr_for_asserts(payload, out);
+                }
+            }
+            Expr::FunctionCall(c) => {
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::IndirectCall(c) => {
+                Self::scan_expr_for_asserts(&c.callee, out);
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Array(a) => {
+                for element in &a.elements {
+                    Self::scan_expr_for_asserts(element, out);
+                }
+            }
+            Expr::MemberAccess(m) => Self::scan_expr_for_asserts(&m.base, out),
+            Expr::IndexAccess(i) => {
+                Self::scan_expr_for_asserts(&i.base, out);
+                Self::scan_expr_for_asserts(&i.index, out);
+            }
+            Expr::MethodCall(c) => {
+                Self::scan_expr_for_asserts(&c.base, out);
+                for arg in &c.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::BinaryOp(b) => {
+                Self::scan_expr_for_asserts(&b.lhs, out);
+                Self::scan_expr_for_asserts(&b.rhs, out);
+            }
+            Expr::RelationalOp(r) => {
+                Self::scan_expr_for_asserts(&r.lhs, out);
+                Self::scan_expr_for_asserts(&r.rhs, out);
+            }
+            Expr::LogicalOp(l) => {
+                Self::scan_expr_for_asserts(&l.lhs, out);
+                // The right operand of `&&` and `||` may not run, so its assertions cannot
+                // establish a consumer contract.
+            }
+            Expr::UnaryOp(u) => Self::scan_expr_for_asserts(&u.expr, out),
+            Expr::Borrow(b) => Self::scan_expr_for_asserts(&b.expr, out),
+            Expr::Dereference(d) => Self::scan_expr_for_asserts(&d.expr, out),
+            Expr::StructInit(s) => {
+                for (_, field) in &s.fields {
+                    Self::scan_expr_for_asserts(field, out);
+                }
+            }
+            Expr::Range(r) => {
+                Self::scan_expr_for_asserts(&r.start, out);
+                Self::scan_expr_for_asserts(&r.end, out);
+            }
+            Expr::Grad(g) => {
+                for arg in &g.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Vjp(v) => {
+                for arg in &v.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+                Self::scan_expr_for_asserts(&v.cotangent, out);
+            }
+            Expr::Jvp(j) => {
+                for arg in &j.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+                Self::scan_expr_for_asserts(&j.tangent, out);
+            }
+            Expr::VecMacro(v) => {
+                for element in &v.elements {
+                    Self::scan_expr_for_asserts(element, out);
+                }
+            }
+            Expr::AsCast(c) => Self::scan_expr_for_asserts(&c.expr, out),
+            Expr::Print(p) => {
+                for arg in &p.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::Println(p) => {
+                for arg in &p.args {
+                    Self::scan_expr_for_asserts(arg, out);
+                }
+            }
+            Expr::InlineMlir(i) => {
+                for (_, input, _) in &i.inputs {
+                    Self::scan_expr_for_asserts(input, out);
+                }
+                for clobber in &i.clobbers {
+                    Self::scan_expr_for_asserts(clobber, out);
+                }
+            }
+            // A closure body is deferred until the closure is invoked, so it is not a consumer
+            // contract at the point where the closure expression is evaluated.
+            Expr::Closure(_) => {}
+            Expr::TransferPredicate(t) => {
+                Self::scan_topology_for_asserts(&t.from, out);
+                Self::scan_topology_for_asserts(&t.to, out);
+            }
+            Expr::Topology(t) => Self::scan_topology_for_asserts(&t.top, out),
+            Expr::Identifier(_)
+            | Expr::Number(_)
+            | Expr::StringLiteral(_)
+            | Expr::MemorySpace(_)
+            | Expr::MacroCall(_)
+            | Expr::SizeOf(_) => {}
         }
     }
 
@@ -1482,8 +1673,17 @@ impl<'a> TypeChecker<'a> {
             });
     }
 
-    /// Discharge this hop's local-completeness and soundness obligation, so the buffer crossing
-    /// the seam is one the program has said enough about.
+    /// Discharge the per-seam local-completeness / soundness obligation for one transfer
+    /// hop `src -> dst` (see "Precision at the Boundary" and `crate::hir::seam`).
+    ///
+    /// The footprint is the actual `buffer` crossing this seam. Because tensor *contents*
+    /// are opaque, the obligation tracks the coarsest abstraction — definite (`CONST`) vs
+    /// possibly-stale (`TOP`): the producer establishes the buffer (definite), a
+    /// synchronizing transfer is the identity (obligation `unsat` => ACCEPT), and a relaxed
+    /// transfer sends the published buffer to `TOP`, so a consumer can read it stale
+    /// (`sat` => REJECT, with a concrete counterexample naming the buffer). This is the
+    /// per-buffer instance of the paper's `post /\ ~conclusion` schema; the value-contract
+    /// form (`flag => data`) is the message-passing worked example (`seam::check_seam`).
     fn discharge_seam_obligation(&mut self, t: &TransferExpr, edge: &ResolvedEdge, relaxed: bool) {
         let source_mem = edge.source_mem.clone();
         let target_mem = edge.target_mem.clone();
