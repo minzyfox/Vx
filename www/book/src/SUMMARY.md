@@ -23,7 +23,6 @@
 
 - [Topologies and memory](heterogeneous.md)
 - [Machine files](machine-files.md)
-- [Carrying facts across boundaries](correlation.md)
 - [NUMA and the host's memory domains](numa.md)
 
 # Reference
