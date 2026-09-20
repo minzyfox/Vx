@@ -12,6 +12,7 @@ on:
       - 'src/diagnostic.rs'
       - 'tests/**'
       - 'scripts/tools/gen_error_pages.py'
+      - 'scripts/tools/gen_site_metadata.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -72,6 +73,7 @@ jobs:
           cp www/favicon.svg  _site/
           cp www/install.sh   _site/
           cp www/CNAME        _site/
+          cp www/ai-usage.html _site/
 
           # The book is served under /docs/.
           mkdir -p _site/docs
@@ -86,6 +88,13 @@ jobs:
 
           # A 404 that looks like the site rather than like GitHub.
           cp www/index.html _site/404.html
+
+      # Canonical links, licence, schema.org records and the citation line on every page,
+      # plus robots.txt, sitemap.xml, llms.txt and the TDM record. Run over the assembled
+      # site rather than the sources: it is the only place that sees the book, which mdBook
+      # renders with a head no file in this repository controls.
+      - name: Generate the site metadata
+        run: python3 scripts/tools/gen_site_metadata.py --site _site
 
       - name: Check the install script is valid shell
         run: sh -n _site/install.sh
