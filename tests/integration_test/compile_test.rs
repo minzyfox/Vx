@@ -395,6 +395,15 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
             path
         ));
     }
+    // `// NO-WARN:` is the other direction: text that must NOT appear in any warning. A
+    // fixture for a fixed false positive needs it, since every other check here passes
+    // when a warning is merely present. It never stands alone -- a file still states what
+    // it does expect, so "warn about nothing at all" cannot satisfy it.
+    let unwanted: Vec<String> = source
+        .lines()
+        .filter(|l| l.trim().starts_with("// NO-WARN:"))
+        .map(|l| l.split_once("NO-WARN:").unwrap().1.trim().to_string())
+        .collect();
 
     let mut loader = vxc::module_loader::ModuleLoader::new();
     loader
@@ -474,12 +483,30 @@ fn run_warning_test(path: &Path) -> Result<(), String> {
             ));
         }
     }
+    for w in &unwanted {
+        if let Some(got) = warnings.iter().find(|got| got.contains(w.as_str())) {
+            return Err(format!(
+                "NO-WARN check failed on {:?}: `{}` was not supposed to be warned about, \
+                 but got `{}`.",
+                path, w, got
+            ));
+        }
+    }
     Ok(())
 }
 
 // Backend Runner
 fn run_backend_test(path: &Path) -> Result<(), String> {
     let source = fs::read_to_string(path).expect("Failed to read test file");
+
+    // This runner is the legacy AST code generator. `// REQUIRES: flat-codegen` says the
+    // program's answers are only right on the flat path -- an unsigned `>>` or `%` lowers to
+    // the signed op here, because the element type is gone by the time the op is chosen.
+    // The flat sweep in flat_corpus_sweep.rs still runs the file, so its `EXPECT` lines are
+    // checked -- on one code generator rather than two.
+    if source.contains("// REQUIRES: flat-codegen") {
+        return Ok(());
+    }
 
     // Extract // EXPECT: lines (assuming just one for simplicity right now)
     let expect_lines: Vec<String> = source
