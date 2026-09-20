@@ -944,9 +944,7 @@ fn run_lit_test(path: &Path, force_legacy: bool) -> Result<(), String> {
             .replace("%t", t_val.to_str().unwrap());
 
         // `// REQUIRES: flat-codegen` opts a file out: some constructs exist ONLY on the flat
-        // path (`flash_attention_into`, whose note-and-nest emission is what
-        // kernel_kind_attention.vx pins), and forcing legacy there tests a lowering that
-        // deliberately does not exist.
+        // path, and forcing legacy there tests a lowering that deliberately does not exist.
         // Skip a command that already names the flag: clap rejects it twice.
         if force_legacy
             && !cmd.contains("--legacy-codegen")

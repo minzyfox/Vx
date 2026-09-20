@@ -1914,15 +1914,6 @@ impl<'a> FnEmit<'a> {
             // cuBLAS. The destination register rides the imm (see `Opcode::MatmulInto`).
             Opcode::Matmul => self.op_matmul(idx, ins),
             Opcode::MatmulInto => self.op_matmul_into(idx, ins),
-            // `flash_attention_into(&mut o, &q, &k, &v, scale)` (no result): a serial
-            // `o = softmax(q @ k^T * scale) @ v` nest, preceded by a `vx.attention_note` naming
-            // which memref plays which role. The nest is the correctness contract — a runtime
-            // that cannot (or will not) route runs it as written; the note is what
-            // `kernelKindOf` classifies as `kind=attention` so a runtime that CAN route hands
-            // the region to a fused vendor kernel instead. o, v and scale ride the imm (see
-            // `Opcode::FlashAttnInto`). f16 storage with f32 arithmetic throughout, the same
-            // split the widening contracts (Vx#320) give every half slice.
-            Opcode::FlashAttnInto => self.op_flash_attn_into(idx, ins),
             // Store into a tensor place (no result). A scalar-element place (an `imm = 1`
             // `TensorIndex`) → `memref.store`; a row/sub-view place (an `imm = 0` `TensorIndex`, a row
             // memref in `mem_of`) takes an elementwise vector value → `vector.store`.

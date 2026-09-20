@@ -195,14 +195,8 @@ pub enum Opcode {
     /// this op exists so a matmul region no longer evicts the whole program from the flat path
     /// (and with it every other region's parallel proof).
     MatmulInto = 40,
-    /// `flash_attention_into(&mut o, &q, &k, &v, scale)`: fused scaled-dot-product attention
-    /// written in place, `o = softmax(q @ k^T * scale) @ v` over rank-2 f16 tensors. Five values
-    /// through two operand fields: `operand1` = q, `operand2` = k, and the imm packs the rest --
-    /// `o | v << 16 | scale << 32` (register indices are far below 2^16). Codegen emits a serial
-    /// fallback nest plus a `vx.attention_note` naming the roles, which `kernelKindOf` classifies
-    /// as `kind=attention` so the runtime can route the region to a vendor flash kernel; a
-    /// runtime that refuses runs the nest as written -- slower, never wrong.
-    FlashAttnInto = 41,
+    // 41 was a fused-attention op. It is left unused on purpose: these numbers are the
+    // wire format of a serialized HIR body, so reusing 41 would misread an older stream.
     /// A differentiated call: `grad(f, x)`, `vjp(f, x, v)` or `jvp(f, x, v)`. `type_idx` is the
     /// *target* function's GID (its name and signature come from there), and `imm` packs the
     /// argument count in the low 32 bits with the mode above them -- `AUTODIFF_REVERSE` or
@@ -332,7 +326,6 @@ impl Opcode {
             38 => Abort,
             39 => Barrier,
             40 => MatmulInto,
-            41 => FlashAttnInto,
             42 => AutoDiff,
             43 => TensorLoad,
             44 => TensorDim,
