@@ -6,7 +6,7 @@
 //
 //----------------------------------------------------------------------===//
 // The other half of print_reads_its_argument_at_home.vx: the correction that
-// refusal points at, and the one the flash bench template already writes.
+// refusal points at, and the one a bench template already writes.
 //
 // `transfer(o, Memory::CPU_DRAM)` is the declared way home. It lowers to the
 // plugin's read-back, and the movement is priced by the algebra rather than

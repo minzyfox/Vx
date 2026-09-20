@@ -14,10 +14,10 @@
 // across the edge happened exactly once, so the edge is silent about a body that reads the
 // arrived tile sixteen times.
 //
-// Attention is the shape that makes it concrete. A query loop over key blocks re-reads K and
-// V on every query iteration, so K's reads are queries x keys x d elements against a
-// footprint of keys x d: an amplification factor that is a property of the LOOP NEST, not of
-// any edge, and that nobody declared anywhere.
+// A blocked loop is the shape that makes it concrete. An outer loop over blocks of one
+// operand re-reads the streamed operand every iteration, so its reads are outer x inner x d
+// elements against a footprint of inner x d: an amplification factor that is a property of
+// the LOOP NEST, not of any edge, and that nobody declared anywhere.
 //
 // TOUCHES, NOT FOOTPRINT. The count is how many times an access executes, never how many
 // distinct elements it reaches. `k[t * 2 + jj][d]` is not analysed as an index; it is counted
@@ -437,9 +437,8 @@ impl<'a> TypeChecker<'a> {
                             // annotated-unplaced `let m_new : f32 = if ...` is provably not a
                             // tensor, nested or not, and an annotated-placed one carries its
                             // space on its face. Without this, every scalar if-expression
-                            // binding inside a loop was refused -- which took the flash
-                            // fixture's count from exact to absent, the wrong direction of
-                            // honest.
+                            // binding inside a loop was refused -- which took a blocked
+                            // fixture's count from exact to absent, the wrong direction.
                             if let Some(ann) = &l.ty_ann {
                                 return self.placed_space(ann).map(|space| {
                                     match self.region_elem_bytes(ann) {

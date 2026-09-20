@@ -39,7 +39,7 @@
 // CHECK: dereference device memory
 
 Memory CPU_DRAM {}
-// The same space tests/backend/pass/flash_attention_placed.vx declares, with
+// The same space tests/backend/pass/placed_kernel_four_operands.vx declares, with
 // the one field it omits. Without `managed:` the default is `cached`, which
 // says the hardware moves data implicitly and a host read is therefore fine --
 // a claim that is false for the HBM of a discrete GPU, and precisely why that

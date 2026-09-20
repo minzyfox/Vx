@@ -13,7 +13,7 @@
 //! length or the wrong order still launches -- the driver cannot check one
 //! against the kernel's signature -- so the kernel reads its arguments from the
 //! wrong offsets and returns a plausible wrong answer. Finding that on rented
-//! hardware is the expensive way, and finding it in a fused attention kernel is
+//! hardware is the expensive way, and finding it in a large fused kernel is
 //! worse, because there is nothing to compare the output against.
 
 use std::path::PathBuf;

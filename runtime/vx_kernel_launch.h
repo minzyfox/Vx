@@ -38,7 +38,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/// Enough for eight rank-3 memrefs, or the four rank-2 ones the attention
+/// Enough for eight rank-3 memrefs, or the four rank-2 ones a four-operand
 /// kernel takes with room to spare. A kernel wanting more than this is not a
 /// kernel this path should be quietly truncating for.
 #define VX_LAUNCH_MAX_PARAMS 128
@@ -157,7 +157,7 @@ static inline int vx_launch_build_params(void *const *device_args,
 ///
 /// Counting is confined to the parenthesised signature. Counting every
 /// `.param` in the file also counts each `ld.param` and every extern's return
-/// slot, which turned 28 into 36 when scripts/flash_kernel_to_ptx.sh first
+/// slot, which turned 28 into 36 when the emitted PTX was first
 /// tried it.
 static inline int vx_launch_entry_param_count(const char *ptx,
                                               const char *entry) {

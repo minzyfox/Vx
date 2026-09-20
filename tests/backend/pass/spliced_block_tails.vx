@@ -25,7 +25,7 @@
 //
 // So these are not wrong answers, they are programs that did not build. The
 // shapes are ordinary -- a `spawn` region ending in an `if` is how a device
-// kernel writes a conditional result, and it is what FlashAttention's verdict
+// kernel writes a conditional result, and it is what a blocked kernel's verdict
 // write looks like -- and each is checked here for its value, not merely for
 // compiling, since threading the wrong block would also compile.
 //

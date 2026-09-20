@@ -488,8 +488,8 @@ static void useDeviceMathIn(Region &kernel, ModuleOp module,
 
 // Put a kernel's own scratch on the stack.
 //
-// A `Tensor` declared inside the region -- FlashAttention's `ts`, the one score
-// tile it keeps -- lowers to `memref.alloc`. That is a heap allocation, and in
+// A `Tensor` declared inside the region -- a kernel's one scratch tile --
+// lowers to `memref.alloc`. That is a heap allocation, and in
 // a device kernel it becomes a call to device-side `malloc`: a heap the launch
 // has to be configured with, and a call on every invocation, for what is a
 // 64-byte scratch buffer. Nothing frees it either, so on the host path it leaks
@@ -600,7 +600,7 @@ struct SpawnOpLowering : public OpRewritePattern<SpawnOp> {
     // Vx loop bounds are literals -- `for i in 0..32` -- and they are defined
     // outside the region, so capturing them by value turns every trip count
     // into a runtime argument. That costs twice. It widens the dispatch: the
-    // FlashAttention kernel took eight scalar arguments that are all constants,
+    // measured kernel took eight scalar arguments that are all constants,
     // 8 of its 36 `.param`s. And it hides the shape from the backend, which is
     // the expensive half -- with the bounds opaque, NVVM cannot unroll the
     // 16-wide inner loops, and the same kernel goes from 306 instructions of
@@ -1033,8 +1033,8 @@ struct TransferOpLowering : public OpRewritePattern<TransferOp> {
 /// dereferences device memory and the process dies inside vx_npu_kernel_0,
 /// three frames below anything naming a cause (#251, #348). On a machine with
 /// no device the transfer is a no-op, the pointers stay host pointers and it
-/// passes -- which is how tests/backend/pass/flash_attention_placed.vx sat in
-/// the passing set while faulting on every GPU it was written for.
+/// passes -- which is how a placed kernel sat in the passing set while
+/// faulting on every GPU it was written for.
 ///
 /// Run before the conversion rather than inside the rewrite: a pattern that
 /// fails is retried, so the same message arrived several times and left behind
@@ -1136,9 +1136,9 @@ struct ConvertVxToStandardPass
   /// `nvvm-attach-target`, `convert-gpu-to-nvvm`, `gpu-module-to-binary` --
   /// starts at `gpu.func` inside a `gpu.module`, and nothing emitted one.
   ///
-  /// scripts/flash_kernel_to_ptx.sh has been doing this edit with a text
-  /// transform for as long as #251 has been open, and its header says so: "the
-  /// only edit it makes is structural ... that step *is* the remaining work".
+  /// This edit was done by a text transform outside the compiler for as long
+  /// as #251 has been open; the only edit it makes is structural, and that step
+  /// is the remaining work.
   /// It is structural because the outliner already did the hard part. The
   /// captures are the entry block's arguments, so the signature is a
   /// transcription; the body is a clone; `vx.return` becomes `gpu.return`.
@@ -1185,7 +1185,7 @@ struct ConvertVxToStandardPass
       // is hard.
       //
       // `func`, because a `gpu.module` is its own symbol table: a body that
-      // calls a host helper -- `flash_attention_v4.vx` calls `exp_poly` --
+      // calls a host helper -- a kernel calling something like `exp_poly` --
       // clones into a kernel whose callee is not visible from it, and the
       // verifier rejects the module before anything downstream sees it. Making
       // it a kernel means bringing the callee along or inlining it.
@@ -1354,8 +1354,7 @@ struct ConvertVxToStandardPass
       // Each thread then walks lb+gtid, lb+gtid+stride, ... -- a disjoint
       // cover of the iteration space for ANY launch configuration. A 1x1x1
       // launch has gtid 0 and stride 1: exactly the serial loop, which is why
-      // scripts/launch_emitted_kernel.cpp and every existing test stay
-      // correct without knowing this happened.
+      // every existing test stays correct without knowing this happened.
       //
       // Only the device clone changes. The `vx.kernel` body the host runs
       // still carries the tags as inert attributes and no thread indexing.
@@ -2249,8 +2248,8 @@ struct LaunchOpLowering : public OpRewritePattern<vx::LaunchOp> {
 /// The worker's identity arrives through two calls rather than through extra
 /// parameters on the kernel. Appending parameters would change the C interface
 /// of every outlined kernel, and there are callers outside this pipeline that
-/// know the current shape (scripts/launch_emitted_kernel.cpp, the remote
-/// worker). A call costs one indirect branch per dispatch, not per iteration.
+/// know the current shape (the remote worker). A call costs one indirect
+/// branch per dispatch, not per iteration.
 ///
 /// The degeneracy is the safety property, and it is the same one the device
 /// clone relies on: at one worker, `chunk` is the whole trip, the offsets are 0
@@ -2468,8 +2467,8 @@ static std::string deviceLibdevice() {
 
 /// Compile a `gpu.module` to a device image, as PTX text.
 ///
-/// This is the pipeline scripts/flash_kernel_to_ptx.sh established, moved into
-/// the compiler. That script drove `convert-vx-to-standard`'s own kernel to
+/// This is the pipeline a standalone script established, moved into the
+/// compiler. That script drove `convert-vx-to-standard`'s own kernel to
 /// sm_80 by hand and reported what was left; running the same passes here is
 /// what turns "this kernel can reach PTX" into "every compile produces one".
 /// The script still exists and still runs the pipeline externally, so the two
@@ -2528,9 +2527,7 @@ static std::string deviceImageOf(gpu::GPUModuleOp gpuModule,
   pm.addPass(createConvertMathToLLVMPass());
   // Slice ops from the flat path (`dot`, row axpy) arrive as `vector.*`;
   // lowered to LLVM vectors, NVPTX renders their loads as v4 (128-bit) --
-  // the whole point of admitting the dialect (Vx#378 R1). Mirrored in
-  // scripts/flash_kernel_to_ptx.sh, which must stay an independent
-  // transcription of this same pipeline.
+  // the whole point of admitting the dialect.
   pm.addPass(createConvertVectorToLLVMPass());
   pm.addPass(createGpuToLLVMConversionPass());
   pm.addPass(createReconcileUnrealizedCastsPass());
@@ -2610,7 +2607,7 @@ struct ConvertVxToLLVMPass
     // the last point at which it exists -- and dropped rather than never
     // emitted, so the kernel is still visible in the IR between the two passes
     // (`--pass-pipeline=builtin.module(convert-vx-to-standard)` shows it, which
-    // is what scripts/flash_kernel_to_ptx.sh reads).
+    // is what an out-of-compiler transcription of this pipeline reads).
     SmallVector<gpu::GPUModuleOp> deviceModules;
     getOperation().walk(
         [&](gpu::GPUModuleOp m) { deviceModules.push_back(m); });

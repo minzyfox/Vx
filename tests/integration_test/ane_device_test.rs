@@ -121,7 +121,7 @@ fn coreml_places_these_graphs_where_we_measured() {
 fn the_dispatcher_reports_the_device_coreml_chose() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vxc = PathBuf::from(env!("CARGO_BIN_EXE_vxc"));
-    let program = root.join("benchmarks/flash_attention_ane/flash_attention_split.vx");
+    let program = root.join("tests/backend/pass/ane_matmul_f16.vx");
     assert!(program.is_file(), "missing {}", program.display());
 
     let out = Command::new(&vxc)

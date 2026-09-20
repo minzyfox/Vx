@@ -32,8 +32,8 @@
 // the operands were host memory. `transfer(x, Memory::GPU_HBM)` is the
 // construct that ends that: after one, the pointers are device pointers, and an
 // unrouted kernel is handed them and dereferences them on the CPU.
-// tests/backend/pass/flash_attention_placed.vx is exactly that shape, and it
-// passes in CI because CI has no GPU -- the transfer is a no-op and the
+// tests/backend/pass/placed_kernel_four_operands.vx is exactly that shape, and
+// it passes in CI because CI has no GPU -- the transfer is a no-op and the
 // pointers stay host pointers. On an A100 it segmentation-faulted inside the
 // outlined kernel.
 //
@@ -731,7 +731,7 @@ bool run_device_image(const void *payload, size_t payload_size,
        that needs no `ptxas` anywhere and stays loadable on a newer device.
 
        VX_MAXRREG caps the per-thread registers the JIT may use. The knob
-       exists because ptxas took the split-K attention kernel to 255 registers
+       exists because ptxas took a split-K kernel to 255 registers
        -- the architectural ceiling, with spill traffic in the hot chain -- and
        the register/occupancy trade is a measurement, not a guess: a cap buys
        resident warps at the price of more spills, and only the device clock
@@ -842,7 +842,7 @@ bool run_device_image(const void *payload, size_t payload_size,
     }
   }
   /* Device-side timing, on request. Wall clock cannot see this kernel any
-     more: at 128 blocks the flash sweep's whole device time is ~50 ms under
+     more: at 128 blocks a sweep's whole device time is ~50 ms under
      ~300 ms of rented-pod host jitter, and one outlier fit a NEGATIVE
      per-K slope. CUDA events are stamped by the device, so they are immune
      to everything the host does between enqueue and sync. */
@@ -947,7 +947,7 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
   // The header of this file claims a refusal to route "costs performance and
   // never correctness". That is true for a program whose tensors live in host
   // memory and false for one that declares a memory hierarchy and moves into
-  // it. tests/backend/pass/flash_attention_placed.vx does the second: it
+  // it. tests/backend/pass/placed_kernel_four_operands.vx does the second: it
   // transfers Q, K, V and O into GPU_HBM and then runs a fused online-softmax
   // loop, which is not a GEMM and is not classified as one. On a machine
   // without this plugin the transfer is a no-op, the pointers stay host

@@ -9,12 +9,8 @@
 // A GPU-placed region that no vendor library can stand in for is compiled to
 // PTX and carried in the dispatch payload (#251).
 //
-// scripts/tools/flash_kernel_to_ptx.sh drives the same kernel through the same passes
-// from outside the compiler, and the two agree byte for byte -- that comparison
-// is what established the pipeline. It cannot run in CI, though: it needs
-// `mlir-opt` on PATH. These tests are the part that can, and they check the two
-// facts that matter for the next step: an image exists, and it is the kernel
-// rather than something shaped like one.
+// These tests check the two facts that matter: an image exists, and it is the
+// kernel rather than something shaped like one.
 //
 // The negative is as load-bearing as the positive. A classified matmul is left
 // at `linalg` level on purpose so the plugin can route it to cuBLAS, which
@@ -72,7 +68,7 @@ fn emit_llvm(name: &str) -> String {
 /// cause.
 #[test]
 fn a_placed_kernel_is_compiled_to_ptx_and_carried_in_the_payload() {
-    let ir = emit_llvm("flash_attention_placed_verified.vx");
+    let ir = emit_llvm("placed_kernel_four_operands.vx");
 
     assert!(
         ir.contains("image="),

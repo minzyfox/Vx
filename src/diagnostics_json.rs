@@ -102,8 +102,9 @@ use crate::report::{ResidentSet, SpawnRegionTraffic, StagingRoute};
 /// `spawn_regions` was added for #353 A4 T4 and is **additive** likewise. It answers the
 /// question the `routes` traffic cannot: a route says what it cost to GET a tile to a space,
 /// while a region says what the kernel then does with it. Those differ by the loop nest, which
-/// is where re-reading lives — an attention kernel re-reads K on every query iteration, so K's
-/// reads exceed its footprint by a factor no edge cost can express, because the movement
+/// is where re-reading lives — a kernel that streams one operand past a block of another
+/// re-reads it on every outer iteration, so its reads exceed its footprint by a factor no
+/// edge cost can express, because the movement
 /// across the edge happened exactly once. `traffic_source` is `"spawn_region"` here and never
 /// on a route; conversely `"builtin_copy"`/`"lowering_body"` appear only on routes.
 ///

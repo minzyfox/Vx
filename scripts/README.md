@@ -19,17 +19,13 @@ Each campaign holds the runner **and the template it substitutes**, in one
 directory:
 
 ```
-campaigns/flash/run_flash_bench.sh  +  flash_*_bench.vx
 campaigns/gemm/run_gemm_bench.sh    +  gpu_gemm_bench.vx
 campaigns/llama/run_perf_matrix.sh
 ```
 
 A template is an input to exactly one script. They used to sit in a shared
-`scripts/templates/`, which expressed no such coupling — and all nine had rotted
-against a language that moved, with nothing to say so. Seven compile today; the
-three that do not (`flash_coop`, `flash_fa2`, `flash_splitk`) stage a row from
-GPU_HBM into an SMEM tile, which Vx#352 has not materialised, and are left
-failing rather than papered over.
+`scripts/templates/`, which expressed no such coupling — and had rotted against a
+language that moved, with nothing to say so.
 
 ## Running one
 
@@ -40,7 +36,7 @@ root, so from a checkout they could not run at all — which is most of why the
 templates rotted unseen.
 
 ```
-./scripts/campaigns/flash/run_flash_bench.sh -k 512 -n 2 -o /tmp/flash
+./scripts/campaigns/gemm/run_gemm_bench.sh -s "512 1024" -o /tmp/gemm
 ```
 
 A runner exits non-zero when it measured nothing. That is worth stating because
@@ -60,7 +56,6 @@ Earlier campaign notes cite the old locations. This table resolves them:
 
 | Was | Is |
 |---|---|
-| `scripts/run_flash_bench.sh` | `scripts/campaigns/flash/run_flash_bench.sh` |
 | `scripts/run_gemm_bench.sh` | `scripts/campaigns/gemm/run_gemm_bench.sh` |
 | `scripts/run_perf_matrix.sh` | `scripts/campaigns/llama/run_perf_matrix.sh` |
 | `scripts/templates/*.vx` | beside their runner in `scripts/campaigns/*/` |

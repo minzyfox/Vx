@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 // Full-MLIR regression lock for slice elementwise ops + store (S3). `scalar * slice` broadcasts
 // then multiplies; `slice + slice` loads both and adds; the assignment `o[i] = <slice>` becomes
-// a `vector.store` into the S1 row view. These are FlashAttention's O accumulate (`o += s*v`)
+// a `vector.store` into the S1 row view. These are the output accumulate (`o += s*v`)
 // and rescale (`o *= s`). Regenerate with:
 //   cargo run --bin update_mlir_test_checks -- tests/optimizations/pass/slice_elementwise_mlir.vx
 //

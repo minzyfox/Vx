@@ -1,0 +1,61 @@
+//===- placed_kernel_four_operands.vx - Vx Compiler -------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A placed kernel with four rank-2 operands: a, b and c are read, o is written,
+// all of them staged into GPU_HBM and combined inside one `spawn`.
+//
+// The shape is what matters here rather than the arithmetic. The compiler must
+// compile this region to PTX and carry it in the dispatch payload, because the
+// region is not a GEMM and so has no library call to route to. Four rank-2
+// memrefs is 28 kernel parameters, and tests/runtime/kernel_launch_test.cpp
+// builds a parameter list for the same signature from the ABI tags and must
+// also get 28 -- a launch is only safe while the two agree.
+//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK: vx.transfer
+// CHECK: vx.spawn topology(500)
+// EXPECT: [[2,   5,   8,   11
+
+Memory CPU_DRAM {}
+Memory GPU_HBM {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s, managed: cached
+}
+
+fn main() -> i32 {
+  let mut a_h = Tensor<f32, [8, 4]>::uninit();
+  let mut b_h = Tensor<f32, [8, 4]>::uninit();
+  let mut c_h = Tensor<f32, [8, 4]>::uninit();
+  let mut o_h = Tensor<f32, [8, 4]>::uninit();
+
+  // Values that vary along both axes, so no operand can be dropped without
+  // changing the result.
+  for i in 0..8 {
+    for j in 0..4 {
+      a_h[i][j] = ((i + j) as f32);
+      b_h[i][j] = 2.0;
+      c_h[i][j] = ((j + 2) as f32);
+      o_h[i][j] = 0.0;
+    }
+  }
+
+  let a = transfer(a_h, Memory::GPU_HBM);
+  let b = transfer(b_h, Memory::GPU_HBM);
+  let c = transfer(c_h, Memory::GPU_HBM);
+  let mut o = transfer(o_h, Memory::GPU_HBM);
+
+  spawn on(Topology::GPU) {
+    for i in 0..8 {
+      for j in 0..4 {
+        o[i][j] = a[i][j] * b[i][j] + c[i][j];
+      }
+    }
+  }
+
+  // Row 0 is 2*(0+j) + (j+2), so 2, 5, 8, 11.
+  print(o);
+  return 0;
+}

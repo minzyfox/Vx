@@ -8,7 +8,7 @@
 #===----------------------------------------------------------------------===#
 #
 # Takes a freshly rented x86 Linux GPU box from nothing to a compiler that
-# builds, a bundle that runs, and a flash bench that reports where it ran.
+# builds, a bundle that runs, and a GEMM bench that reports where it ran.
 #
 # This is the *compiler development* loop -- the bounded exception in
 # "Build & deployment discipline" in gpu_disaggregated_inference.md. A pod
@@ -141,15 +141,15 @@ say "assembling the bench bundle"
 "${SSH[@]}" "set -e; cd '$REMOTE'
   ln -sfn '$TARGET' target
   B='$REMOTE/../bundle'; mkdir -p \"\$B\"
-  cp scripts/campaigns/flash/run_flash_bench.sh \"\$B/\"
-  cp scripts/campaigns/flash/flash_attention_bench.vx \"\$B/\"
+  cp scripts/campaigns/gemm/run_gemm_bench.sh \"\$B/\"
+  cp scripts/campaigns/gemm/gpu_gemm_bench.vx \"\$B/\"
   ln -sfn '$REMOTE/stdlib' \"\$B/stdlib\"
   ln -sfn '$REMOTE/tests'  \"\$B/tests\"
   ln -sfn '$TARGET'        \"\$B/target\"
   ln -sf '$TARGET/release/vxc' \"\$B/vxc\"
   ln -sf '$TARGET/release/libvx_std_core.so' \"\$B/libvx_std_core.so\"
   printf '. %s/config.local\nexport PATH=/usr/local/cuda/bin:\$PATH\n' '$REMOTE' > \"\$B/env.sh\"
-  chmod +x \"\$B/run_flash_bench.sh\"
+  chmod +x \"\$B/run_gemm_bench.sh\"
   echo \"  bundle at \$(cd \"\$B\" && pwd)\""
 
 # --- 5. prove it ------------------------------------------------------------
@@ -160,14 +160,17 @@ say "assembling the bench bundle"
 # here so the smoke test matches what the bench will do.
 say "smoke test"
 "${SSH[@]}" "cd '$REMOTE/../bundle' && . ./env.sh && ulimit -s 524288
-  sed -e 's/__VX_SQ__/128/g' -e 's/__VX_SK__/512/g' -e 's/__VX_HD__/64/g' \
-      -e 's/__VX_TILE__/64/g' -e 's/__VX_NT__/8/g' -e 's/__VX_BENCH_NOTE__/bootstrap smoke/' \
-      flash_attention_bench.vx > /tmp/smoke.vx
+  sed -e 's/__VX_BENCH_N__/512/g' -e 's/__VX_BENCH_ITERS__/1/g' \
+      -e 's/__VX_BENCH_DEV__/0/g' -e 's/__VX_BENCH_NOTE__/bootstrap smoke/' \
+      gpu_gemm_bench.vx > /tmp/smoke.vx
   VX_DISPATCH_VERBOSE=1 ./vxc /tmp/smoke.vx --run 2>&1 \
     | grep -E 'Vx CUDA|SIGSEGV' | sed 's/^/  /'
-  # 0.01*(512-1)/2 = 2.555, the closed form the bench checks at every size.
-  got=\$(VX_DISPATCH_VERBOSE=0 ./vxc /tmp/smoke.vx --run 2>/dev/null | grep -oE '^\[\[[0-9.]+' | tr -d '[')
-  echo \"  o[0][0] = \${got:-<nothing>} (expected 2.555)\""
+  # The template fills a[i][j] = (i+j)*0.001 and b[i][j] = (i*3+j)*0.001, so
+  # c[0][0] is 3e-6 * sum of k^2 for k < N -- about 133.8 at N=512. Printed
+  # rather than asserted: f32 accumulation over 512 terms moves the last digits,
+  # and this is a smoke test for "did it run on the GPU", not a numeric gate.
+  got=\$(VX_DISPATCH_VERBOSE=0 ./vxc /tmp/smoke.vx --run 2>/dev/null | head -1)
+  echo \"  c[0][0] and N = \${got:-<nothing>} (expect c[0][0] near 133.8)\""
 
 say "ready.  ssh -p $PORT -i $KEY $HOST, then:"
-echo "    cd $(dirname "$REMOTE")/bundle && ulimit -s 524288 && ./run_flash_bench.sh"
+echo "    cd $(dirname "$REMOTE")/bundle && ulimit -s 524288 && ./run_gemm_bench.sh"

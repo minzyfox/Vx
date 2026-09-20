@@ -958,7 +958,7 @@ impl FnEmit<'_> {
         // improvising linalg's integer semantics here. The half-precision pair is in (Vx#320):
         // the routed backend runs them through cublasGemmEx with f32 accumulation, and the host
         // fallback's linalg lowers them like any float -- restricting to f32 here silently
-        // evicted every f16 attention program from the flat path, prover and all.
+        // evicted every f16 program from the flat path, prover and all.
         let et = memref_element(&md).ok_or(crate::emitter_gap!())?;
         if et != "f32" && et != "f64" && et != "f16" && et != "bf16" {
             return Err(crate::emitter_gap!());

@@ -17,8 +17,8 @@
 //
 // The range comes from two runtime queries rather than from extra kernel
 // parameters, which keeps the C interface of every outlined kernel the shape
-// its other callers already know (scripts/launch_emitted_kernel.cpp, the remote
-// worker). The checks pin that both queries are asked.
+// its other callers already know (the remote worker). The checks pin that
+// both queries are asked.
 //
 // The arithmetic is checked in the order it has to happen, because the ORDER is
 // the claim:

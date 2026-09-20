@@ -301,10 +301,11 @@ Two things this buys that a declared edge cost cannot:
 
 1. **C10 becomes structural.** The cost cannot describe something other than the emitted code,
    because it is computed from the emitted code.
-1. **It sees plan-level waste.** The shipped flash-attention kernel re-reads K and V from global
-   memory on *every* query iteration. No edge cost can express that — the per-hop rate is identical
-   either way — but a traffic count reads it straight off the loop structure. That is precisely the
-   class of inefficiency the whole exercise is aimed at, and a declared-cost model is blind to it.
+1. **It sees plan-level waste.** A kernel that streams one operand past a block of another
+   re-reads it from global memory on *every* outer iteration. No edge cost can express that — the
+   per-hop rate is identical either way — but a traffic count reads it straight off the loop
+   structure. That is precisely the class of inefficiency the whole exercise is aimed at, and a
+   declared-cost model is blind to it.
 
 The limit is honest and narrow: derived traffic needs static bounds. A data-dependent loop needs
 either a bound or a declaration, and a lowering that has one should say so.
@@ -579,8 +580,9 @@ re-reading lives, and no edge cost can reach it, because the movement across the
 exactly **once**.
 
 So a second counter walks each `spawn` region and publishes a `spawn_regions` record per site,
-with a per-buffer breakdown. On the shipped flash-attention fixture
-(`tests/backend/pass/flash_attention_placed.vx`, staging Q[2,4], K[4,4], V[4,4], O[2,4]):
+with a per-buffer breakdown. Worked through on a kernel that streams `k` and `v` past a block of
+`q` — four rank-2 tensors staged into GPU_HBM, 2 queries over 4 keys at width 4 — the breakdown
+reads:
 
 ```
 GPU_HBM   read 608 B   written 224 B   exact

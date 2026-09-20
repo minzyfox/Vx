@@ -758,7 +758,7 @@ fn flat_marks_shared_ref_param_readonly() {
 fn flat_matches_ast_if_expression() {
     // A value-position `if` (`let m: i32 = if a > b { a } else { b }`, #201): lowered to blocks + a
     // result slot each branch stores into, then loaded. JIT-matches the AST oracle. This is the
-    // `let m_new = if tm > m { tm } else { m }` shape from the attention corpus.
+    // The `let m_new = if tm > m { tm } else { m }` shape: a running maximum.
     assert_parity(
         "fn main() -> i32 { let a = 3; let b = 7; let m: i32 = if a > b { a } else { b }; return m; }",
         7,
@@ -1831,7 +1831,7 @@ fn flat_matches_ast_tensor_row_sum_reduction() {
 
 #[test]
 fn flat_matches_ast_tensor_elementwise_row_store() {
-    // The FlashAttention write-path shape: an elementwise scalar-broadcast multiply
+    // The write-path shape: an elementwise scalar-broadcast multiply
     // over a row (`q[0] * 2.0`) stored back into a row (`o[0] = …`), then an element
     // read + compare so the exit is an i32. o[0] = [2,4,6,8]; o[0][1] = 4 > 3.5 -> 1.
     // Exercises vector.load/broadcast + arith.mulf + vector.store, flat-vs-AST.
@@ -1844,9 +1844,9 @@ fn flat_matches_ast_tensor_elementwise_row_store() {
 }
 
 #[test]
-fn flat_matches_ast_flashattention_write_path() {
-    // Capstone: the FlashAttention inner write path composed end to end through the
-    // flat path -- `o[0] = v[0] * (dot(q[0], k[0]) * scale)`. dot([1,2,3,4],[1,1,1,1])
+fn flat_matches_ast_dot_scale_broadcast_write_path() {
+    // Capstone: a reduction feeding a scaled broadcast, composed end to end through
+    // the flat path -- `o[0] = v[0] * (dot(q[0], k[0]) * scale)`. dot([1,2,3,4],[1,1,1,1])
     // = 10; * 0.5 = 5; v[0] * 5 = [10,10,10,10]; o[0][0] = 10 > 9 -> r = 1. Exercises
     // reduction (dot) + scalar multiply + elementwise broadcast + row store + read,
     // all together, flat-vs-AST.
@@ -2719,14 +2719,6 @@ fn flat_matches_ast_corpus_tensor_view_2d() {
            unsafe { vx_free_f32(p, 6); } return (x * 10.0) as i32 + w; }",
         63,
     );
-}
-
-#[test]
-fn flat_matches_ast_corpus_linear_attention() {
-    // An attention-corpus program (no softmax/exp): tensor allocs, `for` loops,
-    // and `print`. Its printed output must match the AST oracle through the flat
-    // path.
-    assert_output_parity(&corpus("linear_attention.vx"));
 }
 
 /// A minimal self-contained `Vec<T>` (the shape of `stdlib/std/vec.vx`, minus googletest): a struct

@@ -10,9 +10,8 @@
 // An `alloca` is given back when the function returns and not before, so one
 // emitted inside a loop body takes a fresh slot every iteration. A nest running
 // a couple of million times then exhausts the stack, and the program dies of
-// SIGSEGV having compiled without a diagnostic -- which is what
-// benchmarks/flash_attention_ane/flash_attention_split.vx did until the slots
-// moved to the entry block.
+// SIGSEGV having compiled without a diagnostic -- which is what a program with
+// stack slots inside a loop did until the slots moved to the entry block.
 //
 // Checked structurally rather than by running something big. MLIR hoists the
 // simple shapes on its own, so a small program with a local in a loop passes
@@ -52,7 +51,7 @@ fn stack_slots_are_allocated_once_not_per_iteration() {
     // cargo points this at the profile the suite is running in; a hardcoded
     // `target/debug/vxc` is absent under `cargo test --release` and this skipped.
     let vxc = PathBuf::from(env!("CARGO_BIN_EXE_vxc"));
-    let src = root.join("benchmarks/flash_attention_ane/flash_attention_split.vx");
+    let src = root.join("tests/backend/pass/ane_matmul_f16.vx");
     assert!(src.is_file(), "missing {}", src.display());
 
     let out = Command::new(&vxc)

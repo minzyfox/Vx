@@ -106,8 +106,8 @@ pub fn granule_round(bytes: u64, granule: Option<u64>) -> u64 {
 ///
 /// The multiply happens before the divide so the picosecond scaling does not lose the precision it
 /// exists to buy, and the intermediate is `u128`. `u64` is not enough: `bytes * 1e12` overflows it
-/// at only ~18 MB, so a 64 MiB tile -- an ordinary transfer, and smaller than a single attention
-/// block on the fleet's own corpus -- produced no cost at all. The *result* still fits `u64`
+/// at only ~18 MB, so a 64 MiB tile -- an ordinary transfer, and smaller than a single tile
+/// on the fleet's own corpus -- produced no cost at all. The *result* still fits `u64`
 /// comfortably (64 GiB over a 100 GB/s link is 6.9e10 ps), so only the intermediate needs the
 /// width; the final narrowing is checked rather than truncating.
 pub fn hop_cost(bytes: u64, bw: crate::syntax::Bandwidth) -> Option<u64> {

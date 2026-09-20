@@ -7050,7 +7050,7 @@ mod tests {
 
     #[test]
     fn dot_of_indexed_rows_lowers() {
-        // The FlashAttention shape: `dot(q[i], k[j])` -> index each rank-2 tensor to a row, then
+        // `dot(q[i], k[j])` -> index each rank-2 tensor to a row, then
         // reduce. Two TensorIndex feed one Reduce.
         let f = parse_fn(
             "fn score(q: Tensor<f32, [2, 4]>, k: Tensor<f32, [2, 4]>) -> f32 { return dot(q[0], k[0]); }",
@@ -7064,7 +7064,7 @@ mod tests {
     }
 
     #[test]
-    fn flashattention_write_path_composes() {
+    fn dot_broadcast_write_path_composes() {
         // Allocate the output, weight v by a scaled score, and store the row back -- alloc + index +
         // dot(reduce) + elementwise + store, the whole non-scalar surface in one flat stream.
         let f = parse_fn(
@@ -7147,8 +7147,8 @@ mod tests {
     }
 
     #[test]
-    fn flashattention_score_expression_composes() {
-        // The FA inner score `dot(q[i], k[j]) * scale`: index -> reduce -> scalar multiply, proving
+    fn dot_scale_expression_composes() {
+        // `dot(q[i], k[j]) * scale`: index -> reduce -> scalar multiply, proving
         // the tensor pieces compose end to end into one flat stream.
         let f = parse_fn(
             "fn score(q: Tensor<f32, [2, 4]>, k: Tensor<f32, [2, 4]>, scale: f32) -> f32 \
@@ -7787,7 +7787,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flash_shaped_spawn_region_is_grid_stridable() {
+    fn a_blocked_spawn_region_is_grid_stridable() {
         // The bench template's shape in miniature: thread-private scratch before the loop, scalar
         // accumulators inside it, an if-expression, and every captured write leading with the
         // induction variable. (No `.exp()` here — the harness loads no stdlib, so a method call
@@ -8304,8 +8304,8 @@ mod tests {
         // `matmul_into` in a spawn must lower on the FLAT path (one MatmulInto op, dst in the
         // imm) and must NOT be strided -- the region is classified and routed, not launched
         // wide. The regression this pins: the call used to evict the whole program to the AST
-        // path, taking every OTHER region's parallel proof with it -- an unfused-attention
-        // program lost its softmax kernel's grid-stride to the mere presence of a GEMM.
+        // path, taking every OTHER region's parallel proof with it -- a program lost its
+        // softmax kernel's grid-stride to the mere presence of a GEMM.
         let (did, w) = lower_with_registry(
             "fn main() -> i32 {\n\
                let mut a = Tensor<f32>([4, 3]);\n\

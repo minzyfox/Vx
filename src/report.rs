@@ -85,8 +85,8 @@ pub struct StagingRoute {
 /// Bytes read and written against one placed buffer by a `spawn` region (#353 A4 T4).
 ///
 /// Per BUFFER, not just per space, because the amplification this stage exists to show is a
-/// fact about a particular tensor: in an attention kernel K and V are re-read on every query
-/// iteration while Q is read once per query. Summed into their shared space those three
+/// fact about a particular tensor: a streamed operand is re-read on every outer iteration
+/// while the blocked one is read once. Summed into their shared space they
 /// become one number that hides which of them is the problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferTraffic {

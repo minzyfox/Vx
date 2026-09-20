@@ -7,10 +7,8 @@
 //===----------------------------------------------------------------------===//
 // The cumulative budget check (E6010): the *sum* of the tiles placed in a memory space must
 // fit its capacity, even when each tile fits individually. This is the collective-overflow
-// the per-tile check (E6009) misses -- and exactly the constraint FlashAttention-4 agonizes
-// over ("... leaving half the tensor memory for S and P"): here the Q/K/V tiles for an SMEM
-// scratchpad are 128 KiB each and the scratchpad is 228 KiB, so any one fits but three do not
-// (384 KiB > 228 KiB).
+// the per-tile check (E6009) misses. Here three tiles for an SMEM scratchpad are 128 KiB
+// each and the scratchpad is 228 KiB, so any one fits but three do not (384 KiB > 228 KiB).
 //
 // RUN: not vxc %s 2>&1 | FileCheck %s
 

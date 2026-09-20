@@ -13,7 +13,7 @@
 // filled by a copy and read back by the body (Vx#352, #353) -- and it has never
 // executed on silicon. Everything known about it so far comes from reading PTX.
 //
-// Mirrors scripts/launch_emitted_kernel.cpp deliberately: standalone driver-API
+// A standalone driver-API
 // harness, no plugin, no wire, no worker. A wrong answer here is the kernel or
 // the marshalling, and there is no third possibility.
 //

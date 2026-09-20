@@ -170,7 +170,7 @@ noticed.
 | Target | What exists | What has run |
 | --- | --- | --- |
 | CPU, x86-64 and arm64 | MLIR → LLVM IR → native, JIT or object file | Everything in the test suite |
-| NVIDIA GPU | MLIR → NVVM → PTX, shipped in the dispatch payload and loaded by the driver | Fused attention and a disaggregated prefill/decode split, on A100 and H100 |
+| NVIDIA GPU | MLIR → NVVM → PTX, shipped in the dispatch payload and loaded by the driver | A disaggregated prefill/decode split, on A100 and H100 |
 | Apple | CoreML dispatch from a native plugin | One f16 512×512 matmul on the Neural Engine, confirmed through the compute-plan API; every fp32 kernel is placed on the CPU by CoreML |
 | Remote | A wire protocol carrying memref descriptors and dispatch payloads to a worker on another machine | An arm64 laptop dispatching to an x86-64 worker over an SSH tunnel |
 

@@ -6,8 +6,8 @@ A tile staged into on-chip scratchpad that the scratchpad cannot hold.
 
 ## Vx
 
-`tests/frontend/fail/flash_attention_tile_too_big.vx`. A 128x64 f32 query tile is 32768 bytes,
-staged into a `Local_SRAM` declared at 16 KiB, and E6009 refuses it with both numbers.
+`tests/frontend/fail/tile_over_the_smem_ceiling.vx`. A 128x64 f32 tile is 32768 bytes, staged
+into a `Local_SRAM` declared at 16 KiB, and E6009 refuses it with both numbers.
 
 ## CUDA
 

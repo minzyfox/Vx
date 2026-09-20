@@ -12,7 +12,7 @@
 // asks the host to execute a device body, which is the mistake the annotation
 // exists to catch.
 //
-// This is not a theoretical case. benchmarks/flash_attention_ane/flash_attention.vx
+// This is not a theoretical case. A benchmark that placed its kernel this way
 // declares its software exponential `on Topology::ANE` so that it is a
 // device-side helper rather than a host call reached from inside the region --
 // and the host reference in that same file cannot call it, which is exactly this

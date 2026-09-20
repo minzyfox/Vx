@@ -338,7 +338,7 @@ inline int vx_routing_try_dispatch(const void *payload, size_t payload_size,
          earlier `transfer` is a handle -- memory in the worker's process --
          and a region that runs here reads it directly from generated code,
          where no plugin entry point and none of the guards in this file are
-         involved. tests/backend/pass/flash_attention_placed.vx is exactly
+         involved. tests/backend/pass/placed_kernel_four_operands.vx is exactly
          that: four operands crossed, the fused region declined, the fallback
          ran at home, and the program died on a signal (#251, #348).
 

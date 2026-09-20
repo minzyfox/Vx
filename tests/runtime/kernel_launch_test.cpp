@@ -16,11 +16,11 @@
 // reads a size out of a pointer field and walks off the buffer. Neither shows
 // up as a failed launch.
 //
-// The expected counts are pinned against a real kernel: the attention region in
-// tests/backend/pass/flash_attention_placed_verified.vx compiles to an entry
-// with 28 parameters -- four rank-2 memrefs at seven each -- which
-// scripts/flash_kernel_to_ptx.sh reports and this file asserts from the other
-// side.
+// The expected counts are pinned against a real kernel: the placed region in
+// tests/backend/pass/placed_kernel_four_operands.vx compiles to an entry with
+// 28 parameters -- four rank-2 memrefs at seven each -- which
+// tests/integration_test/device_image_test.rs reads off the emitted PTX and
+// this file asserts from the ABI side.
 //
 // Driven by tests/integration_test/kernel_launch_test.rs.
 //
@@ -85,8 +85,8 @@ void widths() {
         "a publication slot cannot be marshalled");
 }
 
-/// Four rank-2 f32 memrefs, which is the attention kernel's signature.
-void the_attention_signature() {
+/// Four rank-2 f32 memrefs, the signature a four-operand placed kernel has.
+void the_four_operand_signature() {
   float qs[32 * 16], ks[64 * 16], os[32 * 16], vs[64 * 16];
   Desc2D q = make_2d(qs, 32, 16);
   Desc2D k = make_2d(ks, 64, 16);
@@ -245,7 +245,7 @@ void entry_parameter_counting() {
 
 int main() {
   widths();
-  the_attention_signature();
+  the_four_operand_signature();
   a_view_keeps_its_own_offset_and_strides();
   scalars_pass_by_address();
   refusals();
