@@ -1469,13 +1469,13 @@ impl<'c> MeliorGenerator<'c> {
             if lowered.starts_with("memref<") {
                 lowered = "!llvm.ptr".to_string();
             }
-            match scalar_type_bits(&lowered) {
-                Some(b) if b > widest => {
-                    widest = b;
+            if let Some(bits) = scalar_type_bits(&lowered) {
+                if bits > widest {
+                    widest = bits;
                     payload_ty_str = lowered;
                 }
-                None if payload_ty_str == "none" => payload_ty_str = lowered,
-                _ => {}
+            } else if payload_ty_str == "none" {
+                payload_ty_str = lowered;
             }
         }
         Ok(payload_ty_str)

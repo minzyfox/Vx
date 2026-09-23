@@ -186,14 +186,14 @@ impl<'a> TypeChecker<'a> {
                 }
                 return target_ty;
             }
-            _ => {}
+            (source_ty, target_ty) => {
+                self.errors.push(format!(
+                    "Unsupported cast: cannot cast from {:?} to {:?}",
+                    source_ty, target_ty
+                ));
+                Type::Unknown
+            }
         }
-
-        self.errors.push(format!(
-            "Unsupported cast: cannot cast from {:?} to {:?}",
-            source_ty, target_ty
-        ));
-        Type::Unknown
     }
 
     /// Type-check the two operands of a binary / relational / logical op, letting an untyped

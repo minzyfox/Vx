@@ -1045,7 +1045,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            _ => {}
+            _ => return,
         }
     }
 }

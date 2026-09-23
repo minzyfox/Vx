@@ -92,16 +92,24 @@ pub(crate) fn emit_seam_certificates<'c>(
     Ok(body_block)
 }
 
-/// Collect the names of every `Expr::Identifier` reachable from `e`. Best-effort over the
-/// structurally-recursive variants that carry value expressions; variants that cannot name
-/// a transported host variable (literals, type/topology nodes, nested spawns) contribute
-/// nothing. Under-collecting is safe — it only suppresses a certificate, never emits a
-/// wrong one.
+/// Collect the names of host variables evaluated in `e`.
+///
+/// The walker follows every expression that is evaluated in this seam. Nested `spawn` bodies
+/// are deliberately excluded: they have a distinct capture boundary and receive certificates
+/// when their own seam is emitted. Literals, types, and topology nodes do not name host values.
 pub(crate) fn collect_expr_idents(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Identifier(i) => {
             out.insert(i.name.as_ref().to_string());
         }
+        Expr::EnumVariant(v) => {
+            if let Some(payload) = &v.payload {
+                for expr in payload {
+                    collect_expr_idents(expr, out);
+                }
+            }
+        }
+        Expr::Transfer(t) => collect_expr_idents(&t.expr, out),
         Expr::RelationalOp(b) => {
             collect_expr_idents(&b.lhs, out);
             collect_expr_idents(&b.rhs, out);
@@ -128,6 +136,22 @@ pub(crate) fn collect_expr_idents(e: &Expr, out: &mut HashSet<String>) {
                 collect_expr_idents(a, out);
             }
         }
+        Expr::IndirectCall(c) => {
+            collect_expr_idents(&c.callee, out);
+            for arg in &c.args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::Array(a) => {
+            for element in &a.elements {
+                collect_expr_idents(element, out);
+            }
+        }
+        Expr::VecMacro(v) => {
+            for element in &v.elements {
+                collect_expr_idents(element, out);
+            }
+        }
         Expr::MethodCall(c) => {
             collect_expr_idents(&c.base, out);
             for a in &c.args {
@@ -145,7 +169,86 @@ pub(crate) fn collect_expr_idents(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        _ => {}
+        Expr::UnsafeBlock(u) => {
+            for stmt in &u.stmts {
+                collect_stmt_idents(stmt, out);
+            }
+            if let Some(ret) = &u.ret {
+                collect_expr_idents(ret, out);
+            }
+        }
+        Expr::ComptimeBlock(c) => {
+            for stmt in &c.stmts {
+                collect_stmt_idents(stmt, out);
+            }
+            if let Some(ret) = &c.ret {
+                collect_expr_idents(ret, out);
+            }
+        }
+        Expr::StructInit(s) => {
+            for (_, value) in &s.fields {
+                collect_expr_idents(value, out);
+            }
+        }
+        Expr::Range(r) => {
+            collect_expr_idents(&r.start, out);
+            collect_expr_idents(&r.end, out);
+        }
+        Expr::Match(m) => {
+            collect_expr_idents(&m.expr, out);
+            for arm in &m.arms {
+                for stmt in &arm.body {
+                    collect_stmt_idents(stmt, out);
+                }
+            }
+        }
+        Expr::Grad(g) => {
+            for arg in &g.args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::Vjp(v) => {
+            for arg in &v.args {
+                collect_expr_idents(arg, out);
+            }
+            collect_expr_idents(&v.cotangent, out);
+        }
+        Expr::Jvp(j) => {
+            for arg in &j.args {
+                collect_expr_idents(arg, out);
+            }
+            collect_expr_idents(&j.tangent, out);
+        }
+        Expr::Print(p) => {
+            for arg in &p.args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::Println(p) => {
+            for arg in &p.args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::InlineMlir(m) => {
+            for (_, input, _) in &m.inputs {
+                collect_expr_idents(input, out);
+            }
+            for clobber in &m.clobbers {
+                collect_expr_idents(clobber, out);
+            }
+        }
+
+        // These forms do not evaluate a host value at this seam. A nested spawn owns its
+        // capture boundary; closures and macro calls have been lowered/expanded before codegen.
+        Expr::Number(_)
+        | Expr::StringLiteral(_)
+        | Expr::TransferPredicate(_)
+        | Expr::MemorySpace(_)
+        | Expr::Topology(_)
+        | Expr::SizeOf(_)
+        | Expr::SpawnOn(_)
+        | Expr::Closure(_)
+        | Expr::MacroCall(_) => {}
     }
 }
 
@@ -190,7 +293,10 @@ mod tests {
     use super::*;
     use crate::symbol::Symbol;
     use crate::syntax::types::Span;
-    use crate::syntax::{IdentifierExpr, RelationalOp, RelationalOpExpr};
+    use crate::syntax::{
+        ArrayExpr, EnumVariantExpr, IdentifierExpr, IndirectCallExpr, MemorySpace, RelationalOp,
+        RelationalOpExpr, TransferExpr,
+    };
 
     fn sp() -> Span {
         Span {
@@ -219,6 +325,38 @@ mod tests {
         collect_expr_idents(&e, &mut out);
         assert_eq!(out.len(), 2);
         assert!(out.contains("kblk_start") && out.contains("qblk_end"));
+    }
+
+    #[test]
+    fn collects_values_nested_in_previously_skipped_expressions() {
+        let e = Expr::Array(ArrayExpr::new(
+            vec![
+                Expr::Transfer(TransferExpr::new(
+                    Box::new(id("staged")),
+                    MemorySpace::CPUDRAM,
+                    sp(),
+                )),
+                Expr::IndirectCall(IndirectCallExpr::new(
+                    Box::new(id("callback")),
+                    vec![Expr::EnumVariant(EnumVariantExpr::new(
+                        "Option".into(),
+                        "Some".into(),
+                        Some(vec![id("payload")]),
+                        sp(),
+                    ))],
+                    sp(),
+                )),
+            ],
+            sp(),
+        ));
+
+        let mut out = HashSet::new();
+        collect_expr_idents(&e, &mut out);
+
+        assert_eq!(out.len(), 3);
+        assert!(out.contains("staged"));
+        assert!(out.contains("callback"));
+        assert!(out.contains("payload"));
     }
 
     #[test]

@@ -148,7 +148,12 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
                     }
-                    _ => {}
+                    Statement::Return(_)
+                    | Statement::Assert(_)
+                    | Statement::Break(_)
+                    | Statement::Continue(_)
+                    | Statement::MacroCall(_)
+                    | Statement::Error(_) => {}
                 }
             }
         }
@@ -519,7 +524,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            _ => {}
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::EnumVariant(_, _, None) => {}
         }
     }
 

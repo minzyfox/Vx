@@ -318,22 +318,19 @@ impl<'a> TypeChecker<'a> {
         let mut base_snapshots: HashMap<String, Option<Vec<BorrowRecord>>> = HashMap::new();
         if let Some((param_types, _)) = &callee_sig {
             for (i, arg) in args.iter().enumerate() {
-                match param_types.get(i) {
-                    Some(pty) if Self::is_ref_type(pty) => {
-                        if let Some((base, path)) = Self::arg_reborrow_base(arg) {
-                            base_snapshots
-                                .entry(base.clone())
-                                .or_insert_with(|| self.borrow.snapshot_base(base.as_str()));
-                            ref_args.push((
-                                i,
-                                base,
-                                path,
-                                Self::is_mut_ref(pty),
-                                matches!(arg, Expr::Borrow(_)),
-                            ));
-                        }
+                if let Some(pty) = param_types.get(i).filter(|pty| Self::is_ref_type(pty)) {
+                    if let Some((base, path)) = Self::arg_reborrow_base(arg) {
+                        base_snapshots
+                            .entry(base.clone())
+                            .or_insert_with(|| self.borrow.snapshot_base(base.as_str()));
+                        ref_args.push((
+                            i,
+                            base,
+                            path,
+                            Self::is_mut_ref(pty),
+                            matches!(arg, Expr::Borrow(_)),
+                        ));
                     }
-                    _ => {}
                 }
             }
         }

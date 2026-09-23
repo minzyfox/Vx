@@ -1416,7 +1416,11 @@ impl CompilerDriver {
                     ));
                 }
             }
-            _ => {}
+            // `execute_vx_pipeline` returns before codegen for these actions. Keep this
+            // exhaustive so a newly added action must explicitly choose a backend behavior.
+            Action::ParseOnly | Action::PrintAst | Action::EmitInterface => {
+                unreachable!("non-codegen action reached lower_and_emit")
+            }
         }
 
         Ok(())
