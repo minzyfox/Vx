@@ -52,18 +52,18 @@ impl<'a> TypeChecker<'a> {
         ret: Option<&Expr>,
         before: &HashMap<crate::symbol::Symbol, Value>,
     ) -> ComptimeFold {
-        // Anything it writes that outlives it would have to survive, and the block does not.
-        if let Some(name) = Self::escaping_write(stmts) {
-            self.report_comptime_block_failure(
-                &format!(
-                    "it writes to '{}', which is declared outside it -- the block disappears, \
-                     so the write would have to disappear with it",
-                    name
-                ),
-                &ret.map(|r| r.span()).unwrap_or_default(),
-            );
-            return ComptimeFold::Refused;
-        }
+        let outer_bindings = self
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.keys().cloned())
+            .collect();
+        let previous_effects = self.consteval.comptime_effects.replace(Some(
+            crate::hir::check_state::ComptimeEffects {
+                outer_bindings,
+                local_scopes: vec![HashSet::new()],
+                escaping_write: None,
+            },
+        ));
         let mut env = before.clone();
         let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
         let flow = self.eval_block(stmts, &mut env);
@@ -71,6 +71,25 @@ impl<'a> TypeChecker<'a> {
         self.consteval.unsupported_stmt.set(outer_unsupported);
 
         let span = ret.map(|r| r.span()).unwrap_or_default();
+        let returned = matches!(&flow, EvalFlow::Return(_));
+        let value = match flow {
+            EvalFlow::Return(value) => Some(value),
+            EvalFlow::Normal | EvalFlow::Break | EvalFlow::Continue => {
+                ret.map(|expr| self.eval_expr(expr, &env))
+            }
+        };
+        let effects = self.consteval.comptime_effects.replace(previous_effects);
+        if let Some(name) = effects.and_then(|effects| effects.escaping_write) {
+            self.report_comptime_block_failure(
+                &format!(
+                    "it writes to '{}', which is declared outside it -- the block disappears, \
+                     so the write would have to disappear with it",
+                    name
+                ),
+                &span,
+            );
+            return ComptimeFold::Refused;
+        }
         if !ran {
             self.report_comptime_block_failure(
                 "it holds a statement the evaluator cannot run",
@@ -81,13 +100,12 @@ impl<'a> TypeChecker<'a> {
         // A `return` inside the block, where the block is a closure or function body, is
         // that body's value -- `|| comptime { ..; return x; }` is how the closure fixtures
         // are written. Answer with it, the same as a trailing expression.
-        if let EvalFlow::Return(returned) = flow {
-            return self.fold_value(returned, &span);
+        if returned {
+            return self.fold_value(value.flatten(), &span);
         }
-        let Some(ret) = ret else {
+        let Some(value) = value else {
             return ComptimeFold::NoValue;
         };
-        let value = self.eval_expr(ret, &env);
         self.fold_value(value, &span)
     }
 
@@ -106,244 +124,6 @@ impl<'a> TypeChecker<'a> {
                 ComptimeFold::Refused
             }
         }
-    }
-
-    /// A name the block writes that was declared outside it.
-    ///
-    /// The block disappears, so anything it did has to disappear with it. Writing to a
-    /// variable that outlives the block is an effect that cannot: the write would simply
-    /// stop happening, which is how this turned a program that printed 4 into one that
-    /// printed 0.
-    fn escaping_write(stmts: &[Statement]) -> Option<crate::symbol::Symbol> {
-        type Scopes = Vec<HashSet<crate::symbol::Symbol>>;
-
-        fn is_local(name: &crate::symbol::Symbol, scopes: &Scopes) -> bool {
-            scopes.iter().rev().any(|scope| scope.contains(name))
-        }
-
-        fn declare(name: &crate::symbol::Symbol, scopes: &mut Scopes) {
-            scopes
-                .last_mut()
-                .expect("escaping-write walk always has a scope")
-                .insert(name.clone());
-        }
-
-        fn declare_pattern(pattern: &Pattern, scopes: &mut Scopes) {
-            match pattern {
-                Pattern::Identifier(name) => declare(name, scopes),
-                Pattern::EnumVariant(_, _, Some(payloads)) => {
-                    for payload in payloads {
-                        declare_pattern(payload, scopes);
-                    }
-                }
-                Pattern::Wildcard | Pattern::Literal(_) | Pattern::EnumVariant(_, _, None) => {}
-            }
-        }
-
-        fn walk_block(stmts: &[Statement], scopes: &mut Scopes) -> Option<crate::symbol::Symbol> {
-            scopes.push(HashSet::new());
-            let escaped = walk_stmts(stmts, scopes);
-            scopes.pop();
-            escaped
-        }
-
-        fn walk_stmts(stmts: &[Statement], scopes: &mut Scopes) -> Option<crate::symbol::Symbol> {
-            for stmt in stmts {
-                match stmt {
-                    Statement::LetDecl(d) => {
-                        if let Some(name) = walk_expr(&d.expr, scopes) {
-                            return Some(name);
-                        }
-                        declare(&d.name, scopes);
-                    }
-                    Statement::Assign(a) => {
-                        if let Some(root) = TypeChecker::place_root(&a.lhs) {
-                            if !is_local(root, scopes) {
-                                return Some(root.clone());
-                            }
-                        }
-                        if let Some(name) = walk_expr(&a.lhs, scopes) {
-                            return Some(name);
-                        }
-                        if let Some(name) = walk_expr(&a.rhs, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    Statement::CompoundAssign(c) => {
-                        if let Some(root) = TypeChecker::place_root(&c.lhs) {
-                            if !is_local(root, scopes) {
-                                return Some(root.clone());
-                            }
-                        }
-                        if let Some(name) = walk_expr(&c.lhs, scopes) {
-                            return Some(name);
-                        }
-                        if let Some(name) = walk_expr(&c.rhs, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    Statement::ForLoop(f) => {
-                        if let Some(name) = walk_expr(&f.iterable, scopes) {
-                            return Some(name);
-                        }
-                        if let Some(name) = walk_exprs(&f.invariants, scopes) {
-                            return Some(name);
-                        }
-                        scopes.push(HashSet::new());
-                        scopes
-                            .last_mut()
-                            .expect("loop scope was pushed")
-                            .insert(f.iter.clone().into());
-                        let escaped = walk_stmts(&f.body, scopes);
-                        scopes.pop();
-                        if escaped.is_some() {
-                            return escaped;
-                        }
-                    }
-                    Statement::Loop(l) => {
-                        if let Some(name) = walk_exprs(&l.invariants, scopes) {
-                            return Some(name);
-                        }
-                        if let Some(name) = walk_block(&l.body, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    Statement::Return(r) => {
-                        if let Some(expr) = &r.expr {
-                            if let Some(name) = walk_expr(expr, scopes) {
-                                return Some(name);
-                            }
-                        }
-                    }
-                    Statement::ExprStmt(e) => {
-                        if let Some(name) = walk_expr(&e.expr, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    Statement::Assert(a) => {
-                        if let Some(name) = walk_expr(&a.expr, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    Statement::Break(_)
-                    | Statement::Continue(_)
-                    | Statement::MacroCall(_)
-                    | Statement::Error(_) => {}
-                }
-            }
-            None
-        }
-
-        fn walk_exprs(exprs: &[Expr], scopes: &mut Scopes) -> Option<crate::symbol::Symbol> {
-            for expr in exprs {
-                if let Some(name) = walk_expr(expr, scopes) {
-                    return Some(name);
-                }
-            }
-            None
-        }
-
-        fn walk_expr(expr: &Expr, scopes: &mut Scopes) -> Option<crate::symbol::Symbol> {
-            match expr {
-                Expr::Identifier(_)
-                | Expr::Number(_)
-                | Expr::StringLiteral(_)
-                | Expr::TransferPredicate(_)
-                | Expr::MemorySpace(_)
-                | Expr::Topology(_)
-                | Expr::MacroCall(_)
-                | Expr::SizeOf(_) => None,
-                Expr::EnumVariant(e) => e
-                    .payload
-                    .as_deref()
-                    .and_then(|payload| walk_exprs(payload, scopes)),
-                Expr::Transfer(e) => walk_expr(&e.expr, scopes),
-                Expr::FunctionCall(e) => walk_exprs(&e.args, scopes),
-                Expr::IndirectCall(e) => {
-                    walk_expr(&e.callee, scopes).or_else(|| walk_exprs(&e.args, scopes))
-                }
-                Expr::Array(e) => walk_exprs(&e.elements, scopes),
-                Expr::VecMacro(e) => walk_exprs(&e.elements, scopes),
-                Expr::MemberAccess(e) => walk_expr(&e.base, scopes),
-                Expr::IndexAccess(e) => {
-                    walk_expr(&e.base, scopes).or_else(|| walk_expr(&e.index, scopes))
-                }
-                Expr::MethodCall(e) => {
-                    walk_expr(&e.base, scopes).or_else(|| walk_exprs(&e.args, scopes))
-                }
-                Expr::BinaryOp(e) => {
-                    walk_expr(&e.lhs, scopes).or_else(|| walk_expr(&e.rhs, scopes))
-                }
-                Expr::RelationalOp(e) => {
-                    walk_expr(&e.lhs, scopes).or_else(|| walk_expr(&e.rhs, scopes))
-                }
-                Expr::LogicalOp(e) => {
-                    walk_expr(&e.lhs, scopes).or_else(|| walk_expr(&e.rhs, scopes))
-                }
-                Expr::UnaryOp(e) => walk_expr(&e.expr, scopes),
-                Expr::Borrow(e) => walk_expr(&e.expr, scopes),
-                Expr::Dereference(e) => walk_expr(&e.expr, scopes),
-                Expr::AsCast(e) => walk_expr(&e.expr, scopes),
-                Expr::UnsafeBlock(e) => walk_block(&e.stmts, scopes)
-                    .or_else(|| e.ret.as_deref().and_then(|ret| walk_expr(ret, scopes))),
-                Expr::ComptimeBlock(e) => walk_block(&e.stmts, scopes)
-                    .or_else(|| e.ret.as_deref().and_then(|ret| walk_expr(ret, scopes))),
-                Expr::StructInit(e) => {
-                    for (_, value) in &e.fields {
-                        if let Some(name) = walk_expr(value, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    None
-                }
-                Expr::If(e) => walk_expr(&e.cond, scopes)
-                    .or_else(|| walk_block(&e.then_block, scopes))
-                    .or_else(|| {
-                        e.else_block
-                            .as_deref()
-                            .and_then(|otherwise| walk_block(otherwise, scopes))
-                    }),
-                Expr::Range(e) => walk_expr(&e.start, scopes).or_else(|| walk_expr(&e.end, scopes)),
-                Expr::Match(e) => {
-                    if let Some(name) = walk_expr(&e.expr, scopes) {
-                        return Some(name);
-                    }
-                    for arm in &e.arms {
-                        scopes.push(HashSet::new());
-                        declare_pattern(&arm.pattern, scopes);
-                        let escaped = walk_stmts(&arm.body, scopes);
-                        scopes.pop();
-                        if escaped.is_some() {
-                            return escaped;
-                        }
-                    }
-                    None
-                }
-                Expr::Grad(e) => walk_exprs(&e.args, scopes),
-                Expr::Vjp(e) => {
-                    walk_exprs(&e.args, scopes).or_else(|| walk_expr(&e.cotangent, scopes))
-                }
-                Expr::Jvp(e) => {
-                    walk_exprs(&e.args, scopes).or_else(|| walk_expr(&e.tangent, scopes))
-                }
-                // These bodies run in a different context. A closure is checked when called,
-                // and `spawn on` is run by the target topology, not by this comptime block.
-                Expr::SpawnOn(_) | Expr::Closure(_) => None,
-                Expr::Print(e) => walk_exprs(&e.args, scopes),
-                Expr::Println(e) => walk_exprs(&e.args, scopes),
-                Expr::InlineMlir(e) => {
-                    for (_, input, _) in &e.inputs {
-                        if let Some(name) = walk_expr(input, scopes) {
-                            return Some(name);
-                        }
-                    }
-                    walk_exprs(&e.clobbers, scopes)
-                }
-            }
-        }
-
-        let mut scopes = Vec::new();
-        walk_block(stmts, &mut scopes)
     }
 
     fn report_comptime_block_failure(&mut self, why: &str, span: &Span) {
@@ -961,66 +741,5 @@ impl<'a> TypeChecker<'a> {
             }
             _ => panic!("Expected IndexAccess, got {:?}", expr),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn identifier(name: &str) -> Expr {
-        Expr::Identifier(IdentifierExpr::new(name.into(), Span::default()))
-    }
-
-    fn number(value: &str) -> Expr {
-        Expr::Number(NumberExpr::new(value.to_string(), None, Span::default()))
-    }
-
-    fn assign(name: &str) -> Statement {
-        Statement::Assign(AssignStmt::new(
-            identifier(name),
-            number("1"),
-            Span::default(),
-        ))
-    }
-
-    #[test]
-    fn escaping_write_visits_if_in_let_initializer() {
-        let stmts = vec![Statement::LetDecl(LetDeclStmt::new(
-            "local".to_string(),
-            false,
-            None,
-            Expr::If(IfExpr::new(
-                false,
-                Box::new(identifier("true")),
-                vec![assign("outer")],
-                Some(vec![]),
-                Span::default(),
-            )),
-            Span::default(),
-        ))];
-
-        assert_eq!(
-            TypeChecker::escaping_write(&stmts),
-            Some(crate::symbol::Symbol::from("outer"))
-        );
-    }
-
-    #[test]
-    fn escaping_write_keeps_match_bindings_local() {
-        let stmts = vec![Statement::ExprStmt(ExprStmtStmt::new(
-            Expr::Match(MatchExpr::new(
-                Box::new(identifier("value")),
-                vec![MatchArm {
-                    pattern: Pattern::Identifier("item".into()),
-                    body: vec![assign("item")],
-                }],
-                Span::default(),
-            )),
-            true,
-            Span::default(),
-        ))];
-
-        assert_eq!(TypeChecker::escaping_write(&stmts), None);
     }
 }

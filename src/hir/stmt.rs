@@ -1175,6 +1175,10 @@ impl<'a> TypeChecker<'a> {
                     local_env.insert(func.params.get(i + skip)?.0.clone(), arg_val);
                 }
                 self.enter_call()?;
+                self.push_comptime_eval_scope();
+                for (param, _) in &func.params {
+                    self.declare_comptime_eval_binding(param);
+                }
                 let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
                 let mut result = None;
                 if let EvalFlow::Return(ret_val) = self.eval_block(&func.body, &mut local_env) {
@@ -1187,6 +1191,7 @@ impl<'a> TypeChecker<'a> {
                     result = None;
                 }
                 self.consteval.unsupported_stmt.set(outer_unsupported);
+                self.pop_comptime_eval_scope();
                 self.leave_call();
                 result
             }
@@ -1198,13 +1203,21 @@ impl<'a> TypeChecker<'a> {
                 span: _,
             }) => {
                 let mut local_env = env.clone();
-                if let EvalFlow::Return(value) = self.eval_block(stmts, &mut local_env) {
-                    return value;
-                }
-                if self.consteval.unsupported_stmt.get() {
-                    return None;
-                }
-                self.eval_expr(ret.as_deref()?, &local_env)
+                self.push_comptime_eval_scope();
+                let flow = self.eval_block(stmts, &mut local_env);
+                let result = match flow {
+                    EvalFlow::Return(value) => value,
+                    EvalFlow::Normal | EvalFlow::Break | EvalFlow::Continue => {
+                        if self.consteval.unsupported_stmt.get() {
+                            None
+                        } else {
+                            ret.as_deref()
+                                .and_then(|ret| self.eval_expr(ret, &local_env))
+                        }
+                    }
+                };
+                self.pop_comptime_eval_scope();
+                result
             }
             Expr::IndirectCall(IndirectCallExpr {
                 callee,
@@ -1236,6 +1249,7 @@ impl<'a> TypeChecker<'a> {
                     };
                     let mut ret = None;
                     let mut local_env = env.clone();
+                    self.push_comptime_eval_scope();
                     for stmt in block {
                         if let Statement::ExprStmt(ExprStmtStmt {
                             expr: e,
@@ -1253,6 +1267,7 @@ impl<'a> TypeChecker<'a> {
                             ret = val;
                         }
                     }
+                    self.pop_comptime_eval_scope();
                     ret
                 } else {
                     None
@@ -1329,10 +1344,15 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.enter_call()?;
+        self.push_comptime_eval_scope();
+        for (param, _) in &func.params {
+            self.declare_comptime_eval_binding(param);
+        }
         let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
         self.eval_block(&func.body, &mut local_env);
         let ran = !self.consteval.unsupported_stmt.get();
         self.consteval.unsupported_stmt.set(outer_unsupported);
+        self.pop_comptime_eval_scope();
         self.leave_call();
         if !ran {
             return None;
@@ -1436,6 +1456,10 @@ impl<'a> TypeChecker<'a> {
             );
         }
         self.enter_call()?;
+        self.push_comptime_eval_scope();
+        for (param, _) in &func.params {
+            self.declare_comptime_eval_binding(param);
+        }
         let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
         let mut result = None;
         if let EvalFlow::Return(ret_val) = self.eval_block(&func.body, &mut local_env) {
@@ -1445,6 +1469,7 @@ impl<'a> TypeChecker<'a> {
             result = None;
         }
         self.consteval.unsupported_stmt.set(outer_unsupported);
+        self.pop_comptime_eval_scope();
         self.leave_call();
         result
     }
@@ -1533,6 +1558,50 @@ impl<'a> TypeChecker<'a> {
         Some(())
     }
 
+    /// Start a lexical scope for a comptime evaluation, when one is active.
+    fn push_comptime_eval_scope(&self) {
+        if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+            effects.local_scopes.push(std::collections::HashSet::new());
+        }
+    }
+
+    /// End a lexical scope for a comptime evaluation, when one is active.
+    fn pop_comptime_eval_scope(&self) {
+        if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+            effects
+                .local_scopes
+                .pop()
+                .expect("comptime evaluation scope was pushed");
+        }
+    }
+
+    /// Record a binding introduced while evaluating a comptime block.
+    fn declare_comptime_eval_binding(&self, name: &crate::symbol::Symbol) {
+        if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+            effects
+                .local_scopes
+                .last_mut()
+                .expect("comptime evaluation has a root scope")
+                .insert(name.clone());
+        }
+    }
+
+    /// Remember an effect that would disappear when the enclosing comptime block folds.
+    fn record_comptime_write(&self, name: &crate::symbol::Symbol) {
+        let mut state = self.consteval.comptime_effects.borrow_mut();
+        let Some(effects) = state.as_mut() else {
+            return;
+        };
+        let is_local = effects
+            .local_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name));
+        if effects.escaping_write.is_none() && effects.outer_bindings.contains(name) && !is_local {
+            effects.escaping_write = Some(name.clone());
+        }
+    }
+
     /// Run every statement of a block, stopping at whatever leaves it early.
     pub(crate) fn eval_block(
         &self,
@@ -1589,6 +1658,8 @@ impl<'a> TypeChecker<'a> {
         // make a variable the loop never touched unknown from here on.
         let name: crate::symbol::Symbol = iter.to_string().into();
         let shadowed = env.get(name.as_ref()).cloned();
+        self.push_comptime_eval_scope();
+        self.declare_comptime_eval_binding(&name);
         let mut left = EvalFlow::Normal;
 
         let mut i = start;
@@ -1617,6 +1688,7 @@ impl<'a> TypeChecker<'a> {
             Some(val) => env.insert(name, val),
             None => env.remove(name.as_ref()),
         };
+        self.pop_comptime_eval_scope();
         left
     }
 
@@ -1627,19 +1699,22 @@ impl<'a> TypeChecker<'a> {
         body: &[Statement],
         env: &mut HashMap<crate::symbol::Symbol, Value>,
     ) -> EvalFlow {
-        loop {
+        self.push_comptime_eval_scope();
+        let flow = loop {
             if self.step_loop().is_none() {
-                return EvalFlow::Normal;
+                break EvalFlow::Normal;
             }
             match self.eval_block(body, env) {
                 EvalFlow::Normal | EvalFlow::Continue => {}
-                EvalFlow::Break => return EvalFlow::Normal,
-                ret @ EvalFlow::Return(_) => return ret,
+                EvalFlow::Break => break EvalFlow::Normal,
+                ret @ EvalFlow::Return(_) => break ret,
             }
             if self.consteval.unsupported_stmt.get() {
-                return EvalFlow::Normal;
+                break EvalFlow::Normal;
             }
-        }
+        };
+        self.pop_comptime_eval_scope();
+        flow
     }
 
     pub(crate) fn eval_statement(
@@ -1661,6 +1736,7 @@ impl<'a> TypeChecker<'a> {
                     Some(val) => env.insert(name.clone(), val),
                     None => env.remove(name.as_ref()),
                 };
+                self.declare_comptime_eval_binding(name);
                 EvalFlow::Normal
             }
             Statement::Assign(AssignStmt {
@@ -1672,6 +1748,7 @@ impl<'a> TypeChecker<'a> {
                     Some(val) => env.insert(name.clone(), val),
                     None => env.remove(name.as_ref()),
                 };
+                self.record_comptime_write(name);
                 EvalFlow::Normal
             }
             // `x op= v` is `x = x op v`. Run as that, so the arithmetic and the overflow
@@ -1712,6 +1789,7 @@ impl<'a> TypeChecker<'a> {
                     if !stored {
                         env.remove(root.as_ref());
                     }
+                    self.record_comptime_write(root);
                 }
                 EvalFlow::Normal
             }
@@ -1757,6 +1835,7 @@ impl<'a> TypeChecker<'a> {
                 match self.eval_call_effects(call, env) {
                     Some(written) => {
                         for (place, value) in written {
+                            self.record_comptime_write(&place);
                             env.insert(place, value);
                         }
                     }
@@ -1791,9 +1870,15 @@ impl<'a> TypeChecker<'a> {
                     return EvalFlow::Normal;
                 };
                 if taken {
-                    self.eval_block(then_block, env)
+                    self.push_comptime_eval_scope();
+                    let flow = self.eval_block(then_block, env);
+                    self.pop_comptime_eval_scope();
+                    flow
                 } else if let Some(otherwise) = else_block {
-                    self.eval_block(otherwise, env)
+                    self.push_comptime_eval_scope();
+                    let flow = self.eval_block(otherwise, env);
+                    self.pop_comptime_eval_scope();
+                    flow
                 } else {
                     EvalFlow::Normal
                 }
