@@ -44,15 +44,15 @@
 <p class="post-meta">Aditya Kumar &middot; 23 September 2026</p>
 
 <blockquote class="tldr"><strong>TL;DR</strong> — <code>malloc</code> and <code>cudaMalloc</code>
-return memory that lives in different places, is read by different processors, and runs out at
-different sizes. C, C++ and Rust give both results the same type. Vx makes the memory space part of
+return memory that lives in different places. They are supposed to be read by different processors, and run out at
+different sizes. C, C++ and Rust give both results the same type. Vx makes the memory space (placement) part of
 the type, so a value from device memory cannot be passed, assigned or read as if it were host
 memory.</blockquote>
 
 <p class="lede">An allocator knows exactly one thing better than anyone else in the program: which
 memory it just handed out. The first thing the language does with that answer is throw it away.</p>
 
-<h2>Two lines of C</h2>
+<h2>Here is a simple example in C to demonstrate the problem</h2>
 
 <pre><code><span class="t">float</span> *a = (<span class="t">float</span> *)<span class="f">malloc</span>(<span class="n">16</span> * <span class="k">sizeof</span>(<span class="t">float</span>));
 <span class="t">float</span> *b;
@@ -145,15 +145,15 @@ pointer per mutability, and its foreign-function declarations come out identical
 <em>provenance</em>: which allocation the pointer was derived from. It does not track which memory
 that allocation is in, because in its abstract machine there is only one.</p>
 
-<h2>The libraries noticed</h2>
+<h2>Popular libraries have made efforts to address this</h2>
 
-<p>People who write GPU code hit this early, and the libraries built the missing type themselves.
+<p>People who write GPU code hit this early, so the libraries built the missing type themselves.
 Thrust has <code>thrust::device_ptr&lt;T&gt;</code>. SYCL has
 <code>multi_ptr&lt;T, address_space&gt;</code>. In Rust, <code>cudarc</code> has
 <code>CudaSlice&lt;T&gt;</code> and <code>cust</code> has <code>DeviceBuffer&lt;T&gt;</code>. Inside
-one of these libraries, a device buffer and a host buffer are different types, and that works.</p>
+one of these libraries, a device buffer and a host buffer are different types.</p>
 
-<p>Each one is a private vocabulary, though, and they meet at the raw pointer. cuBLAS takes
+<p>Each one is their own vocabulary, though, and they meet at the raw pointer. cuBLAS takes
 <code>const float *</code>. A kernel launch takes <code>float *</code>. Thrust's way out is
 <code>thrust::raw_pointer_cast</code>, and the Rust crates have their own equivalents. Every time a
 buffer crosses from one library to another, it crosses as a bare pointer, and the space is gone
@@ -166,7 +166,7 @@ fact, which space each generic pointer points into. The allocator knew. The type
 compiler pass spends its time guessing it back, and it gives up at any call it cannot see
 through.</p>
 
-<h2>The bug, in the wild</h2>
+<h2>The bugs highlight the underlying problem</h2>
 
 <p>This is a mistake people make often enough to leave a trail. A few from public trackers:</p>
 
@@ -202,7 +202,7 @@ mode ran correctly.</td></tr>
 names, and the only place they could record it was a mode flag on a handle, because the parameter's
 type has nowhere to put it. The last row is a compiler making the same mistake a person does.</p>
 
-<h2>Prior art</h2>
+<h2>Prior art in programming languages</h2>
 
 <p>Putting the space in the pointer's type is an old idea. OpenCL C writes
 <code>__global float *</code> and <code>__local float *</code> as distinct types. ISO/IEC TR 18037
@@ -266,7 +266,7 @@ pointer is refused at the same read.</p>
 <p>That compiles and runs. Nothing about it needs a GPU on the machine doing the compiling: which
 spaces a CPU can see comes from the machine description the compiler checks against.</p>
 
-<h2>Where the space goes when two memories are one</h2>
+<h2>Where the space goes in a unified memory system</h2>
 
 <p>On Apple silicon the CPU and the neural engine share physical memory, and the built-in CPU
 description lists <code>NPU_HBM</code> among the spaces it can see. A host read of a tensor in
@@ -282,7 +282,7 @@ measured
 file records both facts: <code>visible:</code> says who may read a space, and the transfer edges
 say what moving data costs.</p>
 
-<h2>Raw pointers mean CPU memory</h2>
+<h2>Even in Vx raw pointers mean CPU memory</h2>
 
 <p>Vx has raw pointers too, <code>*const T</code> and <code>*mut T</code>, and they carry no space
 parameter. That is deliberate: a raw pointer points into the default CPU memory, which is what a
