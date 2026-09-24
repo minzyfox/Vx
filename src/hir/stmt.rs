@@ -1257,9 +1257,17 @@ impl<'a> TypeChecker<'a> {
                             span: _,
                         }) = stmt
                         {
-                            let val = self.eval_expr(e, &local_env);
-                            if !*has_semi {
-                                ret = val;
+                            if *has_semi && matches!(e, Expr::FunctionCall(_) | Expr::If(_)) {
+                                if let EvalFlow::Return(val) =
+                                    self.eval_statement(stmt, &mut local_env)
+                                {
+                                    ret = val;
+                                }
+                            } else {
+                                let val = self.eval_expr(e, &local_env);
+                                if !*has_semi {
+                                    ret = val;
+                                }
                             }
                         } else if let EvalFlow::Return(val) =
                             self.eval_statement(stmt, &mut local_env)
@@ -1270,6 +1278,9 @@ impl<'a> TypeChecker<'a> {
                     self.pop_comptime_eval_scope();
                     ret
                 } else {
+                    if self.consteval.comptime_effects.borrow().is_some() {
+                        self.consteval.unsupported_stmt.set(true);
+                    }
                     None
                 }
             }
@@ -1668,7 +1679,10 @@ impl<'a> TypeChecker<'a> {
                 break;
             }
             env.insert(name.clone(), Value::Int(i));
-            match self.eval_block(body, env) {
+            self.push_comptime_eval_scope();
+            let flow = self.eval_block(body, env);
+            self.pop_comptime_eval_scope();
+            match flow {
                 EvalFlow::Normal | EvalFlow::Continue => {}
                 EvalFlow::Break => break,
                 ret @ EvalFlow::Return(_) => {
@@ -1704,7 +1718,10 @@ impl<'a> TypeChecker<'a> {
             if self.step_loop().is_none() {
                 break EvalFlow::Normal;
             }
-            match self.eval_block(body, env) {
+            self.push_comptime_eval_scope();
+            let body_flow = self.eval_block(body, env);
+            self.pop_comptime_eval_scope();
+            match body_flow {
                 EvalFlow::Normal | EvalFlow::Continue => {}
                 EvalFlow::Break => break EvalFlow::Normal,
                 ret @ EvalFlow::Return(_) => break ret,
