@@ -785,6 +785,22 @@ impl<'graph> ComptimeInterpreter<'graph> {
             }
             Expr::LogicalOp(op) => {
                 let lhs = self.expr(&op.lhs);
+                if lhs.flow != ComptimeEvalFlow::Normal {
+                    return lhs;
+                }
+                match (&lhs.value.concrete, &op.op) {
+                    (Some(Value::Bool(false)), LogicalOp::And) => {
+                        let mut outcome = ComptimeEvalOutcome::known(Value::Bool(false));
+                        outcome.support.merge_from(lhs.support);
+                        return outcome;
+                    }
+                    (Some(Value::Bool(true)), LogicalOp::Or) => {
+                        let mut outcome = ComptimeEvalOutcome::known(Value::Bool(true));
+                        outcome.support.merge_from(lhs.support);
+                        return outcome;
+                    }
+                    _ => {}
+                }
                 let rhs = self.expr(&op.rhs);
                 let mut outcome = self.unknown_after([lhs.clone(), rhs.clone()]);
                 outcome.value.concrete = match (&lhs.value.concrete, &rhs.value.concrete, &op.op) {
