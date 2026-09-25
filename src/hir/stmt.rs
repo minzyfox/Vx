@@ -1587,9 +1587,14 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Expr::Borrow(BorrowExpr { expr, is_mut, .. }) => {
-                facts = self.comptime_place_facts(expr, effects);
-                if !is_mut {
-                    facts.reference_origins.clear();
+                // An immutable borrow can expose a mutable reference stored in its value. A
+                // mutable borrow also writes its storage, so it carries both kinds of origin.
+                facts = self.comptime_value_facts(expr, effects);
+                if *is_mut {
+                    Self::merge_comptime_value_facts(
+                        &mut facts,
+                        self.comptime_place_facts(expr, effects),
+                    );
                 }
             }
             Expr::Dereference(DereferenceExpr { expr, .. })
