@@ -1173,9 +1173,14 @@ impl<'a> TypeChecker<'a> {
                 // its own parameters folds, and one that reads a capture finds the name
                 // unbound and answers nothing, which is the right answer either way.
                 let skip = usize::from(Self::is_closure_body(name.as_ref()));
+                let borrowed = Self::mut_borrow_args(func, args);
                 let mut local_env = HashMap::new();
                 for (i, arg_expr) in args.iter().skip(skip).enumerate() {
-                    let arg_val = self.eval_expr(arg_expr, env)?;
+                    let param_index = i + skip;
+                    let arg_val = match borrowed.iter().find(|(at, _)| *at == param_index) {
+                        Some((_, place)) => env.get(place.as_ref())?.clone(),
+                        None => self.eval_expr(arg_expr, env)?,
+                    };
                     local_env.insert(func.params.get(i + skip)?.0.clone(), arg_val);
                 }
                 self.enter_call()?;
@@ -1191,12 +1196,20 @@ impl<'a> TypeChecker<'a> {
                 // A body holding a statement the evaluator cannot run has not been run.
                 // Answering with what the statements it could run left behind would be a
                 // guess, and a guess here is reported as a certainty.
-                if self.consteval.unsupported_stmt.get() {
+                let ran = !self.consteval.unsupported_stmt.get();
+                if !ran {
                     result = None;
                 }
                 self.consteval.unsupported_stmt.set(outer_unsupported);
                 self.pop_comptime_eval_scope();
                 self.leave_call();
+                if !ran && !borrowed.is_empty() {
+                    self.consteval.unsupported_stmt.set(true);
+                    return None;
+                }
+                for (_, place) in borrowed {
+                    self.record_comptime_write(&place);
+                }
                 result
             }
             // The body of a comptime lambda is a `comptime` block, so evaluating a call to
@@ -1251,45 +1264,316 @@ impl<'a> TypeChecker<'a> {
                     } else {
                         return None;
                     };
-                    let mut ret = None;
-                    let mut local_env = env.clone();
-                    self.push_comptime_eval_scope();
-                    for stmt in block {
-                        if let Statement::ExprStmt(ExprStmtStmt {
-                            expr: e,
-                            has_semi,
-                            span: _,
-                        }) = stmt
-                        {
-                            if *has_semi && matches!(e, Expr::FunctionCall(_) | Expr::If(_)) {
-                                if let EvalFlow::Return(val) =
-                                    self.eval_statement(stmt, &mut local_env)
-                                {
-                                    ret = val;
-                                }
-                            } else {
-                                let val = self.eval_expr(e, &local_env);
-                                if !*has_semi {
-                                    ret = val;
-                                }
-                            }
-                        } else if let EvalFlow::Return(val) =
-                            self.eval_statement(stmt, &mut local_env)
-                        {
-                            ret = val;
-                        }
-                    }
-                    self.pop_comptime_eval_scope();
-                    ret
+                    self.eval_value_block(block, None, env)
                 } else {
-                    if self.consteval.comptime_effects.borrow().is_some() {
+                    if self.may_write_outer_in_blocks(
+                        std::iter::once(then_block.as_slice())
+                            .chain(else_block.iter().map(Vec::as_slice)),
+                    ) {
                         self.consteval.unsupported_stmt.set(true);
                     }
                     None
                 }
             }
+            Expr::UnsafeBlock(UnsafeBlockExpr {
+                stmts,
+                ret,
+                span: _,
+            }) => self.eval_value_block(stmts, ret.as_deref(), env),
+            Expr::Match(MatchExpr {
+                expr: scrutinee,
+                arms,
+                span: _,
+            }) => {
+                let Some(value) = self.eval_expr(scrutinee, env) else {
+                    if self.may_write_outer_in_blocks(arms.iter().map(|arm| arm.body.as_slice())) {
+                        self.consteval.unsupported_stmt.set(true);
+                    }
+                    return None;
+                };
+                let Some(arm) = arms
+                    .iter()
+                    .find(|arm| self.pattern_matches(&arm.pattern, &value, env))
+                else {
+                    if self.may_write_outer_in_blocks(arms.iter().map(|arm| arm.body.as_slice())) {
+                        self.consteval.unsupported_stmt.set(true);
+                    }
+                    return None;
+                };
+                self.eval_value_block(&arm.body, None, env)
+            }
             _ => None,
         }
+    }
+
+    /// Evaluate a block used as an expression. Its final expression provides the value, while
+    /// preceding statements use the normal evaluator and stop at the first control-flow exit.
+    fn eval_value_block(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<Value> {
+        let mut local_env = env.clone();
+        self.eval_value_block_result(stmts, ret, &mut local_env).1
+    }
+
+    /// Run an expression block against an environment owned by its caller. This carries the
+    /// flow separately from its tail value so statement-position `unsafe` and `match` blocks
+    /// can still pass `return`, `break`, and `continue` to their enclosing block.
+    fn eval_value_block_result(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> (EvalFlow, Option<Value>) {
+        let (body, trailing) = match ret {
+            Some(ret) => (stmts, Some(ret)),
+            None => match stmts.last() {
+                Some(Statement::ExprStmt(ExprStmtStmt {
+                    expr,
+                    has_semi: false,
+                    span: _,
+                })) => (&stmts[..stmts.len() - 1], Some(expr)),
+                _ => (stmts, None),
+            },
+        };
+        self.push_comptime_eval_scope();
+        let flow = self.eval_block(body, env);
+        let value = match &flow {
+            EvalFlow::Return(value) => value.clone(),
+            EvalFlow::Normal => trailing.and_then(|expr| self.eval_expr(expr, env)),
+            EvalFlow::Break | EvalFlow::Continue => None,
+        };
+        self.pop_comptime_eval_scope();
+        (flow, value)
+    }
+
+    /// Run an expression block in statement position. Only bindings that existed before the
+    /// block survive its lexical scope, so inner `let`s cannot leak into the caller's map.
+    fn eval_value_block_in_place(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) -> EvalFlow {
+        let names: Vec<_> = env.keys().cloned().collect();
+        let mut local_env = env.clone();
+        let (flow, _) = self.eval_value_block_result(stmts, ret, &mut local_env);
+        for name in names {
+            match local_env.get(name.as_ref()) {
+                Some(value) => {
+                    env.insert(name, value.clone());
+                }
+                None => {
+                    env.remove(name.as_ref());
+                }
+            };
+        }
+        flow
+    }
+
+    /// Whether a pattern selects a value the evaluator knows how to represent.
+    fn pattern_matches(
+        &self,
+        pattern: &Pattern,
+        value: &Value,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> bool {
+        match pattern {
+            Pattern::Wildcard | Pattern::Identifier(_) => true,
+            Pattern::Literal(literal) => self.eval_expr(literal, env).as_ref() == Some(value),
+            Pattern::EnumVariant(_, _, _) => false,
+        }
+    }
+
+    /// An unknown condition may be discarded only when neither path can write a binding that
+    /// predates this comptime evaluation. This is a conservative syntax walk: it follows the
+    /// same lexical scopes as the evaluator, but need not guess which unknown path will run.
+    fn may_write_outer_in_blocks<'b>(
+        &self,
+        mut blocks: impl Iterator<Item = &'b [Statement]>,
+    ) -> bool {
+        type Bindings = std::collections::HashSet<crate::symbol::Symbol>;
+
+        fn is_outer(name: &crate::symbol::Symbol, outer: &Bindings, locals: &[Bindings]) -> bool {
+            outer.contains(name) && !locals.iter().rev().any(|scope| scope.contains(name))
+        }
+
+        fn expr_may_write(
+            checker: &TypeChecker<'_>,
+            expr: &Expr,
+            outer: &Bindings,
+            locals: &mut Vec<Bindings>,
+        ) -> bool {
+            match expr {
+                Expr::FunctionCall(call) => {
+                    if let Some(func) = checker.callee_body(call.name.as_ref()) {
+                        if TypeChecker::mut_borrow_args(func, &call.args)
+                            .iter()
+                            .any(|(_, place)| is_outer(place, outer, locals))
+                        {
+                            return true;
+                        }
+                    }
+                    call.args
+                        .iter()
+                        .any(|arg| expr_may_write(checker, arg, outer, locals))
+                }
+                Expr::If(IfExpr {
+                    cond,
+                    then_block,
+                    else_block,
+                    is_comptime: _,
+                    span: _,
+                }) => {
+                    expr_may_write(checker, cond, outer, locals)
+                        || block_may_write(checker, then_block, outer, locals)
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|block| block_may_write(checker, block, outer, locals))
+                }
+                Expr::Match(MatchExpr {
+                    expr,
+                    arms,
+                    span: _,
+                }) => {
+                    expr_may_write(checker, expr, outer, locals)
+                        || arms
+                            .iter()
+                            .any(|arm| block_may_write(checker, &arm.body, outer, locals))
+                }
+                Expr::UnsafeBlock(UnsafeBlockExpr {
+                    stmts,
+                    ret,
+                    span: _,
+                })
+                | Expr::ComptimeBlock(ComptimeBlockExpr {
+                    stmts,
+                    ret,
+                    span: _,
+                }) => {
+                    block_may_write(checker, stmts, outer, locals)
+                        || ret
+                            .as_ref()
+                            .is_some_and(|ret| expr_may_write(checker, ret, outer, locals))
+                }
+                Expr::BinaryOp(BinaryOpExpr {
+                    lhs,
+                    rhs,
+                    op: _,
+                    span: _,
+                })
+                | Expr::RelationalOp(RelationalOpExpr {
+                    lhs,
+                    rhs,
+                    op: _,
+                    span: _,
+                })
+                | Expr::LogicalOp(LogicalOpExpr {
+                    lhs,
+                    rhs,
+                    op: _,
+                    span: _,
+                }) => {
+                    expr_may_write(checker, lhs, outer, locals)
+                        || expr_may_write(checker, rhs, outer, locals)
+                }
+                Expr::UnaryOp(UnaryOpExpr {
+                    expr,
+                    op: _,
+                    span: _,
+                })
+                | Expr::Borrow(BorrowExpr {
+                    expr,
+                    is_mut: _,
+                    span: _,
+                })
+                | Expr::Dereference(DereferenceExpr {
+                    expr,
+                    ty: _,
+                    span: _,
+                }) => expr_may_write(checker, expr, outer, locals),
+                Expr::Array(ArrayExpr { elements, span: _ }) => elements
+                    .iter()
+                    .any(|element| expr_may_write(checker, element, outer, locals)),
+                Expr::IndexAccess(IndexAccessExpr {
+                    base,
+                    index,
+                    span: _,
+                }) => {
+                    expr_may_write(checker, base, outer, locals)
+                        || expr_may_write(checker, index, outer, locals)
+                }
+                Expr::Range(RangeExpr {
+                    start,
+                    end,
+                    span: _,
+                }) => {
+                    expr_may_write(checker, start, outer, locals)
+                        || expr_may_write(checker, end, outer, locals)
+                }
+                _ => false,
+            }
+        }
+
+        fn block_may_write(
+            checker: &TypeChecker<'_>,
+            stmts: &[Statement],
+            outer: &Bindings,
+            locals: &mut Vec<Bindings>,
+        ) -> bool {
+            locals.push(Bindings::new());
+            let writes = stmts.iter().any(|stmt| match stmt {
+                Statement::LetDecl(LetDeclStmt { name, expr, .. }) => {
+                    let writes = expr_may_write(checker, expr, outer, locals);
+                    locals
+                        .last_mut()
+                        .expect("block scope was pushed")
+                        .insert(name.clone());
+                    writes
+                }
+                Statement::Assign(AssignStmt { lhs, rhs, .. })
+                | Statement::CompoundAssign(CompoundAssignStmt { lhs, rhs, .. }) => {
+                    TypeChecker::place_root(lhs).is_some_and(|name| is_outer(name, outer, locals))
+                        || expr_may_write(checker, rhs, outer, locals)
+                }
+                Statement::Return(ReturnStmt { expr, .. }) => expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_may_write(checker, expr, outer, locals)),
+                Statement::ExprStmt(ExprStmtStmt { expr, .. }) => {
+                    expr_may_write(checker, expr, outer, locals)
+                }
+                Statement::ForLoop(ForLoopStmt {
+                    iter,
+                    iterable,
+                    body,
+                    ..
+                }) => {
+                    expr_may_write(checker, iterable, outer, locals) || {
+                        locals.push(Bindings::from([iter.as_str().into()]));
+                        let writes = block_may_write(checker, body, outer, locals);
+                        locals.pop();
+                        writes
+                    }
+                }
+                Statement::Loop(LoopStmt { body, .. }) => {
+                    block_may_write(checker, body, outer, locals)
+                }
+                _ => false,
+            });
+            locals.pop();
+            writes
+        }
+
+        let (outer, mut locals) = {
+            let state = self.consteval.comptime_effects.borrow();
+            let Some(effects) = state.as_ref() else {
+                return false;
+            };
+            (effects.outer_bindings.clone(), effects.local_scopes.clone())
+        };
+        blocks.any(|block| block_may_write(self, block, &outer, &mut locals))
     }
 
     /// The caller-side variable each argument passed by mutable borrow writes through.
@@ -1888,7 +2172,12 @@ impl<'a> TypeChecker<'a> {
                 span: _,
             }) => {
                 let Some(Value::Bool(taken)) = self.eval_expr(cond, env) else {
-                    self.consteval.unsupported_stmt.set(true);
+                    if self.may_write_outer_in_blocks(
+                        std::iter::once(then_block.as_slice())
+                            .chain(else_block.iter().map(Vec::as_slice)),
+                    ) {
+                        self.consteval.unsupported_stmt.set(true);
+                    }
                     return EvalFlow::Normal;
                 };
                 if taken {
@@ -1901,6 +2190,45 @@ impl<'a> TypeChecker<'a> {
                     let flow = self.eval_block(otherwise, env);
                     self.pop_comptime_eval_scope();
                     flow
+                } else {
+                    EvalFlow::Normal
+                }
+            }
+            Statement::ExprStmt(ExprStmtStmt {
+                expr:
+                    Expr::UnsafeBlock(UnsafeBlockExpr {
+                        stmts,
+                        ret,
+                        span: _,
+                    }),
+                has_semi: _,
+                span: _,
+            }) => self.eval_value_block_in_place(stmts, ret.as_deref(), env),
+            Statement::ExprStmt(ExprStmtStmt {
+                expr:
+                    Expr::Match(MatchExpr {
+                        expr,
+                        arms,
+                        span: _,
+                    }),
+                has_semi: _,
+                span: _,
+            }) => {
+                let Some(value) = self.eval_expr(expr, env) else {
+                    if self.may_write_outer_in_blocks(arms.iter().map(|arm| arm.body.as_slice())) {
+                        self.consteval.unsupported_stmt.set(true);
+                    }
+                    return EvalFlow::Normal;
+                };
+                if let Some(arm) = arms
+                    .iter()
+                    .find(|arm| self.pattern_matches(&arm.pattern, &value, env))
+                {
+                    self.eval_value_block_in_place(&arm.body, None, env)
+                } else if self.may_write_outer_in_blocks(arms.iter().map(|arm| arm.body.as_slice()))
+                {
+                    self.consteval.unsupported_stmt.set(true);
+                    EvalFlow::Normal
                 } else {
                     EvalFlow::Normal
                 }

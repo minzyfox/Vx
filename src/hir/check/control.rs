@@ -51,6 +51,7 @@ impl<'a> TypeChecker<'a> {
         stmts: &[Statement],
         ret: Option<&Expr>,
         before: &HashMap<crate::symbol::Symbol, Value>,
+        block_span: &Span,
     ) -> ComptimeFold {
         let outer_bindings = self
             .scopes
@@ -70,7 +71,12 @@ impl<'a> TypeChecker<'a> {
         let ran = !self.consteval.unsupported_stmt.get();
         self.consteval.unsupported_stmt.set(outer_unsupported);
 
-        let span = ret.map(|r| r.span()).unwrap_or_default();
+        let span = ret
+            .map(|r| r.span())
+            .filter(|span| span.line != 0)
+            .or_else(|| stmts.first().map(Statement::span))
+            .filter(|span| span.line != 0)
+            .unwrap_or(*block_span);
         let returned = matches!(&flow, EvalFlow::Return(_));
         let value = match flow {
             EvalFlow::Return(value) => Some(value),
@@ -221,7 +227,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.consteval.comptime_depth -= 1;
                 self.pop_scope();
-                let folded = self.fold_comptime_block(stmts, ret.as_deref(), &before);
+                let folded = self.fold_comptime_block(stmts, ret.as_deref(), &before, &block_span);
                 // An assertion the placement fold answered `true` is discharged here: nothing
                 // at run time holds a placement, so nothing is left to check. (A false one
                 // was reported by the assert check.) Asserts on anything else stay, as the
