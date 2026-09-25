@@ -9,7 +9,7 @@
 
 fn main(n : i32) -> i32 {
   let mut outside : i32 = 0i32;
-  // CHECK: Error[E3033] at {{[1-9][0-9]*}}:{{[1-9][0-9]*}}: this `comptime` block cannot be evaluated: it holds a statement the evaluator cannot run
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
   let value = comptime {
     let chosen = if n > 0i32 {
       outside = 4i32;

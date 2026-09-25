@@ -53,15 +53,27 @@ impl<'a> TypeChecker<'a> {
         before: &HashMap<crate::symbol::Symbol, Value>,
         block_span: &Span,
     ) -> ComptimeFold {
-        let outer_bindings = self
-            .scopes
-            .iter()
-            .flat_map(|scope| scope.keys().cloned())
-            .collect();
+        let mut outer_bindings = HashSet::new();
+        let mut outer_reference_bindings = HashSet::new();
+        let mut outer_callable_bindings = HashSet::new();
+        for scope in &self.scopes {
+            for (name, (ty, _)) in scope {
+                outer_bindings.insert(name.clone());
+                if self.type_can_carry_mut_reference(ty) {
+                    outer_reference_bindings.insert(name.clone());
+                }
+                if matches!(ty, Type::Closure(..)) {
+                    outer_callable_bindings.insert(name.clone());
+                }
+            }
+        }
         let previous_effects = self.consteval.comptime_effects.replace(Some(
             crate::hir::check_state::ComptimeEffects {
                 outer_bindings,
-                local_scopes: vec![HashSet::new()],
+                outer_reference_bindings,
+                outer_callable_bindings,
+                local_scopes: vec![HashMap::new()],
+                analysis_call_stack: HashSet::new(),
                 escaping_write: None,
             },
         ));

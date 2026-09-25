@@ -72,10 +72,39 @@ pub struct ConstEvalState {
     pub comptime_depth: u32,
 }
 
+/// What a value can carry into an operation that runs while folding `comptime`.
+///
+/// A local name is not enough to decide whether a mutation escapes: it may be a reborrow of an
+/// outer value, a field that holds one, or a callable that captured one. These facts move with the
+/// value and are scoped with its binding, so shadowing and reassignment replace the old facts.
+#[derive(Clone, Default)]
+pub struct ComptimeValueFacts {
+    /// Outer bindings a mutable reference inside this value can reach.
+    pub reference_origins: HashSet<Symbol>,
+    /// Functions this value may call when used as a callable value.
+    pub callable_targets: HashSet<Symbol>,
+    /// Outer bindings a closure held by this value may write when invoked.
+    pub captured_writes: HashSet<Symbol>,
+    /// A callable whose body is unavailable. It is safe only when it receives no outer reference
+    /// and carries no known outer capture.
+    pub unknown_callable: bool,
+}
+
 /// The bindings visible before a `comptime` block and the locals it creates while running.
+#[derive(Clone)]
 pub struct ComptimeEffects {
     pub outer_bindings: HashSet<Symbol>,
-    pub local_scopes: Vec<HashSet<Symbol>>,
+    /// Outer bindings whose value is already a mutable reference or can carry one.
+    pub outer_reference_bindings: HashSet<Symbol>,
+    /// Callable values defined before the block. Their captures are not available here, so a call
+    /// through one is conservatively treated as capable of writing its outer owner.
+    pub outer_callable_bindings: HashSet<Symbol>,
+    /// Scoped value facts. Every binding is present, including plain locals, so it correctly
+    /// shadows an outer binding with the same spelling.
+    pub local_scopes: Vec<HashMap<Symbol, ComptimeValueFacts>>,
+    /// Calls currently being summarized for an unknown control-flow path. A recursive summary
+    /// still checks the call's reference arguments, but does not recurse forever into its body.
+    pub analysis_call_stack: HashSet<Symbol>,
     pub escaping_write: Option<Symbol>,
 }
 

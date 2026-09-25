@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -796,13 +796,86 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// The variable a place expression writes through: `a` for `a`, `a[i]` and `a[i][j]`.
+    /// The binding a place expression reaches: `a` for `a`, `a[i]`, `a.field`, and a reborrow
+    /// through any of those places.
     pub(crate) fn place_root(expr: &Expr) -> Option<&crate::symbol::Symbol> {
         match expr {
             Expr::Identifier(IdentifierExpr { name, span: _ }) => Some(name),
             Expr::IndexAccess(IndexAccessExpr { base, .. }) => Self::place_root(base),
+            Expr::MemberAccess(MemberAccessExpr { base, .. }) => Self::place_root(base),
+            Expr::Dereference(DereferenceExpr { expr, .. }) => Self::place_root(expr),
             _ => None,
         }
+    }
+
+    /// Whether a value can transport a mutable reference through a binding or aggregate.
+    pub(crate) fn type_can_carry_mut_reference(&self, ty: &Type) -> bool {
+        fn visit(
+            checker: &TypeChecker<'_>,
+            ty: &Type,
+            seen: &mut HashSet<crate::symbol::Symbol>,
+        ) -> bool {
+            match ty {
+                Type::Borrow { inner, is_mut, .. } => *is_mut || visit(checker, inner, seen),
+                Type::Pointer(inner, _, is_mut) => *is_mut || visit(checker, inner, seen),
+                Type::Ref(inner, _) | Type::Verified(inner) | Type::Pinned(inner, _) => {
+                    visit(checker, inner, seen)
+                }
+                Type::GenericInstance(base, args) => {
+                    visit(checker, base, seen) || args.iter().any(|arg| visit(checker, arg, seen))
+                }
+                Type::Struct(name, _) | Type::Enum(name, _) => {
+                    if !seen.insert(name.clone()) {
+                        return false;
+                    }
+                    let result = checker
+                        .env
+                        .structs
+                        .get(name)
+                        .map(|decl| {
+                            decl.fields
+                                .iter()
+                                .any(|(_, field)| visit(checker, field, seen))
+                        })
+                        .or_else(|| {
+                            checker
+                                .mono
+                                .generated_structs
+                                .iter()
+                                .find(|decl| decl.name == *name)
+                                .map(|decl| {
+                                    decl.fields
+                                        .iter()
+                                        .any(|(_, field)| visit(checker, field, seen))
+                                })
+                        })
+                        .or_else(|| {
+                            checker.env.enums.get(name).map(|decl| {
+                                decl.variants.iter().any(|(_, payload)| {
+                                    payload.as_ref().is_some_and(|fields| {
+                                        fields.iter().any(|field| visit(checker, field, seen))
+                                    })
+                                })
+                            })
+                        })
+                        .unwrap_or(false);
+                    seen.remove(name);
+                    result
+                }
+                Type::Unknown => true,
+                Type::Tensor(..)
+                | Type::Matrix
+                | Type::Scalar(..)
+                | Type::Generic(..)
+                | Type::Module(..)
+                | Type::Simd(..)
+                | Type::Function(..)
+                | Type::Closure(..)
+                | Type::Const(..) => false,
+            }
+        }
+
+        visit(self, ty, &mut HashSet::new())
     }
 
     /// Check a `return`: type the returned expression against the declared return type, run the
@@ -1132,10 +1205,14 @@ impl<'a> TypeChecker<'a> {
             // a half-built array would let a later index read a value that was never there.
             Expr::Array(ArrayExpr { elements, span: _ }) => {
                 let mut items = Vec::with_capacity(elements.len());
+                let mut complete = true;
                 for element in elements {
-                    items.push(self.eval_expr(element, env)?);
+                    match self.eval_expr(element, env) {
+                        Some(value) => items.push(value),
+                        None => complete = false,
+                    }
                 }
-                Some(Value::Array(items))
+                complete.then_some(Value::Array(items))
             }
             // `a[i]`, where both the array and the index are known at compile time. An index
             // past the end gives no value here; `check_indexaccess_expr` reports it.
@@ -1165,7 +1242,15 @@ impl<'a> TypeChecker<'a> {
                     Some(func) => func,
                     // A closure held in a variable: `add(41)` names the variable, and the
                     // body lives in the `Closure_N_call` the literal generated.
-                    None => self.closure_call_body(name.as_ref())?,
+                    None => match self.closure_call_body(name.as_ref()) {
+                        Some(func) => func,
+                        None => {
+                            self.record_comptime_call_effects(name, args);
+                            self.record_comptime_mut_borrows(args);
+                            self.mark_comptime_eval_unsupported();
+                            return None;
+                        }
+                    },
                 };
                 // A generated closure body takes its captured environment as a first
                 // parameter, and the call passes a struct for it. The environment is not a
@@ -1178,8 +1263,22 @@ impl<'a> TypeChecker<'a> {
                 for (i, arg_expr) in args.iter().skip(skip).enumerate() {
                     let param_index = i + skip;
                     let arg_val = match borrowed.iter().find(|(at, _)| *at == param_index) {
-                        Some((_, place)) => env.get(place.as_ref())?.clone(),
-                        None => self.eval_expr(arg_expr, env)?,
+                        Some((_, place)) => match env.get(place.as_ref()) {
+                            Some(value) => value.clone(),
+                            None => {
+                                self.record_comptime_place_write(place);
+                                self.mark_comptime_eval_unsupported();
+                                return None;
+                            }
+                        },
+                        None => match self.eval_expr(arg_expr, env) {
+                            Some(value) => value,
+                            None => {
+                                self.record_comptime_call_effects(name, args);
+                                self.mark_comptime_eval_unsupported();
+                                return None;
+                            }
+                        },
                     };
                     local_env.insert(func.params.get(i + skip)?.0.clone(), arg_val);
                 }
@@ -1204,11 +1303,14 @@ impl<'a> TypeChecker<'a> {
                 self.pop_comptime_eval_scope();
                 self.leave_call();
                 if !ran && !borrowed.is_empty() {
-                    self.consteval.unsupported_stmt.set(true);
+                    for (_, place) in &borrowed {
+                        self.record_comptime_place_write(place);
+                    }
+                    self.mark_comptime_eval_unsupported();
                     return None;
                 }
                 for (_, place) in borrowed {
-                    self.record_comptime_write(&place);
+                    self.record_comptime_place_write(&place);
                 }
                 result
             }
@@ -1242,6 +1344,17 @@ impl<'a> TypeChecker<'a> {
                 target_func_ty: _,
                 span: _,
             }) => self.eval_indirect_call(callee, args, env),
+            // Aggregate construction runs every field before it creates the aggregate. The
+            // evaluator does not represent structs, but it must still observe a nested call.
+            Expr::StructInit(StructInitExpr { fields, .. }) => {
+                for (_, field) in fields {
+                    let _ = self.eval_expr(field, env);
+                }
+                None
+            }
+            // Creating a borrow is not a mutation. A later use through it is either evaluated
+            // with its provenance or makes the enclosing comptime evaluation unsupported.
+            Expr::Borrow(_) => None,
             Expr::Topology(TopologyExpr { top, span: _ }) => {
                 if matches!(top, Topology::Current) {
                     Some(Value::Topology(self.active_topology.clone()))
@@ -1302,7 +1415,10 @@ impl<'a> TypeChecker<'a> {
                 };
                 self.eval_value_block(&arm.body, None, env)
             }
-            _ => None,
+            _ => {
+                self.mark_comptime_eval_unsupported();
+                None
+            }
         }
     }
 
@@ -1387,193 +1503,659 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// An unknown condition may be discarded only when neither path can write a binding that
-    /// predates this comptime evaluation. This is a conservative syntax walk: it follows the
-    /// same lexical scopes as the evaluator, but need not guess which unknown path will run.
+    /// An unknown path is safe to discard only when its effect summary contains no write to a
+    /// binding that predates this comptime block. The summary follows values, not names: a mutable
+    /// reference may be copied, placed in a struct, captured by a closure, or passed through a
+    /// helper before it is used.
     fn may_write_outer_in_blocks<'b>(
         &self,
         mut blocks: impl Iterator<Item = &'b [Statement]>,
     ) -> bool {
-        type Bindings = std::collections::HashSet<crate::symbol::Symbol>;
-
-        fn is_outer(name: &crate::symbol::Symbol, outer: &Bindings, locals: &[Bindings]) -> bool {
-            outer.contains(name) && !locals.iter().rev().any(|scope| scope.contains(name))
-        }
-
-        fn expr_may_write(
-            checker: &TypeChecker<'_>,
-            expr: &Expr,
-            outer: &Bindings,
-            locals: &mut Vec<Bindings>,
-        ) -> bool {
-            match expr {
-                Expr::FunctionCall(call) => {
-                    if let Some(func) = checker.callee_body(call.name.as_ref()) {
-                        if TypeChecker::mut_borrow_args(func, &call.args)
-                            .iter()
-                            .any(|(_, place)| is_outer(place, outer, locals))
-                        {
-                            return true;
-                        }
+        let effects = {
+            let state = self.consteval.comptime_effects.borrow();
+            let Some(effects) = state.as_ref() else {
+                return false;
+            };
+            effects.clone()
+        };
+        blocks.any(|block| {
+            let mut path = effects.clone();
+            let writes = self.comptime_block_may_write(block, &mut path);
+            if writes {
+                if let Some(name) = path.escaping_write {
+                    if let Some(active) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+                        active.escaping_write.get_or_insert(name);
                     }
-                    call.args
-                        .iter()
-                        .any(|arg| expr_may_write(checker, arg, outer, locals))
                 }
-                Expr::If(IfExpr {
-                    cond,
-                    then_block,
-                    else_block,
-                    is_comptime: _,
-                    span: _,
-                }) => {
-                    expr_may_write(checker, cond, outer, locals)
-                        || block_may_write(checker, then_block, outer, locals)
-                        || else_block
-                            .as_ref()
-                            .is_some_and(|block| block_may_write(checker, block, outer, locals))
+            }
+            writes
+        })
+    }
+
+    fn merge_comptime_value_facts(
+        into: &mut crate::hir::check_state::ComptimeValueFacts,
+        other: crate::hir::check_state::ComptimeValueFacts,
+    ) {
+        into.reference_origins.extend(other.reference_origins);
+        into.callable_targets.extend(other.callable_targets);
+        into.captured_writes.extend(other.captured_writes);
+        into.unknown_callable |= other.unknown_callable;
+    }
+
+    fn comptime_binding_facts(
+        &self,
+        name: &crate::symbol::Symbol,
+        effects: &crate::hir::check_state::ComptimeEffects,
+    ) -> Option<crate::hir::check_state::ComptimeValueFacts> {
+        effects
+            .local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn comptime_value_facts(
+        &self,
+        expr: &Expr,
+        effects: &crate::hir::check_state::ComptimeEffects,
+    ) -> crate::hir::check_state::ComptimeValueFacts {
+        use crate::hir::check_state::ComptimeValueFacts;
+
+        let mut facts = ComptimeValueFacts::default();
+        match expr {
+            Expr::Identifier(IdentifierExpr { name, .. }) => {
+                if let Some(binding) = self.comptime_binding_facts(name, effects) {
+                    return binding;
                 }
-                Expr::Match(MatchExpr {
-                    expr,
-                    arms,
-                    span: _,
-                }) => {
-                    expr_may_write(checker, expr, outer, locals)
-                        || arms
-                            .iter()
-                            .any(|arm| block_may_write(checker, &arm.body, outer, locals))
+                if effects.outer_reference_bindings.contains(name) {
+                    facts.reference_origins.insert(name.clone());
                 }
-                Expr::UnsafeBlock(UnsafeBlockExpr {
-                    stmts,
-                    ret,
-                    span: _,
-                })
-                | Expr::ComptimeBlock(ComptimeBlockExpr {
-                    stmts,
-                    ret,
-                    span: _,
-                }) => {
-                    block_may_write(checker, stmts, outer, locals)
-                        || ret
-                            .as_ref()
-                            .is_some_and(|ret| expr_may_write(checker, ret, outer, locals))
+                if effects.outer_callable_bindings.contains(name) {
+                    facts.captured_writes.insert(name.clone());
+                    facts.unknown_callable = true;
                 }
-                Expr::BinaryOp(BinaryOpExpr {
-                    lhs,
-                    rhs,
-                    op: _,
-                    span: _,
-                })
-                | Expr::RelationalOp(RelationalOpExpr {
-                    lhs,
-                    rhs,
-                    op: _,
-                    span: _,
-                })
-                | Expr::LogicalOp(LogicalOpExpr {
-                    lhs,
-                    rhs,
-                    op: _,
-                    span: _,
-                }) => {
-                    expr_may_write(checker, lhs, outer, locals)
-                        || expr_may_write(checker, rhs, outer, locals)
+                if self.callee_body(name.as_ref()).is_some() {
+                    facts.callable_targets.insert(name.clone());
+                } else if self.env.functions.contains_key(name) {
+                    facts.callable_targets.insert(name.clone());
+                    facts.unknown_callable = true;
+                } else if matches!(self.lookup(name), Some((Type::Function(..), _))) {
+                    // A function value has no captures, but its concrete target is not carried in
+                    // the type environment. Its reference arguments must therefore be treated
+                    // conservatively when it is called.
+                    facts.unknown_callable = true;
                 }
-                Expr::UnaryOp(UnaryOpExpr {
-                    expr,
-                    op: _,
-                    span: _,
-                })
-                | Expr::Borrow(BorrowExpr {
-                    expr,
-                    is_mut: _,
-                    span: _,
-                })
-                | Expr::Dereference(DereferenceExpr {
-                    expr,
-                    ty: _,
-                    span: _,
-                }) => expr_may_write(checker, expr, outer, locals),
-                Expr::Array(ArrayExpr { elements, span: _ }) => elements
-                    .iter()
-                    .any(|element| expr_may_write(checker, element, outer, locals)),
-                Expr::IndexAccess(IndexAccessExpr {
-                    base,
-                    index,
-                    span: _,
-                }) => {
-                    expr_may_write(checker, base, outer, locals)
-                        || expr_may_write(checker, index, outer, locals)
+            }
+            Expr::Borrow(BorrowExpr { expr, is_mut, .. }) => {
+                facts = self.comptime_place_facts(expr, effects);
+                if !is_mut {
+                    facts.reference_origins.clear();
                 }
-                Expr::Range(RangeExpr {
-                    start,
-                    end,
-                    span: _,
-                }) => {
-                    expr_may_write(checker, start, outer, locals)
-                        || expr_may_write(checker, end, outer, locals)
+            }
+            Expr::Dereference(DereferenceExpr { expr, .. })
+            | Expr::MemberAccess(MemberAccessExpr { base: expr, .. }) => {
+                facts = self.comptime_value_facts(expr, effects);
+            }
+            Expr::IndexAccess(IndexAccessExpr { base, index, .. }) => {
+                facts = self.comptime_value_facts(base, effects);
+                Self::merge_comptime_value_facts(
+                    &mut facts,
+                    self.comptime_value_facts(index, effects),
+                );
+            }
+            Expr::FunctionCall(FunctionCallExpr { name, args, .. }) => {
+                if let Some(binding) = self.comptime_binding_facts(name, effects) {
+                    Self::merge_comptime_value_facts(&mut facts, binding);
                 }
-                _ => false,
+                for arg in args {
+                    Self::merge_comptime_value_facts(
+                        &mut facts,
+                        self.comptime_value_facts(arg, effects),
+                    );
+                }
+            }
+            Expr::IndirectCall(IndirectCallExpr { callee, args, .. }) => {
+                facts = self.comptime_value_facts(callee, effects);
+                for arg in args {
+                    Self::merge_comptime_value_facts(
+                        &mut facts,
+                        self.comptime_value_facts(arg, effects),
+                    );
+                }
+            }
+            Expr::Array(ArrayExpr { elements, .. })
+            | Expr::VecMacro(VecMacroExpr { elements, .. }) => {
+                for element in elements {
+                    Self::merge_comptime_value_facts(
+                        &mut facts,
+                        self.comptime_value_facts(element, effects),
+                    );
+                }
+            }
+            Expr::StructInit(StructInitExpr { name, fields, .. }) => {
+                let is_closure_environment = name.starts_with("Closure_");
+                for (_, value) in fields {
+                    let value_facts = self.comptime_value_facts(value, effects);
+                    if is_closure_environment {
+                        facts
+                            .captured_writes
+                            .extend(value_facts.reference_origins.clone());
+                        facts
+                            .captured_writes
+                            .extend(self.comptime_place_facts(value, effects).reference_origins);
+                    }
+                    Self::merge_comptime_value_facts(&mut facts, value_facts);
+                }
+            }
+            Expr::EnumVariant(EnumVariantExpr { payload, .. }) => {
+                for value in payload.iter().flatten() {
+                    Self::merge_comptime_value_facts(
+                        &mut facts,
+                        self.comptime_value_facts(value, effects),
+                    );
+                }
+            }
+            Expr::Closure(closure) => {
+                // The closure body is dormant until a call, but its capture list is already the
+                // concrete transport path for an outer place. Keep that path with the value even
+                // if the generated closure body has rewritten the capture into an environment
+                // field by the time the unknown-path summary sees it.
+                for (name, _) in &closure.captures {
+                    let capture = Expr::Identifier(IdentifierExpr {
+                        name: name.clone(),
+                        span: Span::default(),
+                    });
+                    facts.captured_writes.extend(
+                        self.comptime_place_facts(&capture, effects)
+                            .reference_origins,
+                    );
+                }
+                let mut closure_effects = effects.clone();
+                closure_effects.escaping_write = None;
+                closure_effects.local_scopes.push(HashMap::new());
+                for (name, _) in &closure.params {
+                    closure_effects
+                        .local_scopes
+                        .last_mut()
+                        .expect("closure scope was pushed")
+                        .insert(name.clone(), ComptimeValueFacts::default());
+                }
+                if self.comptime_expr_may_write(&closure.body, &mut closure_effects) {
+                    if let Some(name) = closure_effects.escaping_write {
+                        facts.captured_writes.insert(name);
+                    } else {
+                        facts.unknown_callable = true;
+                    }
+                }
+            }
+            Expr::Transfer(TransferExpr { expr, .. })
+            | Expr::AsCast(AsCastExpr { expr, .. })
+            | Expr::UnaryOp(UnaryOpExpr { expr, .. }) => {
+                facts = self.comptime_value_facts(expr, effects);
+            }
+            Expr::BinaryOp(BinaryOpExpr { lhs, rhs, .. })
+            | Expr::RelationalOp(RelationalOpExpr { lhs, rhs, .. })
+            | Expr::LogicalOp(LogicalOpExpr { lhs, rhs, .. }) => {
+                facts = self.comptime_value_facts(lhs, effects);
+                Self::merge_comptime_value_facts(
+                    &mut facts,
+                    self.comptime_value_facts(rhs, effects),
+                );
+            }
+            _ => {}
+        }
+        facts
+    }
+
+    /// Facts for the storage a mutable borrow or store reaches. A plain local binding is local
+    /// even if the value it currently holds contains a reference; dereferencing that value is what
+    /// reaches its referent.
+    fn comptime_place_facts(
+        &self,
+        expr: &Expr,
+        effects: &crate::hir::check_state::ComptimeEffects,
+    ) -> crate::hir::check_state::ComptimeValueFacts {
+        use crate::hir::check_state::ComptimeValueFacts;
+
+        match expr {
+            Expr::Identifier(IdentifierExpr { name, .. }) => {
+                if let Some(mut facts) = self.comptime_binding_facts(name, effects) {
+                    facts.reference_origins.clear();
+                    return facts;
+                }
+                let mut facts = ComptimeValueFacts::default();
+                if effects.outer_bindings.contains(name) {
+                    facts.reference_origins.insert(name.clone());
+                }
+                if effects.outer_callable_bindings.contains(name) {
+                    facts.captured_writes.insert(name.clone());
+                }
+                facts
+            }
+            Expr::IndexAccess(IndexAccessExpr { base, .. })
+            | Expr::MemberAccess(MemberAccessExpr { base, .. }) => {
+                self.comptime_place_facts(base, effects)
+            }
+            Expr::Dereference(DereferenceExpr { expr, .. }) => {
+                self.comptime_value_facts(expr, effects)
+            }
+            _ => self.comptime_value_facts(expr, effects),
+        }
+    }
+
+    fn comptime_note_outer_writes(
+        &self,
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+        roots: &HashSet<crate::symbol::Symbol>,
+    ) -> bool {
+        let Some(name) = roots.iter().min_by(|a, b| a.as_ref().cmp(b.as_ref())) else {
+            return false;
+        };
+        effects.escaping_write.get_or_insert_with(|| name.clone());
+        true
+    }
+
+    fn comptime_branch_may_write(
+        &self,
+        block: &[Statement],
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        let mut branch = effects.clone();
+        let writes = self.comptime_block_may_write(block, &mut branch);
+        if writes {
+            if let Some(name) = branch.escaping_write {
+                effects.escaping_write.get_or_insert(name);
             }
         }
+        writes
+    }
 
-        fn block_may_write(
-            checker: &TypeChecker<'_>,
-            stmts: &[Statement],
-            outer: &Bindings,
-            locals: &mut Vec<Bindings>,
-        ) -> bool {
-            locals.push(Bindings::new());
-            let writes = stmts.iter().any(|stmt| match stmt {
+    fn comptime_expr_may_write(
+        &self,
+        expr: &Expr,
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        match expr {
+            Expr::FunctionCall(FunctionCallExpr { name, args, .. }) => {
+                args.iter()
+                    .any(|arg| self.comptime_expr_may_write(arg, effects))
+                    || self.comptime_call_may_write(name, args, effects)
+            }
+            Expr::IndirectCall(IndirectCallExpr {
+                callee,
+                args,
+                target_func_ty: _,
+                ..
+            }) => {
+                if self.comptime_expr_may_write(callee, effects)
+                    || args
+                        .iter()
+                        .any(|arg| self.comptime_expr_may_write(arg, effects))
+                {
+                    return true;
+                }
+                let callee_facts = self.comptime_value_facts(callee, effects);
+                if self.comptime_note_outer_writes(effects, &callee_facts.captured_writes) {
+                    return true;
+                }
+                for target in &callee_facts.callable_targets {
+                    if self.comptime_target_call_may_write(target, args, effects) {
+                        return true;
+                    }
+                }
+                if callee_facts.unknown_callable || callee_facts.callable_targets.is_empty() {
+                    let mut roots = HashSet::new();
+                    for arg in args {
+                        roots.extend(self.comptime_value_facts(arg, effects).reference_origins);
+                    }
+                    return self.comptime_note_outer_writes(effects, &roots);
+                }
+                false
+            }
+            Expr::If(IfExpr {
+                cond,
+                then_block,
+                else_block,
+                ..
+            }) => {
+                self.comptime_expr_may_write(cond, effects)
+                    || self.comptime_branch_may_write(then_block, effects)
+                    || else_block
+                        .as_ref()
+                        .is_some_and(|block| self.comptime_branch_may_write(block, effects))
+            }
+            Expr::Match(MatchExpr { expr, arms, .. }) => {
+                self.comptime_expr_may_write(expr, effects)
+                    || arms
+                        .iter()
+                        .any(|arm| self.comptime_branch_may_write(&arm.body, effects))
+            }
+            Expr::UnsafeBlock(UnsafeBlockExpr { stmts, ret, .. })
+            | Expr::ComptimeBlock(ComptimeBlockExpr { stmts, ret, .. }) => {
+                self.comptime_block_may_write(stmts, effects)
+                    || ret
+                        .as_ref()
+                        .is_some_and(|value| self.comptime_expr_may_write(value, effects))
+            }
+            Expr::BinaryOp(BinaryOpExpr { lhs, rhs, .. })
+            | Expr::RelationalOp(RelationalOpExpr { lhs, rhs, .. })
+            | Expr::LogicalOp(LogicalOpExpr { lhs, rhs, .. }) => {
+                self.comptime_expr_may_write(lhs, effects)
+                    || self.comptime_expr_may_write(rhs, effects)
+            }
+            Expr::UnaryOp(UnaryOpExpr { expr, .. })
+            | Expr::Borrow(BorrowExpr { expr, .. })
+            | Expr::Dereference(DereferenceExpr { expr, .. })
+            | Expr::Transfer(TransferExpr { expr, .. })
+            | Expr::AsCast(AsCastExpr { expr, .. }) => self.comptime_expr_may_write(expr, effects),
+            Expr::Array(ArrayExpr { elements, .. })
+            | Expr::VecMacro(VecMacroExpr { elements, .. }) => elements
+                .iter()
+                .any(|element| self.comptime_expr_may_write(element, effects)),
+            Expr::IndexAccess(IndexAccessExpr { base, index, .. }) => {
+                self.comptime_expr_may_write(base, effects)
+                    || self.comptime_expr_may_write(index, effects)
+            }
+            Expr::MemberAccess(MemberAccessExpr { base, .. }) => {
+                self.comptime_expr_may_write(base, effects)
+            }
+            Expr::MethodCall(MethodCallExpr { base, args, .. }) => {
+                self.comptime_expr_may_write(base, effects)
+                    || self.comptime_note_outer_writes(
+                        effects,
+                        &self.comptime_place_facts(base, effects).reference_origins,
+                    )
+                    || args
+                        .iter()
+                        .any(|arg| self.comptime_expr_may_write(arg, effects))
+            }
+            Expr::StructInit(StructInitExpr { fields, .. }) => fields
+                .iter()
+                .any(|(_, value)| self.comptime_expr_may_write(value, effects)),
+            Expr::EnumVariant(EnumVariantExpr { payload, .. }) => payload
+                .iter()
+                .flatten()
+                .any(|value| self.comptime_expr_may_write(value, effects)),
+            Expr::Range(RangeExpr { start, end, .. }) => {
+                self.comptime_expr_may_write(start, effects)
+                    || self.comptime_expr_may_write(end, effects)
+            }
+            Expr::Grad(GradExpr { args, .. })
+            | Expr::Print(PrintExpr { args, .. })
+            | Expr::Println(PrintlnExpr { args, .. }) => args
+                .iter()
+                .any(|arg| self.comptime_expr_may_write(arg, effects)),
+            Expr::Vjp(VjpExpr {
+                args, cotangent, ..
+            })
+            | Expr::Jvp(JvpExpr {
+                args,
+                tangent: cotangent,
+                ..
+            }) => {
+                args.iter()
+                    .any(|arg| self.comptime_expr_may_write(arg, effects))
+                    || self.comptime_expr_may_write(cotangent, effects)
+            }
+            Expr::SpawnOn(SpawnOnExpr {
+                top, stmts, ret, ..
+            }) => {
+                self.comptime_topology_may_write(top, effects)
+                    || self.comptime_block_may_write(stmts, effects)
+                    || ret
+                        .as_ref()
+                        .is_some_and(|value| self.comptime_expr_may_write(value, effects))
+            }
+            Expr::Topology(TopologyExpr { top, .. }) => {
+                self.comptime_topology_may_write(top, effects)
+            }
+            Expr::InlineMlir(InlineMlirExpr {
+                inputs, clobbers, ..
+            }) => {
+                inputs
+                    .iter()
+                    .any(|(_, value, _)| self.comptime_expr_may_write(value, effects))
+                    || clobbers.iter().any(|value| {
+                        self.comptime_expr_may_write(value, effects)
+                            || self.comptime_note_outer_writes(
+                                effects,
+                                &self.comptime_place_facts(value, effects).reference_origins,
+                            )
+                    })
+            }
+            Expr::Closure(_)
+            | Expr::MacroCall(_)
+            | Expr::Identifier(_)
+            | Expr::Number(_)
+            | Expr::StringLiteral(_)
+            | Expr::TransferPredicate(_)
+            | Expr::MemorySpace(_)
+            | Expr::SizeOf(_) => false,
+        }
+    }
+
+    fn comptime_topology_may_write(
+        &self,
+        top: &Topology,
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        match top {
+            Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
+                self.comptime_expr_may_write(index, effects)
+            }
+            Topology::Slice(base, start, end) => {
+                self.comptime_topology_may_write(base, effects)
+                    || self.comptime_expr_may_write(start, effects)
+                    || self.comptime_expr_may_write(end, effects)
+            }
+            Topology::CPU
+            | Topology::AMX
+            | Topology::ANE
+            | Topology::CpuAvx512
+            | Topology::CpuNeon
+            | Topology::Custom(_)
+            | Topology::Current => false,
+        }
+    }
+
+    fn comptime_block_may_write(
+        &self,
+        stmts: &[Statement],
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        effects.local_scopes.push(HashMap::new());
+        let mut writes = false;
+        for stmt in stmts {
+            writes = match stmt {
                 Statement::LetDecl(LetDeclStmt { name, expr, .. }) => {
-                    let writes = expr_may_write(checker, expr, outer, locals);
-                    locals
+                    let writes = self.comptime_expr_may_write(expr, effects);
+                    let facts = self.comptime_value_facts(expr, effects);
+                    effects
+                        .local_scopes
                         .last_mut()
-                        .expect("block scope was pushed")
-                        .insert(name.clone());
+                        .expect("effect scope was pushed")
+                        .insert(name.clone(), facts);
                     writes
                 }
-                Statement::Assign(AssignStmt { lhs, rhs, .. })
-                | Statement::CompoundAssign(CompoundAssignStmt { lhs, rhs, .. }) => {
-                    TypeChecker::place_root(lhs).is_some_and(|name| is_outer(name, outer, locals))
-                        || expr_may_write(checker, rhs, outer, locals)
+                Statement::Assign(AssignStmt { lhs, rhs, .. }) => {
+                    if self.comptime_expr_may_write(lhs, effects)
+                        || self.comptime_expr_may_write(rhs, effects)
+                    {
+                        true
+                    } else if let Expr::Identifier(IdentifierExpr { name, .. }) = lhs {
+                        let is_outer = effects.outer_bindings.contains(name)
+                            && !effects
+                                .local_scopes
+                                .iter()
+                                .rev()
+                                .any(|scope| scope.contains_key(name));
+                        if is_outer {
+                            let mut roots = HashSet::new();
+                            roots.insert(name.clone());
+                            self.comptime_note_outer_writes(effects, &roots)
+                        } else {
+                            let facts = self.comptime_value_facts(rhs, effects);
+                            if let Some(scope) = effects
+                                .local_scopes
+                                .iter_mut()
+                                .rev()
+                                .find(|scope| scope.contains_key(name))
+                            {
+                                scope.insert(name.clone(), facts);
+                            }
+                            false
+                        }
+                    } else {
+                        self.comptime_note_outer_writes(
+                            effects,
+                            &self.comptime_place_facts(lhs, effects).reference_origins,
+                        )
+                    }
+                }
+                Statement::CompoundAssign(CompoundAssignStmt { lhs, rhs, .. }) => {
+                    self.comptime_expr_may_write(lhs, effects)
+                        || self.comptime_expr_may_write(rhs, effects)
+                        || self.comptime_note_outer_writes(
+                            effects,
+                            &self.comptime_place_facts(lhs, effects).reference_origins,
+                        )
+                }
+                Statement::Assert(AssertStmt { expr, .. }) => {
+                    self.comptime_expr_may_write(expr, effects)
+                }
+                Statement::ExprStmt(ExprStmtStmt { expr, .. }) => {
+                    self.comptime_expr_may_write(expr, effects)
                 }
                 Statement::Return(ReturnStmt { expr, .. }) => expr
                     .as_ref()
-                    .is_some_and(|expr| expr_may_write(checker, expr, outer, locals)),
-                Statement::ExprStmt(ExprStmtStmt { expr, .. }) => {
-                    expr_may_write(checker, expr, outer, locals)
-                }
+                    .is_some_and(|expr| self.comptime_expr_may_write(expr, effects)),
                 Statement::ForLoop(ForLoopStmt {
                     iter,
                     iterable,
                     body,
                     ..
                 }) => {
-                    expr_may_write(checker, iterable, outer, locals) || {
-                        locals.push(Bindings::from([iter.as_str().into()]));
-                        let writes = block_may_write(checker, body, outer, locals);
-                        locals.pop();
+                    if self.comptime_expr_may_write(iterable, effects) {
+                        true
+                    } else {
+                        effects.local_scopes.push(HashMap::new());
+                        effects
+                            .local_scopes
+                            .last_mut()
+                            .expect("loop effect scope was pushed")
+                            .insert(iter.as_str().into(), Default::default());
+                        let writes = self.comptime_block_may_write(body, effects);
+                        effects.local_scopes.pop();
                         writes
                     }
                 }
                 Statement::Loop(LoopStmt { body, .. }) => {
-                    block_may_write(checker, body, outer, locals)
+                    self.comptime_block_may_write(body, effects)
                 }
-                _ => false,
-            });
-            locals.pop();
-            writes
-        }
-
-        let (outer, mut locals) = {
-            let state = self.consteval.comptime_effects.borrow();
-            let Some(effects) = state.as_ref() else {
-                return false;
+                Statement::Break(_)
+                | Statement::Continue(_)
+                | Statement::MacroCall(_)
+                | Statement::Error(_) => false,
             };
-            (effects.outer_bindings.clone(), effects.local_scopes.clone())
+            if writes {
+                break;
+            }
+        }
+        effects.local_scopes.pop();
+        writes
+    }
+
+    fn comptime_call_may_write(
+        &self,
+        name: &crate::symbol::Symbol,
+        args: &[Expr],
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        let callee = self.comptime_value_facts(
+            &Expr::Identifier(IdentifierExpr {
+                name: name.clone(),
+                span: Span::default(),
+            }),
+            effects,
+        );
+        if self.comptime_note_outer_writes(effects, &callee.captured_writes) {
+            return true;
+        }
+        let mut targets = callee.callable_targets;
+        if targets.is_empty() && self.callee_body(name.as_ref()).is_some() {
+            targets.insert(name.clone());
+        }
+        for target in targets {
+            if Self::is_closure_body(target.as_ref()) {
+                if let Some(env) = args.first() {
+                    let captured = self.comptime_value_facts(env, effects).captured_writes;
+                    if self.comptime_note_outer_writes(effects, &captured) {
+                        return true;
+                    }
+                }
+            }
+            if self.comptime_target_call_may_write(&target, args, effects) {
+                return true;
+            }
+        }
+        if callee.unknown_callable {
+            let mut roots = HashSet::new();
+            for arg in args {
+                roots.extend(self.comptime_value_facts(arg, effects).reference_origins);
+            }
+            return self.comptime_note_outer_writes(effects, &roots);
+        }
+        false
+    }
+
+    fn comptime_target_call_may_write(
+        &self,
+        target: &crate::symbol::Symbol,
+        args: &[Expr],
+        effects: &mut crate::hir::check_state::ComptimeEffects,
+    ) -> bool {
+        let Some(func) = self.callee_body(target.as_ref()) else {
+            let Some((_, _, params, _, _, _)) = self.env.functions.get(target) else {
+                let mut roots = HashSet::new();
+                for arg in args {
+                    roots.extend(self.comptime_value_facts(arg, effects).reference_origins);
+                }
+                return self.comptime_note_outer_writes(effects, &roots);
+            };
+            let mut roots = HashSet::new();
+            for (i, arg) in args.iter().enumerate() {
+                if params
+                    .get(i)
+                    .is_some_and(|param| self.type_can_carry_mut_reference(param))
+                {
+                    roots.extend(self.comptime_value_facts(arg, effects).reference_origins);
+                }
+            }
+            return self.comptime_note_outer_writes(effects, &roots);
         };
-        blocks.any(|block| block_may_write(self, block, &outer, &mut locals))
+        if !effects.analysis_call_stack.insert(target.clone()) {
+            let mut roots = HashSet::new();
+            for arg in args {
+                roots.extend(self.comptime_value_facts(arg, effects).reference_origins);
+            }
+            return self.comptime_note_outer_writes(effects, &roots);
+        }
+        effects.local_scopes.push(HashMap::new());
+        for (i, (param, _)) in func.params.iter().enumerate() {
+            let facts = args
+                .get(i)
+                .map(|arg| self.comptime_value_facts(arg, effects))
+                .unwrap_or_default();
+            effects
+                .local_scopes
+                .last_mut()
+                .expect("call effect scope was pushed")
+                .insert(param.clone(), facts);
+        }
+        let writes = self.comptime_block_may_write(&func.body, effects);
+        effects.local_scopes.pop();
+        effects.analysis_call_stack.remove(target);
+        writes
     }
 
     /// The caller-side variable each argument passed by mutable borrow writes through.
@@ -1587,7 +2169,10 @@ impl<'a> TypeChecker<'a> {
             let Some((_, param_ty)) = func.params.get(i) else {
                 continue;
             };
-            if !matches!(param_ty, Type::Borrow { is_mut: true, .. }) {
+            if !matches!(
+                param_ty,
+                Type::Borrow { is_mut: true, .. } | Type::Pointer(_, _, true)
+            ) {
                 continue;
             }
             let place = match arg {
@@ -1598,7 +2183,7 @@ impl<'a> TypeChecker<'a> {
                 }) => &**expr,
                 other => other,
             };
-            if let Expr::Identifier(IdentifierExpr { name, span: _ }) = place {
+            if let Some(name) = Self::place_root(place) {
                 borrowed.push((i, name.clone()));
             }
         }
@@ -1860,7 +2445,7 @@ impl<'a> TypeChecker<'a> {
     /// Start a lexical scope for a comptime evaluation, when one is active.
     fn push_comptime_eval_scope(&self) {
         if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
-            effects.local_scopes.push(std::collections::HashSet::new());
+            effects.local_scopes.push(HashMap::new());
         }
     }
 
@@ -1881,7 +2466,43 @@ impl<'a> TypeChecker<'a> {
                 .local_scopes
                 .last_mut()
                 .expect("comptime evaluation has a root scope")
-                .insert(name.clone());
+                .entry(name.clone())
+                .or_default();
+        }
+    }
+
+    /// Bind the value facts for a `let` while the evaluator walks the path that actually runs.
+    /// The static summary for a later unknown branch starts from this same scoped state.
+    fn set_comptime_eval_binding_facts(&self, name: &crate::symbol::Symbol, expr: &Expr) {
+        let Some(snapshot) = self.consteval.comptime_effects.borrow().as_ref().cloned() else {
+            return;
+        };
+        let facts = self.comptime_value_facts(expr, &snapshot);
+        if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+            effects
+                .local_scopes
+                .last_mut()
+                .expect("comptime evaluation has a root scope")
+                .insert(name.clone(), facts);
+        }
+    }
+
+    /// Rebinding a local replaces its provenance; it does not leave an old outer alias attached
+    /// to the spelling after an assignment or a shadowing declaration.
+    fn reassign_comptime_eval_binding_facts(&self, name: &crate::symbol::Symbol, expr: &Expr) {
+        let Some(snapshot) = self.consteval.comptime_effects.borrow().as_ref().cloned() else {
+            return;
+        };
+        let facts = self.comptime_value_facts(expr, &snapshot);
+        if let Some(effects) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+            if let Some(scope) = effects
+                .local_scopes
+                .iter_mut()
+                .rev()
+                .find(|scope| scope.contains_key(name))
+            {
+                scope.insert(name.clone(), facts);
+            }
         }
     }
 
@@ -1895,9 +2516,76 @@ impl<'a> TypeChecker<'a> {
             .local_scopes
             .iter()
             .rev()
-            .any(|scope| scope.contains(name));
+            .any(|scope| scope.contains_key(name));
         if effects.escaping_write.is_none() && effects.outer_bindings.contains(name) && !is_local {
             effects.escaping_write = Some(name.clone());
+        }
+    }
+
+    /// A mutable parameter writes through a place, not necessarily through the binding that
+    /// spells it. Resolve the place's value facts before deciding whether that write escapes.
+    fn record_comptime_place_write(&self, name: &crate::symbol::Symbol) {
+        let mut state = self.consteval.comptime_effects.borrow_mut();
+        let Some(effects) = state.as_mut() else {
+            return;
+        };
+        let mut roots = effects
+            .local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .map(|facts| facts.reference_origins.clone())
+            .unwrap_or_default();
+        if roots.is_empty()
+            && effects.outer_bindings.contains(name)
+            && !effects
+                .local_scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(name))
+        {
+            roots.insert(name.clone());
+        }
+        if let Some(root) = roots.iter().min_by(|a, b| a.as_ref().cmp(b.as_ref())) {
+            effects.escaping_write.get_or_insert_with(|| root.clone());
+        }
+    }
+
+    /// Record every mutable borrow passed to a call the evaluator cannot run.
+    fn record_comptime_mut_borrows(&self, args: &[Expr]) {
+        for arg in args {
+            let Expr::Borrow(BorrowExpr {
+                expr, is_mut: true, ..
+            }) = arg
+            else {
+                continue;
+            };
+            if let Some(root) = Self::place_root(expr) {
+                self.record_comptime_place_write(root);
+            }
+        }
+    }
+
+    /// Summarize a call that could not be evaluated far enough to observe its write directly.
+    /// This keeps an unsupported aggregate or callable value from hiding a write behind its
+    /// unevaluated argument.
+    fn record_comptime_call_effects(&self, name: &crate::symbol::Symbol, args: &[Expr]) {
+        let Some(mut path) = self.consteval.comptime_effects.borrow().as_ref().cloned() else {
+            return;
+        };
+        if self.comptime_call_may_write(name, args, &mut path) {
+            if let Some(root) = path.escaping_write {
+                if let Some(active) = self.consteval.comptime_effects.borrow_mut().as_mut() {
+                    active.escaping_write.get_or_insert(root);
+                }
+            }
+        }
+    }
+
+    /// Mark the current comptime evaluation as incomplete when it reaches an unsupported form.
+    fn mark_comptime_eval_unsupported(&self) {
+        if self.consteval.comptime_effects.borrow().is_some() {
+            self.consteval.unsupported_stmt.set(true);
         }
     }
 
@@ -2035,6 +2723,7 @@ impl<'a> TypeChecker<'a> {
                 expr,
                 span: _,
             }) => {
+                self.set_comptime_eval_binding_facts(name, expr);
                 // A binding the evaluator cannot compute has to become unknown. Leaving an
                 // older binding of the same name in place would answer later reads with it.
                 match self.eval_expr(expr, env) {
@@ -2049,6 +2738,7 @@ impl<'a> TypeChecker<'a> {
                 rhs,
                 span: _,
             }) => {
+                self.reassign_comptime_eval_binding_facts(name, rhs);
                 match self.eval_expr(rhs, env) {
                     Some(val) => env.insert(name.clone(), val),
                     None => env.remove(name.as_ref()),
@@ -2094,7 +2784,7 @@ impl<'a> TypeChecker<'a> {
                     if !stored {
                         env.remove(root.as_ref());
                     }
-                    self.record_comptime_write(root);
+                    self.record_comptime_place_write(root);
                 }
                 EvalFlow::Normal
             }
@@ -2116,9 +2806,12 @@ impl<'a> TypeChecker<'a> {
                 invariants: _,
                 span: _,
             }) => self.eval_loop(body, env),
-            // Already checked and discharged by `check_assert_stmt`, and it produces no
-            // value, so there is nothing left for the evaluator to do with it.
-            Statement::Assert(_) => EvalFlow::Normal,
+            // The assertion itself has no value, but its condition can call through a mutable
+            // borrow and must be observed before this comptime block is folded.
+            Statement::Assert(AssertStmt { expr, .. }) => {
+                let _ = self.eval_expr(expr, env);
+                EvalFlow::Normal
+            }
             Statement::Break(_) => EvalFlow::Break,
             Statement::Continue(_) => EvalFlow::Continue,
             // A call written as a statement. It is run only when it writes through a
@@ -2135,13 +2828,14 @@ impl<'a> TypeChecker<'a> {
                     None => Vec::new(),
                 };
                 if borrowed.is_empty() {
+                    self.record_comptime_call_effects(&call.name, &call.args);
                     self.consteval.unsupported_stmt.set(true);
                     return EvalFlow::Normal;
                 }
                 match self.eval_call_effects(call, env) {
                     Some(written) => {
                         for (place, value) in written {
-                            self.record_comptime_write(&place);
+                            self.record_comptime_place_write(&place);
                             env.insert(place, value);
                         }
                     }
@@ -2149,6 +2843,7 @@ impl<'a> TypeChecker<'a> {
                         for (_, place) in borrowed {
                             env.remove(place.as_ref());
                         }
+                        self.record_comptime_call_effects(&call.name, &call.args);
                         self.consteval.unsupported_stmt.set(true);
                     }
                 }
