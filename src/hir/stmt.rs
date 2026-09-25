@@ -10,11 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
 use crate::hir;
+use crate::hir::check_state::ComptimeEvalContext;
+use crate::hir::comptime_interpreter::{ComptimeInterpreter, ComptimeObservation};
 use crate::syntax;
 
 /// What running a statement did to the block it sits in.
@@ -35,6 +37,132 @@ pub(crate) enum EvalFlow {
 }
 
 impl<'a> TypeChecker<'a> {
+    /// Run the new interpreter beside the legacy comptime evaluator during migration.
+    ///
+    /// Its observation is intentionally not a fold decision yet: owner families enter the new
+    /// interpreter one at a time, and the control checker keeps the legacy result authoritative
+    /// until the parity gate in the migration plan is met.
+    pub(crate) fn observe_comptime_block(
+        &self,
+        stmts: &[Statement],
+        tail: Option<&Expr>,
+        before: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> ComptimeObservation {
+        let mut outer_bindings = HashSet::new();
+        let mut outer_reference_bindings = HashSet::new();
+        let mut outer_callable_bindings = HashSet::new();
+        for scope in &self.scopes {
+            for (name, (ty, _)) in scope {
+                outer_bindings.insert(name.clone());
+                if self.type_can_carry_mut_reference(ty) {
+                    outer_reference_bindings.insert(name.clone());
+                }
+                if matches!(ty, Type::Closure(..)) {
+                    outer_callable_bindings.insert(name.clone());
+                }
+            }
+        }
+        let mut function_bodies = self.env.comptime_bodies.clone();
+        function_bodies.extend(
+            self.env
+                .syntax_functions
+                .iter()
+                .filter(|(_, function)| !function.body.is_empty())
+                .map(|(name, function)| (name.clone(), (**function).clone())),
+        );
+        for (function, _) in &self.mono.functions {
+            function_bodies
+                .entry(function.name.clone())
+                .or_insert_with(|| function.clone());
+        }
+
+        let mut interpreter = ComptimeInterpreter::new(
+            before.clone(),
+            function_bodies,
+            &self.transfer_cost_graph,
+            ComptimeEvalContext::new(
+                outer_bindings,
+                outer_reference_bindings,
+                outer_callable_bindings,
+            ),
+        );
+        interpreter.observe_block(stmts, tail)
+    }
+
+    /// Whether a type can transport a mutable reference to an outer place through a value.
+    ///
+    /// The shared comptime interpreter uses this only to seed facts at the block boundary; once a
+    /// value is inside the interpreter, provenance moves with that value rather than with its
+    /// spelling or declared type.
+    pub(crate) fn type_can_carry_mut_reference(&self, ty: &Type) -> bool {
+        fn visit(
+            checker: &TypeChecker<'_>,
+            ty: &Type,
+            seen: &mut HashSet<crate::symbol::Symbol>,
+        ) -> bool {
+            match ty {
+                Type::Borrow { inner, is_mut, .. } => *is_mut || visit(checker, inner, seen),
+                Type::Pointer(inner, _, is_mut) => *is_mut || visit(checker, inner, seen),
+                Type::Ref(inner, _) | Type::Verified(inner) | Type::Pinned(inner, _) => {
+                    visit(checker, inner, seen)
+                }
+                Type::GenericInstance(base, args) => {
+                    visit(checker, base, seen) || args.iter().any(|arg| visit(checker, arg, seen))
+                }
+                Type::Struct(name, _) | Type::Enum(name, _) => {
+                    if !seen.insert(name.clone()) {
+                        return false;
+                    }
+                    let result = checker
+                        .env
+                        .structs
+                        .get(name)
+                        .map(|decl| {
+                            decl.fields
+                                .iter()
+                                .any(|(_, field)| visit(checker, field, seen))
+                        })
+                        .or_else(|| {
+                            checker
+                                .mono
+                                .generated_structs
+                                .iter()
+                                .find(|decl| decl.name == *name)
+                                .map(|decl| {
+                                    decl.fields
+                                        .iter()
+                                        .any(|(_, field)| visit(checker, field, seen))
+                                })
+                        })
+                        .or_else(|| {
+                            checker.env.enums.get(name).map(|decl| {
+                                decl.variants.iter().any(|(_, payload)| {
+                                    payload.as_ref().is_some_and(|fields| {
+                                        fields.iter().any(|field| visit(checker, field, seen))
+                                    })
+                                })
+                            })
+                        })
+                        .unwrap_or(false);
+                    seen.remove(name);
+                    result
+                }
+                Type::Unknown => true,
+                Type::Tensor(..)
+                | Type::Matrix
+                | Type::Scalar(..)
+                | Type::Generic(..)
+                | Type::Module(..)
+                | Type::Simd(..)
+                | Type::Function(..)
+                | Type::Closure(..)
+                | Type::Const(..) => false,
+            }
+        }
+
+        visit(self, ty, &mut HashSet::new())
+    }
+
     /// Performs semantic analysis on a block of statements.
     ///
     /// A **block** is a sequence of statements enclosed in `{ ... }` that defines a new lexical scope.

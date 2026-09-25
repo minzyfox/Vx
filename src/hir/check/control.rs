@@ -52,8 +52,24 @@ impl<'a> TypeChecker<'a> {
         ret: Option<&Expr>,
         before: &HashMap<crate::symbol::Symbol, Value>,
     ) -> ComptimeFold {
+        // The new interpreter shadows the legacy path while expression-owner semantics are
+        // migrated. Its first live comparator is deliberately narrow: a possible escaping write
+        // is a safety property, so a new-path proof of one must prevent the legacy evaluator from
+        // folding the block away even before value-parity cutover.
+        let shadow = self.observe_comptime_block(stmts, ret, before);
         // Anything it writes that outlives it would have to survive, and the block does not.
         if let Some(name) = Self::escaping_write(stmts) {
+            self.report_comptime_block_failure(
+                &format!(
+                    "it writes to '{}', which is declared outside it -- the block disappears, \
+                     so the write would have to disappear with it",
+                    name
+                ),
+                &ret.map(|r| r.span()).unwrap_or_default(),
+            );
+            return ComptimeFold::Refused;
+        }
+        if let Some(name) = shadow.escaping_write {
             self.report_comptime_block_failure(
                 &format!(
                     "it writes to '{}', which is declared outside it -- the block disappears, \
