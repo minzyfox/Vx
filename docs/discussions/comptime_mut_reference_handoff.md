@@ -302,16 +302,20 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Preserve evaluated aggregate/member/index facts rather than recovering facts from syntax
     alone.
   - [x] Write the early-unknown index regression fixture.
-  - [ ] Add the remaining direct/unknown/local-only place fixtures, including borrowed-place
-    coverage.
+  - [x] Cover borrowed places with the direct dereference failure
+    `comptime_value_call_deref_outer_write`, the unknown-path reborrow failure
+    `comptime_unknown_reborrow_outer_write`, and the local-only reassignment/shadowing pass case
+    `comptime_scoped_reference_provenance`.
   - [ ] Run those fixtures and confirm normalized old/new parity.
 
 - [ ] **Pure operators and containers (non-topology) — complete only after acceptance**
 
   - [x] Implement structural traversal for unary/binary/relational/logical operators, casts,
     ranges, arrays, vectors, struct literals, and enum payloads.
-  - [x] Implement concrete scalar arithmetic/relations and concrete arrays.
-  - [x] Write the early-unknown binary-left/effectful-right regression fixture.
+  - [x] Implement concrete scalar arithmetic/relations, concrete arrays, and logical
+    short-circuiting.
+  - [x] Write the early-unknown binary-left/effectful-right failure fixture and the
+    short-circuit-unreachable-write pass fixture.
   - [ ] Implement or deliberately reject with focused fixtures aggregate values, casts, ranges,
     vectors, and enums.
   - [ ] Add direct/unknown/local-only fixtures and confirm normalized old/new parity.
@@ -322,18 +326,30 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     both topologies are known.
   - [ ] Model dynamic topology-index values precisely enough for predicate results, or retain a
     tested fail-closed rule.
-  - [ ] Add direct/unknown/local-only predicate fixtures, including the early-unknown child case.
+  - [x] Add the early-unknown predicate fixture
+    `comptime_unknown_predicate_later_outer_write`: an unknown first topology index cannot hide a
+    write in the later topology operand.
+  - [x] Add the direct predicate failure fixture
+    `comptime_predicate_later_outer_write`.
+  - [x] Add the local-only predicate pass fixture `comptime_predicate_local_write`.
   - [ ] Run fixtures and confirm normalized old/new parity.
 
 - [ ] **Topology and placement owners — complete only after acceptance**
 
   - [x] Traverse `Topology` (NPU/GPU/AccCore and nested `Slice` indices), `Transfer`, `SpawnOn`,
     and `InlineMlir`; record MLIR clobber-place writes.
-  - [x] Write the direct topology-index regression fixture and retain the imported unknown-path
-    topology/spawn fixtures.
-  - [ ] Define concrete semantics, or fixture-backed fail-closed behavior, for `Transfer`,
-    `SpawnOn`, and MLIR values.
-  - [ ] Add remaining local-only/early-unknown placement fixtures and confirm parity.
+  - [x] Write the direct topology-index and direct `SpawnOn` regressions
+    (`comptime_topology_index_outer_write` and `comptime_spawn_topology_outer_write`), and retain
+    the imported unknown-path topology/spawn fixtures.
+  - [x] Fixture-back `SpawnOn` as fail-closed pending concrete value semantics:
+    `comptime_spawn_local_write_unsupported` rejects even a local-only spawn, while the direct
+    outer-write fixture still names the escaping binding.
+  - [ ] Define concrete semantics, or fixture-backed fail-closed behavior, for `Transfer` and
+    MLIR values.
+  - [x] Add the local-only topology-index pass fixture
+    `comptime_topology_index_local_write`; retain the imported early-unknown topology/spawn
+    failures.
+  - [ ] Confirm normalized old/new parity for the placement fixtures.
 
 - [ ] **Blocks and control flow — complete only after acceptance**
 
@@ -341,6 +357,10 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Implement known/unknown `if`, known-scalar/abstract `match`, and abstract `for`/`loop`
     state handling; preserve `return`, `break`, and `continue` flow.
   - [x] Retain imported unknown-branch, match, loop, return, and shadowing fixtures.
+  - [x] Write the known-branch nested-shadow pass fixture
+    `comptime_nested_scope_shadow_restores_value` for concrete-environment restoration.
+  - [x] Write the known-control pass fixture `comptime_known_control_skips_outer_write`, covering
+    a false `if` arm and a nonmatching scalar `match` arm with unreachable outer writes.
   - [ ] Implement or fixture-back fail-closed bounded-loop recurrence and enum-pattern precision.
   - [ ] Add any missing direct/local-only control-flow fixtures and confirm parity.
 
@@ -354,6 +374,8 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     environments; detect writes through captured references and direct captured-scalar assignment.
   - [x] Write the direct captured-closure-assignment regression and retain imported function-value,
     aggregate-callback, and closure fixtures.
+  - [x] Write the local-only closure-capture pass fixture
+    `comptime_closure_local_capture_write`.
   - [ ] Model unlowered `Expr::Closure`, remaining closure/capture shapes, and opaque-call behavior
     with focused local-only cases.
   - [ ] Run the call/closure fixtures and confirm normalized old/new parity.
@@ -427,8 +449,10 @@ to that gate, not evidence that it has passed.
   interpreter semantics.
 - [x] Add early-unknown-child cases with a later outer-reference write for indexing, calls, and
   operators.
-- [ ] Add the remaining early-unknown-child cases for borrows/places and topology-bearing
-  predicates.
+- [x] Add the early-unknown borrowed-place case
+  `comptime_unknown_place_later_outer_write`.
+- [x] Add the early-unknown-child case for topology-bearing predicates:
+  `comptime_unknown_predicate_later_outer_write`.
 - [ ] Cover the reference/container shapes already listed in this note, with distinct outer
   binding names in failures and local-only pass counterparts where folding is supported.
 - [ ] Cover known/unknown branches, match arms, loops, returns, recursion limits, opaque calls,
