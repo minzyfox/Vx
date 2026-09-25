@@ -989,18 +989,47 @@ impl CompilerDriver {
         // instantiations land in `monomorphized_functions`, and the method/generic calls in the
         // emitted bodies are rewritten to those instance names. Generic functions were already
         // dropped from `other_asts`; generic *methods* are instantiated on demand by these calls.
-        let errors_before_imports = checker.errors.len();
+        // Keep each imported function's errors apart, and report only those of the functions
+        // the program uses. See `imported_errors`.
+        let mut errors_by_function: std::collections::BTreeMap<
+            String,
+            (String, Vec<crate::diagnostic::Diagnostic>),
+        > = std::collections::BTreeMap::new();
         for p in other_asts.values_mut() {
             for f in &mut p.functions {
                 if f.generics.is_empty() {
+                    let before = checker.errors.len();
                     checker.check_function(f);
+                    let found: Vec<_> = checker.errors.inner.drain(before..).collect();
+                    if found.iter().any(|d| d.level == DiagnosticLevel::Error) {
+                        errors_by_function
+                            .insert(f.name.to_string(), (p.module_path.to_string(), found));
+                    }
                 }
             }
         }
-        // Diagnostics from imported *library internals* are not the consumer's concern — this pass
-        // exists to collect monomorphizations, not to re-validate dependencies (which are checked
-        // when compiled on their own). Drop anything it added; keep the instantiations.
-        checker.errors.inner.truncate(errors_before_imports);
+        let with_errors: std::collections::HashSet<String> =
+            errors_by_function.keys().cloned().collect();
+        let used = crate::hir::check::imported_errors::used_functions_with_errors(
+            &checker.traffic.capacity_summaries,
+            &with_errors,
+        );
+        for (name, (module, found)) in errors_by_function {
+            if used.contains(&name) {
+                checker
+                    .errors
+                    .inner
+                    .extend(crate::hir::check::imported_errors::errors_to_report(
+                        found, &module, &name,
+                    ));
+            }
+        }
+        // Do not compile the unused ones: the code generator cannot compile a type error.
+        for p in other_asts.values_mut() {
+            p.functions.retain(|f| {
+                !with_errors.contains(f.name.as_ref()) || used.contains(f.name.as_ref())
+            });
+        }
 
         // The cross-call half of the capacity check: fold every function's summary over the
         // monomorphized call graph. Reads only the summaries the per-function checks exported,
