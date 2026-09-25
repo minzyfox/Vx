@@ -344,8 +344,14 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Fixture-back `SpawnOn` as fail-closed pending concrete value semantics:
     `comptime_spawn_local_write_unsupported` rejects even a local-only spawn, while the direct
     outer-write fixture still names the escaping binding.
-  - [ ] Define concrete semantics, or fixture-backed fail-closed behavior, for `Transfer` and
-    MLIR values.
+  - [x] Add the direct `Transfer` outer-write regression
+    `comptime_transfer_outer_write`; its operand is observed before the transfer is refused.
+  - [x] Fixture-back `Transfer` as fail-closed pending concrete value semantics:
+    `comptime_transfer_local_write_unsupported` rejects even a local-only transfer.
+  - [x] Add the direct inline-MLIR clobber regression
+    `comptime_inline_mlir_outer_clobber`; its outer clobber is recorded before MLIR is refused.
+  - [x] Fixture-back inline MLIR as fail-closed pending concrete value semantics:
+    `comptime_inline_mlir_local_clobber_unsupported` rejects even a local-only clobber.
   - [x] Add the local-only topology-index pass fixture
     `comptime_topology_index_local_write`; retain the imported early-unknown topology/spawn
     failures.
@@ -361,7 +367,11 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     `comptime_nested_scope_shadow_restores_value` for concrete-environment restoration.
   - [x] Write the known-control pass fixture `comptime_known_control_skips_outer_write`, covering
     a false `if` arm and a nonmatching scalar `match` arm with unreachable outer writes.
-  - [ ] Implement or fixture-back fail-closed bounded-loop recurrence and enum-pattern precision.
+  - [x] Add the direct enum-pattern regression `comptime_enum_match_outer_write`: enum matching
+    remains fail-closed for values, but every viable arm is observed for escaping writes.
+  - [x] Add the enum local-only fail-closed fixture
+    `comptime_enum_match_local_write_unsupported`.
+  - [ ] Implement or fixture-back fail-closed bounded-loop recurrence.
   - [ ] Add any missing direct/local-only control-flow fixtures and confirm parity.
 
 - [ ] **Calls and closures — complete only after acceptance**
