@@ -1276,7 +1276,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Expr::Range(range) => {
                 let start = self.expr(&range.start);
                 let end = self.expr(&range.end);
-                self.unknown_after([start, end])
+                // A range used as a value has no spelling in the legacy `Value` model. The
+                // `for` owner handles its integer bounds directly above; every other use must
+                // evaluate both bounds for effects and then refuse rather than silently vanish.
+                self.refusal_after([start, end])
             }
             Expr::Match(match_expr) => self.match_expr(match_expr),
             Expr::Grad(grad) => {
@@ -1324,7 +1327,13 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Expr::Closure(_) => ComptimeEvalOutcome::unsupported(),
             Expr::AsCast(cast) => {
                 let value = self.expr(&cast.expr);
-                self.unknown_after([value])
+                // The legacy value model has no target type, so using its `Int`/`Number`
+                // representation here would silently get narrowing, signedness, pointer, and
+                // tensor casts wrong. Evaluate the operand for effects, then refuse the whole
+                // block until a typed comptime value can model the conversion. This is live
+                // rather than observational because legacy evaluation otherwise drops an
+                // unsupported cast statement and folds a later tail.
+                self.refusal_after([value])
             }
             Expr::Print(print) => {
                 let args = print

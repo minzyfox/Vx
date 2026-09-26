@@ -160,8 +160,9 @@ Anything not proved safe is left unfolded/refused as required by current `compti
 
 > **Implementation status:** §1 is the settled target contract. The current interpreter implements
 > the owner slices recorded below, including bounded finite-range and definite-break loop
-> execution and aggregate-field precision. Full callable/closure semantics, aggregate values as
-> fold results, and full old/new value parity remain pending.
+> execution and aggregate-field precision. Casts and standalone range values are fixture-backed
+> live refusals pending typed comptime values. Full callable/closure semantics, aggregate values
+> as fold results, and full old/new value parity remain pending.
 
 #### 2. Shared state and result model — complete
 
@@ -240,10 +241,19 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Preserve precise array-element and ordinary-struct-field provenance. The local-only
     `comptime_struct_field_precision` fixture proves that writing a local field does not become
     an outer write merely because a sibling holds `&mut outer`.
+  - [x] Promote `AsCast` to a live refusal pending typed comptime values. The direct
+    `comptime_cast_outer_write` and unknown-path `comptime_unknown_cast_outer_write` fixtures
+    ensure an operand's outer write is diagnosed before the refusal;
+    `comptime_cast_local_unsupported` proves legacy cannot silently drop a local cast statement
+    and fold a later tail.
+  - [x] Promote standalone `Range` values to a live refusal while retaining concrete integer-range
+    execution for `for` loops. `comptime_range_outer_write` covers the later bound,
+    `comptime_unknown_range_outer_write` covers the unknown-path first bound, and
+    `comptime_range_local_unsupported` proves a local range statement cannot vanish before a
+    foldable tail.
   - [ ] Implement or deliberately reject with focused fixtures aggregate *values* (as fold
-    results), casts, ranges, vectors, and enums. Structs still have no concrete legacy `Value`
-    representation, so this completed provenance work is intentionally not a promise to fold a
-    struct itself.
+    results), vectors, and enums. Structs still have no concrete legacy `Value` representation,
+    so this completed provenance work is intentionally not a promise to fold a struct itself.
   - [ ] Add direct/unknown/local-only fixtures and confirm normalized old/new parity for the
     remaining container forms.
 
@@ -402,9 +412,9 @@ cargo test
   unreachable. Record the legacy evaluator's different behavior only as a transition allowance;
   remove that allowance when the new interpreter owns the fold verdict.
 - [ ] **Owner acceptance.** Resume §3.2 with the remaining container semantics (aggregate fold
-  values, casts, ranges, and vectors), then calls/closures, control flow, and peripheral forms.
-  Check an owner only after its direct, unknown-path, and local-only fixtures have no
-  unallowlisted comparator result.
+  values and vectors), then calls/closures, control flow, and peripheral forms. Check an
+  owner only after its direct, unknown-path, and local-only fixtures have no unallowlisted
+  comparator result.
 - [ ] **Cut over.** Once every supported owner has parity and every unsupported owner has an
   explicit permanent refusal policy, use the shared interpreter's value/support/flow verdict for
   folding. Then delete the legacy fold evaluator and its name-based escaping-write scan in the
@@ -421,8 +431,8 @@ statement value is not mistaken for a block result. The only current allowance i
 
 The next work is owner acceptance for the remaining container semantics, followed by
 calls/closures and control flow. Do not enable a blanket “shadow Unsupported refuses”: explicit
-live refusal remains limited to the four local-only `SpawnOn`, `Transfer`, inline-MLIR, and
-enum-match owners.
+live refusal remains limited to the fixture-backed `SpawnOn`, `Transfer`, inline-MLIR, enum-match,
+`AsCast`, and standalone `Range` owners.
 
 ##### 3.4 Cut over only after parity
 
