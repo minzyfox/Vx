@@ -14,6 +14,8 @@
 //===----------------------------------------------------------------------===//
 
 use super::super::*;
+use crate::hir::check_state::{ComptimeEvalFlow, ComptimeEvalSupport};
+use crate::hir::comptime_interpreter::{ComptimeNormalizedObservation, ComptimeParity};
 use crate::hir::stmt::EvalFlow;
 use std::collections::HashMap;
 
@@ -26,6 +28,14 @@ enum ComptimeFold {
     /// It could not be run. Reported already, unless this is a closure body -- which is not
     /// asked to fold where it is written.
     Refused,
+}
+
+/// The legacy evaluator's result, normalized to the same value/support/flow dimensions as the
+/// shadow interpreter. `has_tail` distinguishes a no-value comptime statement from an
+/// expression whose value could not be computed; folding still follows the legacy verdict.
+struct LegacyComptimeObservation {
+    normalized: ComptimeNormalizedObservation,
+    has_tail: bool,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -80,14 +90,30 @@ impl<'a> TypeChecker<'a> {
             );
             return ComptimeFold::Refused;
         }
-        let mut env = before.clone();
-        let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
-        let flow = self.eval_block(stmts, &mut env);
-        let ran = !self.consteval.unsupported_stmt.get();
-        self.consteval.unsupported_stmt.set(outer_unsupported);
+        if shadow.call_depth_exceeded {
+            self.report_comptime_depth_exceeded(&ret.map(|r| r.span()).unwrap_or_default());
+            return ComptimeFold::Refused;
+        }
+        // These are the first fixture-backed transition policies promoted beyond observation.
+        // They name owners with no comptime semantics at all (enum values, transfer, placement,
+        // and inline MLIR), so even a local-only effect may not disappear with the block. Other
+        // unsupported shadow results remain on the legacy path until value/support/flow parity
+        // has an explicit allow-list.
+        if shadow.outcome.requires_refusal {
+            self.report_comptime_block_failure(
+                "it holds a statement the evaluator cannot run",
+                &ret.map(|r| r.span()).unwrap_or_default(),
+            );
+            return ComptimeFold::Refused;
+        }
+        let legacy = self.observe_legacy_comptime_block(stmts, ret, before);
+        let parity = shadow.compare_legacy(&legacy.normalized);
+        if parity.is_unallowlisted() {
+            self.report_comptime_parity_disagreement(parity);
+        }
 
         let span = ret.map(|r| r.span()).unwrap_or_default();
-        if !ran {
+        if !legacy.normalized.support.is_supported() {
             self.report_comptime_block_failure(
                 "it holds a statement the evaluator cannot run",
                 &span,
@@ -97,14 +123,82 @@ impl<'a> TypeChecker<'a> {
         // A `return` inside the block, where the block is a closure or function body, is
         // that body's value -- `|| comptime { ..; return x; }` is how the closure fixtures
         // are written. Answer with it, the same as a trailing expression.
-        if let EvalFlow::Return(returned) = flow {
-            return self.fold_value(returned, &span);
+        if legacy.normalized.flow == ComptimeEvalFlow::Return {
+            return self.fold_value(legacy.normalized.concrete, &span);
         }
-        let Some(ret) = ret else {
+        if !legacy.has_tail {
             return ComptimeFold::NoValue;
+        }
+        self.fold_value(legacy.normalized.concrete, &span)
+    }
+
+    fn observe_legacy_comptime_block(
+        &self,
+        stmts: &[Statement],
+        ret: Option<&Expr>,
+        before: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> LegacyComptimeObservation {
+        let mut env = before.clone();
+        let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
+        let flow = self.eval_block(stmts, &mut env);
+        let supported = !self.consteval.unsupported_stmt.get();
+        self.consteval.unsupported_stmt.set(outer_unsupported);
+
+        let (flow, concrete) = if !supported {
+            (ComptimeEvalFlow::Normal, None)
+        } else {
+            match flow {
+                EvalFlow::Normal => (
+                    ComptimeEvalFlow::Normal,
+                    ret.and_then(|tail| self.eval_expr(tail, &env)),
+                ),
+                EvalFlow::Return(value) => (ComptimeEvalFlow::Return, value),
+                EvalFlow::Break => (ComptimeEvalFlow::Break, None),
+                EvalFlow::Continue => (ComptimeEvalFlow::Continue, None),
+            }
         };
-        let value = self.eval_expr(ret, &env);
-        self.fold_value(value, &span)
+        LegacyComptimeObservation {
+            normalized: ComptimeNormalizedObservation {
+                concrete,
+                support: if supported {
+                    ComptimeEvalSupport::Supported
+                } else {
+                    ComptimeEvalSupport::Unsupported
+                },
+                flow,
+            },
+            has_tail: ret.is_some(),
+        }
+    }
+
+    fn report_comptime_parity_disagreement(&mut self, parity: ComptimeParity) {
+        if self.speculating || self.consteval.closure_body_depth > 0 {
+            return;
+        }
+        self.errors.push_warning(format!(
+            "comptime interpreter transition disagreement: {}",
+            parity.description()
+        ));
+    }
+
+    fn report_comptime_depth_exceeded(&mut self, span: &Span) {
+        if self.speculating
+            || self.consteval.closure_body_depth > 0
+            || self
+                .errors
+                .has_error(crate::diagnostic::DiagnosticCode::E8004)
+        {
+            return;
+        }
+        self.errors.error_with_code(
+            crate::diagnostic::DiagnosticCode::E8004,
+            format!(
+                "compile-time evaluation went more than {} calls deep and was stopped. A \
+                 recursive function whose base case is never reached is the usual cause.",
+                crate::hir::check_state::MAX_CALL_DEPTH
+            ),
+            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+        );
     }
 
     fn fold_value(&mut self, value: Option<Value>, span: &Span) -> ComptimeFold {
