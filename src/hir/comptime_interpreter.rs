@@ -9,18 +9,106 @@ use std::collections::HashMap;
 
 use crate::arch::TransferCostGraph;
 use crate::hir::check_state::{
-    ComptimeEvalContext, ComptimeEvalFlow, ComptimeEvalOutcome, ComptimeEvalSupport,
-    ComptimeEvalValue, ComptimeValueFacts,
+    ComptimeAggregateValue, ComptimeEvalContext, ComptimeEvalFlow, ComptimeEvalOutcome,
+    ComptimeEvalSupport, ComptimeEvalUnsupportedReason, ComptimeEvalValue, ComptimeValueFacts,
 };
 use crate::hir::env::Value;
 use crate::symbol::Symbol;
 use crate::syntax::*;
+
+/// Recursive comptime calls clone enough lexical state that the compiler worker's ordinary stack
+/// can run out before the language-level 256-call limit. The outermost call moves the whole
+/// recursive evaluation onto one larger stack; recursive frames stay on that same thread.
+const COMPTIME_RECURSION_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// The comparison-friendly result of one shadow interpretation.
 #[derive(Clone, PartialEq)]
 pub(crate) struct ComptimeObservation {
     pub outcome: ComptimeEvalOutcome,
     pub escaping_write: Option<Symbol>,
+    pub call_depth_exceeded: bool,
+    has_tail: bool,
+}
+
+/// The dimensions that must agree before the unified interpreter can replace the legacy fold
+/// verdict. Escaping writes are deliberately outside this type: they are already a live safety
+/// comparator with their own diagnostic.
+#[derive(Clone, PartialEq)]
+pub(crate) struct ComptimeNormalizedObservation {
+    pub concrete: Option<Value>,
+    pub support: ComptimeEvalSupport,
+    pub flow: ComptimeEvalFlow,
+}
+
+/// A classified old/new result. The only temporary allowance is recursion, pinned by the
+/// quicksort and countdown fixtures; all other differences are transition bugs to investigate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComptimeParity {
+    Agree,
+    AllowedLegacyNestedReturnFlow,
+    ValueMismatch,
+    SupportMismatch,
+    FlowMismatch,
+}
+
+impl ComptimeParity {
+    pub(crate) fn is_unallowlisted(self) -> bool {
+        !matches!(self, Self::Agree | Self::AllowedLegacyNestedReturnFlow)
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Agree => "agreement",
+            Self::AllowedLegacyNestedReturnFlow => {
+                "allow-listed nested-return control-flow difference"
+            }
+            Self::ValueMismatch => "concrete value mismatch",
+            Self::SupportMismatch => "support-status mismatch",
+            Self::FlowMismatch => "control-flow mismatch",
+        }
+    }
+}
+
+impl ComptimeObservation {
+    pub(crate) fn normalized(&self) -> ComptimeNormalizedObservation {
+        ComptimeNormalizedObservation {
+            // A statement-only comptime block has no replacement value. Its final statement may
+            // happen to evaluate to a constant, but that is not a block result and must not be
+            // compared with the legacy evaluator's deliberate no-value observation.
+            concrete: if !self.has_tail && self.outcome.flow == ComptimeEvalFlow::Normal {
+                None
+            } else {
+                self.outcome.value.concrete.clone()
+            },
+            support: self.outcome.support,
+            flow: self.outcome.flow,
+        }
+    }
+
+    pub(crate) fn compare_legacy(&self, legacy: &ComptimeNormalizedObservation) -> ComptimeParity {
+        let shadow = self.normalized();
+        if shadow == *legacy {
+            return ComptimeParity::Agree;
+        }
+        // The legacy evaluator represents a `return` nested inside an expression-valued `if` as
+        // that expression's value and then carries on. The unified interpreter preserves the
+        // real block flow, so the following write is unreachable. The focused
+        // `comptime_return_unreachable_outer_write` fixture pins this transition allowance.
+        if shadow.support == ComptimeEvalSupport::Supported
+            && legacy.support == ComptimeEvalSupport::Supported
+            && shadow.flow == ComptimeEvalFlow::Return
+            && legacy.flow == ComptimeEvalFlow::Normal
+        {
+            return ComptimeParity::AllowedLegacyNestedReturnFlow;
+        }
+        if shadow.flow != legacy.flow {
+            ComptimeParity::FlowMismatch
+        } else if shadow.concrete != legacy.concrete {
+            ComptimeParity::ValueMismatch
+        } else {
+            ComptimeParity::SupportMismatch
+        }
+    }
 }
 
 /// A comptime-only interpreter kept beside the legacy evaluator during migration.
@@ -59,6 +147,8 @@ impl<'graph> ComptimeInterpreter<'graph> {
         ComptimeObservation {
             outcome,
             escaping_write: self.context.escaping_write().cloned(),
+            call_depth_exceeded: self.context.call_depth_exceeded(),
+            has_tail: tail.is_some(),
         }
     }
 
@@ -66,12 +156,41 @@ impl<'graph> ComptimeInterpreter<'graph> {
         &mut self,
         children: impl IntoIterator<Item = ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
+        Self::unsupported_outcome(children)
+    }
+
+    fn unsupported_outcome(
+        children: impl IntoIterator<Item = ComptimeEvalOutcome>,
+    ) -> ComptimeEvalOutcome {
         let mut outcome = ComptimeEvalOutcome::unsupported();
         for child in children {
             outcome.value.facts.merge_from(&child.value.facts);
             outcome.support.merge_from(child.support);
+            outcome
+                .unsupported_reason
+                .merge_from(child.unsupported_reason);
+            outcome.requires_refusal |= child.requires_refusal;
         }
         outcome.support = ComptimeEvalSupport::Unsupported;
+        outcome
+    }
+
+    /// Preserve children, then mark a syntax owner whose lack of comptime semantics is already
+    /// a live, fixture-backed refusal policy. Other transition-only unsupported results stay
+    /// observations until the old/new comparator can classify them.
+    fn refusal_after(
+        &mut self,
+        children: impl IntoIterator<Item = ComptimeEvalOutcome>,
+    ) -> ComptimeEvalOutcome {
+        let mut outcome = ComptimeEvalOutcome::refusal();
+        for child in children {
+            outcome.value.facts.merge_from(&child.value.facts);
+            outcome.support.merge_from(child.support);
+            outcome
+                .unsupported_reason
+                .merge_from(child.unsupported_reason);
+            outcome.requires_refusal |= child.requires_refusal;
+        }
         outcome
     }
 
@@ -85,6 +204,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
         for child in children {
             outcome.value.facts.merge_from(&child.value.facts);
             outcome.support.merge_from(child.support);
+            outcome
+                .unsupported_reason
+                .merge_from(child.unsupported_reason);
+            outcome.requires_refusal |= child.requires_refusal;
             if child.flow != ComptimeEvalFlow::Normal {
                 outcome.flow = child.flow;
             }
@@ -136,10 +259,26 @@ impl<'graph> ComptimeInterpreter<'graph> {
         match expr {
             Expr::Identifier(id) => {
                 if let Some(binding) = self.context.binding_facts(&id.name) {
-                    ComptimeValueFacts {
-                        reference_origins: binding.captured_place_origins.clone(),
-                        ..ComptimeValueFacts::default()
+                    // A local aggregate may *contain* a reference, but borrowing the aggregate
+                    // (or one of its ordinary scalar fields) does not reach that reference's
+                    // pointee. Component selection below carries the field's own facts when it
+                    // is the reference-bearing field.
+                    if self.env.get(&id.name).is_some_and(|value| {
+                        matches!(&value.aggregate, Some(ComptimeAggregateValue::Struct(_)))
+                    }) {
+                        return ComptimeValueFacts::default();
                     }
+                    // A local can name a closure-environment field or a reference parameter.
+                    // Both are places whose writes reach the carried outer origin; keeping only
+                    // captured-place origins here lost writes such as `param[0] = ...`.
+                    let mut facts = ComptimeValueFacts::default();
+                    facts
+                        .reference_origins
+                        .extend(binding.reference_origins.iter().cloned());
+                    facts
+                        .reference_origins
+                        .extend(binding.captured_place_origins.iter().cloned());
+                    facts
                 } else if self.context.is_outer_binding(&id.name) {
                     let mut facts = ComptimeValueFacts::default();
                     facts.reference_origins.insert(id.name.clone());
@@ -175,8 +314,14 @@ impl<'graph> ComptimeInterpreter<'graph> {
 
         self.context.push_scope();
         let mut result = ComptimeEvalOutcome::unknown();
+        let mut support = ComptimeEvalSupport::Supported;
+        let mut unsupported_reason = ComptimeEvalUnsupportedReason::None;
+        let mut requires_refusal = false;
         for stmt in stmts {
             result = self.statement(stmt);
+            support.merge_from(result.support);
+            unsupported_reason.merge_from(result.unsupported_reason);
+            requires_refusal |= result.requires_refusal;
             if result.flow != ComptimeEvalFlow::Normal {
                 break;
             }
@@ -184,8 +329,14 @@ impl<'graph> ComptimeInterpreter<'graph> {
         if result.flow == ComptimeEvalFlow::Normal {
             if let Some(tail) = tail {
                 result = self.expr(tail);
+                support.merge_from(result.support);
+                unsupported_reason.merge_from(result.unsupported_reason);
+                requires_refusal |= result.requires_refusal;
             }
         }
+        result.support.merge_from(support);
+        result.unsupported_reason.merge_from(unsupported_reason);
+        result.requires_refusal |= requires_refusal;
         self.context.pop_scope();
         for (name, value) in shadowed {
             match value {
@@ -222,7 +373,9 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Statement::ExprStmt(expr) => self.expr(&expr.expr),
             Statement::ForLoop(loop_stmt) => self.for_loop(loop_stmt),
             Statement::Assign(assign) => self.assign(&assign.lhs, &assign.rhs),
-            Statement::CompoundAssign(assign) => self.compound_assign(&assign.lhs, &assign.rhs),
+            Statement::CompoundAssign(assign) => {
+                self.compound_assign(&assign.lhs, &assign.op, &assign.rhs)
+            }
             Statement::Assert(assert) => self.expr(&assert.expr),
             Statement::Loop(loop_stmt) => self.loop_stmt(loop_stmt),
             Statement::Break(_) => ComptimeEvalOutcome {
@@ -265,9 +418,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
         self.unknown_after([left, right])
     }
 
-    fn compound_assign(&mut self, lhs: &Expr, rhs: &Expr) -> ComptimeEvalOutcome {
+    fn compound_assign(&mut self, lhs: &Expr, op: &BinaryOp, rhs: &Expr) -> ComptimeEvalOutcome {
         let left = self.expr(lhs);
         let right = self.expr(rhs);
+        let updated = self.binary(left.clone(), right.clone(), op);
         if let Expr::Identifier(id) = lhs {
             if self.context.is_outer_binding(&id.name) {
                 self.context.note_escaping_write([id.name.clone()]);
@@ -278,12 +432,19 @@ impl<'graph> ComptimeInterpreter<'graph> {
             {
                 self.context
                     .note_escaping_write(captured_place.iter().cloned());
+                if captured_place.is_empty() {
+                    self.context.reassign(&id.name, updated.value.facts.clone());
+                    self.env.insert(id.name.clone(), updated.value.clone());
+                }
+            } else {
+                self.context.reassign(&id.name, updated.value.facts.clone());
+                self.env.insert(id.name.clone(), updated.value.clone());
             }
         } else {
             self.context
                 .note_escaping_write(self.place_facts(lhs).reference_origins);
         }
-        self.unknown_after([left, right])
+        updated
     }
 
     fn binary(
@@ -322,8 +483,58 @@ impl<'graph> ComptimeInterpreter<'graph> {
             .map(|outcome| outcome.value.concrete.clone())
             .collect::<Option<Vec<_>>>()
             .map(Value::Array);
+        let aggregate = ComptimeAggregateValue::Array(
+            elements
+                .iter()
+                .map(|outcome| outcome.value.clone())
+                .collect(),
+        );
         let mut outcome = self.unknown_after(elements);
         outcome.value.concrete = concrete;
+        outcome.value.aggregate = Some(aggregate);
+        outcome
+    }
+
+    /// Select one component without inheriting may-facts from its unrelated siblings. The base
+    /// still contributes support, refusal, flow, and already-recorded effects through
+    /// `unknown_after`; only the selected *value* is precise.
+    fn member_access(&mut self, base: ComptimeEvalOutcome, member: &Symbol) -> ComptimeEvalOutcome {
+        let selected = match &base.value.aggregate {
+            Some(ComptimeAggregateValue::Struct(fields)) => fields.get(member).cloned(),
+            _ => None,
+        };
+        let mut outcome = self.unknown_after([base]);
+        if let Some(selected) = selected {
+            outcome.value = selected;
+        }
+        outcome
+    }
+
+    fn index_access(
+        &mut self,
+        base: ComptimeEvalOutcome,
+        index: ComptimeEvalOutcome,
+    ) -> ComptimeEvalOutcome {
+        let selected = match (&base.value.aggregate, &index.value.concrete) {
+            (Some(ComptimeAggregateValue::Array(items)), Some(Value::Int(index)))
+                if *index >= 0 =>
+            {
+                items.get(*index as usize).cloned()
+            }
+            _ => None,
+        };
+        let concrete = match (&base.value.concrete, &index.value.concrete) {
+            (Some(Value::Array(items)), Some(Value::Int(index))) if *index >= 0 => {
+                items.get(*index as usize).cloned()
+            }
+            _ => None,
+        };
+        let mut outcome = self.unknown_after([base, index]);
+        if let Some(selected) = selected {
+            outcome.value = selected;
+        } else {
+            outcome.value.concrete = concrete;
+        }
         outcome
     }
 
@@ -331,10 +542,39 @@ impl<'graph> ComptimeInterpreter<'graph> {
     /// value environment, but its parameter facts are installed in the context's enclosing call
     /// scope, so `*param = ...` is recognised as a write through the caller's mutable reference.
     ///
-    /// Calls without a body, arity mismatch, or recursion are deliberately unsupported during the
-    /// transition. Their arguments have still been evaluated before this point, preserving any
-    /// effect that occurs while producing an argument.
+    /// Calls without a body or with an arity mismatch are deliberately unsupported during the
+    /// transition. Recursive calls use the same isolated-frame model up to the shared depth
+    /// limit. Arguments are evaluated before this point, preserving any effect that occurs while
+    /// producing one.
     fn known_function_call(
+        &mut self,
+        target: &Symbol,
+        args: Vec<ComptimeEvalOutcome>,
+    ) -> ComptimeEvalOutcome {
+        if self.context.call_depth() == 0 {
+            let target = target.clone();
+            let worker_args = args.clone();
+            return std::thread::scope(|scope| {
+                let worker = std::thread::Builder::new()
+                    .name("vx-comptime".into())
+                    .stack_size(COMPTIME_RECURSION_STACK_SIZE)
+                    .spawn_scoped(scope, move || {
+                        self.known_function_call_on_current_stack(&target, worker_args)
+                    });
+                match worker {
+                    Ok(worker) => worker
+                        .join()
+                        .unwrap_or_else(|_| Self::unsupported_outcome(args)),
+                    // The transition interpreter must never make a failed worker allocation a
+                    // compiler crash. Refuse this fold and retain all argument effects instead.
+                    Err(_) => Self::unsupported_outcome(args),
+                }
+            });
+        }
+        self.known_function_call_on_current_stack(target, args)
+    }
+
+    fn known_function_call_on_current_stack(
         &mut self,
         target: &Symbol,
         args: Vec<ComptimeEvalOutcome>,
@@ -342,7 +582,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let Some(function) = self.function_bodies.get(target).cloned() else {
             return self.unsupported_after(args);
         };
-        if function.params.len() != args.len() || !self.context.push_call(target.clone()) {
+        if function.params.len() != args.len() {
+            return self.unsupported_after(args);
+        }
+        if !self.context.push_call() {
             return self.unsupported_after(args);
         }
 
@@ -356,7 +599,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let body = self.block(&function.body);
         self.context.pop_scope();
         self.env = saved_env;
-        self.context.pop_call(target);
+        self.context.pop_call();
 
         let mut outcome = match body.flow {
             ComptimeEvalFlow::Return => ComptimeEvalOutcome {
@@ -368,6 +611,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
         };
         for argument in args {
             outcome.support.merge_from(argument.support);
+            outcome
+                .unsupported_reason
+                .merge_from(argument.unsupported_reason);
+            outcome.requires_refusal |= argument.requires_refusal;
         }
         outcome
     }
@@ -377,7 +624,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
         facts: ComptimeValueFacts,
         args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
-        self.note_opaque_callable(&facts);
+        self.note_opaque_callable(&facts, &args);
         let mut targets = facts.callable_targets.iter();
         let Some(first_target) = targets.next() else {
             return self.unsupported_after(args);
@@ -392,6 +639,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     value: ComptimeEvalValue {
                         concrete: None,
                         facts: environment.clone(),
+                        aggregate: None,
                     },
                     ..ComptimeEvalOutcome::default()
                 },
@@ -408,6 +656,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                         value: ComptimeEvalValue {
                             concrete: None,
                             facts: environment.clone(),
+                            aggregate: None,
                         },
                         ..ComptimeEvalOutcome::default()
                     },
@@ -435,13 +684,25 @@ impl<'graph> ComptimeInterpreter<'graph> {
         }
     }
 
-    /// An opaque callable cannot be assumed pure. Captured writes name outer storage directly;
-    /// recording them means an indirect/callback call is conservatively refused rather than being
-    /// folded away just because the body was not available to this transition interpreter.
-    fn note_opaque_callable(&mut self, facts: &ComptimeValueFacts) {
-        if facts.unknown_callable {
+    /// An opaque callable cannot be assumed pure. Captured writes and mutable-reference arguments
+    /// name outer storage directly, so recording them prevents an indirect/callback call from
+    /// being folded away just because its body was unavailable to this transition interpreter.
+    fn note_opaque_callable(&mut self, facts: &ComptimeValueFacts, args: &[ComptimeEvalOutcome]) {
+        // An empty target set includes a function value that crossed the comptime boundary
+        // through an outer alias. Its spelling is unavailable here, but it may still write
+        // through every mutable reference it received.
+        if facts.unknown_callable || facts.callable_targets.is_empty() {
             self.context
                 .note_escaping_write(facts.captured_writes.iter().cloned());
+            self.context
+                .note_escaping_write(args.iter().flat_map(|arg| {
+                    arg.value
+                        .facts
+                        .reference_origins
+                        .iter()
+                        .chain(arg.value.facts.captured_place_origins.iter())
+                        .cloned()
+                }));
         }
     }
 
@@ -472,6 +733,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Some(Value::Bool(true)) => {
                 let mut outcome = self.block(&if_expr.then_block);
                 outcome.support.merge_from(condition.support);
+                outcome
+                    .unsupported_reason
+                    .merge_from(condition.unsupported_reason);
+                outcome.requires_refusal |= condition.requires_refusal;
                 return outcome;
             }
             Some(Value::Bool(false)) => {
@@ -481,6 +746,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .map(|branch| self.block(branch))
                     .unwrap_or_default();
                 outcome.support.merge_from(condition.support);
+                outcome
+                    .unsupported_reason
+                    .merge_from(condition.unsupported_reason);
+                outcome.requires_refusal |= condition.requires_refusal;
                 return outcome;
             }
             _ => {}
@@ -507,6 +776,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let mut outcome = then_outcome;
         outcome.merge_from(&else_outcome);
         outcome.support.merge_from(condition.support);
+        outcome
+            .unsupported_reason
+            .merge_from(condition.unsupported_reason);
+        outcome.requires_refusal |= condition.requires_refusal;
         outcome
     }
 
@@ -598,6 +871,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
 
         let scrutinee_known = scrutinee.value.concrete.is_some();
         let scrutinee_support = scrutinee.support;
+        let scrutinee_requires_refusal = scrutinee.requires_refusal;
         let scrutinee_facts = scrutinee.value.facts;
         let mut merged = self.clone();
         let mut outcome = merged.match_arm(first, &scrutinee_facts);
@@ -615,14 +889,88 @@ impl<'graph> ComptimeInterpreter<'graph> {
         // still need pattern/value modelling before their value can fold, but their effects have
         // been collected above, so fail closed rather than forgetting an arm's write.
         if !scrutinee_known {
-            outcome.support = ComptimeEvalSupport::Unsupported;
+            outcome.mark_unsupported();
         }
         outcome.support.merge_from(scrutinee_support);
+        outcome.requires_refusal |= scrutinee_requires_refusal;
         outcome
     }
 
     fn for_loop(&mut self, loop_stmt: &ForLoopStmt) -> ComptimeEvalOutcome {
-        let iterable = self.expr(&loop_stmt.iterable);
+        // A finite integer range has the same recurrence as the legacy evaluator. Run it
+        // concretely so assignments made by one turn are available to the next one; the former
+        // zero-or-one abstract join was safe for effects, but could never agree on values.
+        let iterable = if let Expr::Range(range) = &*loop_stmt.iterable {
+            let start = self.expr(&range.start);
+            let end = self.expr(&range.end);
+            if start.flow != ComptimeEvalFlow::Normal {
+                return start;
+            }
+            if end.flow != ComptimeEvalFlow::Normal {
+                return end;
+            }
+            if let (Some(Value::Int(start_index)), Some(Value::Int(end_index))) =
+                (&start.value.concrete, &end.value.concrete)
+            {
+                let iterator: Symbol = loop_stmt.iter.clone().into();
+                let shadowed = self.env.get(&iterator).cloned();
+                self.context.push_scope();
+                self.context
+                    .declare(iterator.clone(), ComptimeValueFacts::default());
+
+                let mut index = *start_index;
+                let end_index = *end_index;
+                let mut outcome = self.unknown_after([start, end]);
+                let mut steps = 0u64;
+                while index < end_index {
+                    if steps >= crate::hir::check_state::MAX_LOOP_STEPS {
+                        outcome.mark_unsupported();
+                        break;
+                    }
+                    steps += 1;
+                    self.env.insert(
+                        iterator.clone(),
+                        ComptimeEvalValue::known(Value::Int(index)),
+                    );
+                    let body = self.block(&loop_stmt.body);
+                    outcome.support.merge_from(body.support);
+                    outcome
+                        .unsupported_reason
+                        .merge_from(body.unsupported_reason);
+                    outcome.requires_refusal |= body.requires_refusal;
+                    match body.flow {
+                        ComptimeEvalFlow::Normal | ComptimeEvalFlow::Continue => {}
+                        ComptimeEvalFlow::Break => break,
+                        ComptimeEvalFlow::Return => {
+                            outcome.flow = ComptimeEvalFlow::Return;
+                            outcome.value = body.value;
+                            break;
+                        }
+                        ComptimeEvalFlow::Indeterminate => {
+                            outcome.flow = ComptimeEvalFlow::Indeterminate;
+                            outcome.mark_unsupported();
+                            break;
+                        }
+                    }
+                    index += 1;
+                }
+                self.context.pop_scope();
+                match shadowed {
+                    Some(value) => {
+                        self.env.insert(iterator, value);
+                    }
+                    None => {
+                        self.env.remove(&iterator);
+                    }
+                }
+                return outcome;
+            }
+            // Keep the already-evaluated bounds when the recurrence is abstract, so an
+            // effectful bound is not visited twice.
+            self.unknown_after([start, end])
+        } else {
+            self.expr(&loop_stmt.iterable)
+        };
         if iterable.flow != ComptimeEvalFlow::Normal {
             return iterable;
         }
@@ -634,8 +982,8 @@ impl<'graph> ComptimeInterpreter<'graph> {
         one_iteration.context.push_scope();
         one_iteration
             .context
-            .declare(loop_stmt.iter.clone(), ComptimeValueFacts::default());
-        let _body = one_iteration.block(&loop_stmt.body);
+            .declare(loop_stmt.iter.clone().into(), ComptimeValueFacts::default());
+        let body = one_iteration.block(&loop_stmt.body);
         one_iteration.context.pop_scope();
 
         self.context.merge_branch(&one_iteration.context);
@@ -643,21 +991,41 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let mut outcome = ComptimeEvalOutcome::unsupported();
         outcome.support.merge_from(iterable.support);
         outcome
+            .unsupported_reason
+            .merge_from(iterable.unsupported_reason);
+        outcome.requires_refusal |= iterable.requires_refusal || body.requires_refusal;
+        outcome
     }
 
     fn loop_stmt(&mut self, loop_stmt: &LoopStmt) -> ComptimeEvalOutcome {
-        // A plain `loop` enters its body at least once. Retain that iteration's effects, but
-        // refuse to fold until recurrence and break-path reasoning are modelled. A definite
-        // return remains a return; a definite break permits the following statement to run.
-        let body = self.block(&loop_stmt.body);
-        let mut outcome = ComptimeEvalOutcome::unsupported();
-        outcome.flow = match body.flow {
-            ComptimeEvalFlow::Return => ComptimeEvalFlow::Return,
-            ComptimeEvalFlow::Break => ComptimeEvalFlow::Normal,
-            ComptimeEvalFlow::Normal
-            | ComptimeEvalFlow::Continue
-            | ComptimeEvalFlow::Indeterminate => ComptimeEvalFlow::Indeterminate,
-        };
+        // Unlike a `for`, a plain loop has no empty path. Execute until an explicit `break` or
+        // `return`; the shared budget gives an unproven recurrence the same fail-closed outcome
+        // as the legacy evaluator's loop-step cap.
+        let mut outcome = ComptimeEvalOutcome::unknown();
+        for _ in 0..crate::hir::check_state::MAX_LOOP_STEPS {
+            let body = self.block(&loop_stmt.body);
+            outcome.support.merge_from(body.support);
+            outcome
+                .unsupported_reason
+                .merge_from(body.unsupported_reason);
+            outcome.requires_refusal |= body.requires_refusal;
+            match body.flow {
+                ComptimeEvalFlow::Normal | ComptimeEvalFlow::Continue => {}
+                ComptimeEvalFlow::Break => return outcome,
+                ComptimeEvalFlow::Return => {
+                    outcome.flow = ComptimeEvalFlow::Return;
+                    outcome.value = body.value;
+                    return outcome;
+                }
+                ComptimeEvalFlow::Indeterminate => {
+                    outcome.flow = ComptimeEvalFlow::Indeterminate;
+                    outcome.mark_unsupported();
+                    return outcome;
+                }
+            }
+        }
+        outcome.mark_unsupported();
+        outcome.flow = ComptimeEvalFlow::Indeterminate;
         outcome
     }
 
@@ -684,19 +1052,26 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 .or_else(|_| number.value.parse::<f64>().map(Value::Number))
                 .map(ComptimeEvalOutcome::known)
                 .unwrap_or_else(|_| ComptimeEvalOutcome::unsupported()),
-            Expr::EnumVariant(variant) => self.unknown_after(
-                variant
+            Expr::EnumVariant(variant) => {
+                let values = variant
                     .payload
                     .iter()
                     .flatten()
                     .map(|value| self.expr(value))
-                    .collect::<Vec<_>>(),
-            ),
+                    .collect::<Vec<_>>();
+                // Enum constants have no concrete representation in the transition value
+                // model. Do not let an enum-driven match and its local writes vanish merely
+                // because the legacy evaluator happens to continue to a later tail.
+                self.refusal_after(values)
+            }
             Expr::StringLiteral(_)
             | Expr::MemorySpace(_)
             | Expr::SizeOf(_)
             | Expr::MacroCall(_) => ComptimeEvalOutcome::unsupported(),
-            Expr::Transfer(transfer) => self.unsupported_after([self.expr(&transfer.expr)]),
+            Expr::Transfer(transfer) => {
+                let value = self.expr(&transfer.expr);
+                self.refusal_after([value])
+            }
             Expr::TransferPredicate(predicate) => {
                 let from = self.topology(&predicate.from);
                 let to = self.topology(&predicate.to);
@@ -717,7 +1092,8 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 outcome
             }
             Expr::FunctionCall(call) => {
-                self.function_call(call, call.args.iter().map(|arg| self.expr(arg)).collect())
+                let args = call.args.iter().map(|arg| self.expr(arg)).collect();
+                self.function_call(call, args)
             }
             Expr::IndirectCall(call) => {
                 let callee = self.expr(&call.callee);
@@ -726,35 +1102,27 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let mut outcome = self.callable_call(facts, args);
                 outcome.support.merge_from(callee.support);
                 outcome
+                    .unsupported_reason
+                    .merge_from(callee.unsupported_reason);
+                outcome.requires_refusal |= callee.requires_refusal;
+                outcome
             }
-            Expr::Array(array) => self.array(
-                array
+            Expr::Array(array) => {
+                let elements = array
                     .elements
                     .iter()
                     .map(|element| self.expr(element))
-                    .collect(),
-            ),
+                    .collect();
+                self.array(elements)
+            }
             Expr::MemberAccess(access) => {
                 let base = self.expr(&access.base);
-                let mut outcome = self.unknown_after([base.clone()]);
-                outcome.value.facts = base.value.facts;
-                outcome
+                self.member_access(base, &access.member)
             }
             Expr::IndexAccess(access) => {
                 let base = self.expr(&access.base);
                 let index = self.expr(&access.index);
-                let concrete = match (&base.value.concrete, &index.value.concrete) {
-                    (Some(Value::Array(items)), Some(Value::Int(index))) if *index >= 0 => {
-                        items.get(*index as usize).cloned()
-                    }
-                    _ => None,
-                };
-                let mut outcome = self.unknown_after([base, index]);
-                // An aggregate's precise field/index facts are not modelled yet. Keeping the
-                // union of its evaluated children is conservative and, unlike syntax-only
-                // lookup, preserves a function or mutable reference stored through a local.
-                outcome.value.concrete = concrete;
-                outcome
+                self.index_access(base, index)
             }
             Expr::MethodCall(call) => {
                 let mut children = vec![self.expr(&call.base)];
@@ -792,11 +1160,19 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     (Some(Value::Bool(false)), LogicalOp::And) => {
                         let mut outcome = ComptimeEvalOutcome::known(Value::Bool(false));
                         outcome.support.merge_from(lhs.support);
+                        outcome
+                            .unsupported_reason
+                            .merge_from(lhs.unsupported_reason);
+                        outcome.requires_refusal |= lhs.requires_refusal;
                         return outcome;
                     }
                     (Some(Value::Bool(true)), LogicalOp::Or) => {
                         let mut outcome = ComptimeEvalOutcome::known(Value::Bool(true));
                         outcome.support.merge_from(lhs.support);
+                        outcome
+                            .unsupported_reason
+                            .merge_from(lhs.unsupported_reason);
+                        outcome.requires_refusal |= lhs.requires_refusal;
                         return outcome;
                     }
                     _ => {}
@@ -829,6 +1205,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let inner = self.expr(&borrow.expr);
                 let mut outcome = self.unknown_after([inner.clone()]);
                 outcome.value.facts = inner.value.facts;
+                outcome.value.aggregate = inner.value.aggregate;
                 if borrow.is_mut {
                     outcome
                         .value
@@ -841,6 +1218,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let inner = self.expr(&deref.expr);
                 let mut outcome = self.unknown_after([inner.clone()]);
                 outcome.value.facts = inner.value.facts;
+                outcome.value.aggregate = inner.value.aggregate;
                 outcome
             }
             Expr::UnsafeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
@@ -849,18 +1227,26 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let fields = init
                     .fields
                     .iter()
-                    .map(|(_, value)| (self.expr(value), self.place_facts(value)))
+                    .map(|(name, value)| (name.clone(), self.expr(value), self.place_facts(value)))
                     .collect::<Vec<_>>();
                 let mut outcome = self.unknown_after(
                     fields
                         .iter()
-                        .map(|(outcome, _)| outcome.clone())
+                        .map(|(_, outcome, _)| outcome.clone())
                         .collect::<Vec<_>>(),
                 );
                 let target: Symbol = format!("{}_call", init.name).into();
+                if !init.name.starts_with("Closure_") {
+                    outcome.value.aggregate = Some(ComptimeAggregateValue::Struct(
+                        fields
+                            .iter()
+                            .map(|(name, outcome, _)| (name.clone(), outcome.value.clone()))
+                            .collect(),
+                    ));
+                }
                 if init.name.starts_with("Closure_") && self.function_bodies.contains_key(&target) {
                     let mut environment = ComptimeValueFacts::default();
-                    for (field, place) in fields {
+                    for (_, field, place) in fields {
                         environment.merge_from(&field.value.facts);
                         // A generated closure environment retains the captured place. This is
                         // deliberately distinct from an ordinary struct literal, whose fields are
@@ -877,22 +1263,30 @@ impl<'graph> ComptimeInterpreter<'graph> {
                         .value
                         .facts
                         .callable_environments
-                        .insert(target, environment);
+                        .insert(target, environment.clone());
+                    // The closure value itself transports its environment. Preserve that fact
+                    // through a borrow of the closure object so the generated `_env` parameter
+                    // and its captured-field bindings still name the original outer place.
+                    outcome.value.facts.merge_from(&environment);
                 }
                 outcome
             }
             Expr::Topology(topology) => self.topology(&topology.top),
             Expr::If(if_expr) => self.if_expr(if_expr),
             Expr::Range(range) => {
-                self.unknown_after([self.expr(&range.start), self.expr(&range.end)])
+                let start = self.expr(&range.start);
+                let end = self.expr(&range.end);
+                self.unknown_after([start, end])
             }
             Expr::Match(match_expr) => self.match_expr(match_expr),
-            Expr::Grad(grad) => self.unsupported_after(
-                grad.args
+            Expr::Grad(grad) => {
+                let args = grad
+                    .args
                     .iter()
                     .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>(),
-            ),
+                    .collect::<Vec<_>>();
+                self.unsupported_after(args)
+            }
             Expr::Vjp(vjp) => {
                 let mut children = vjp
                     .args
@@ -911,36 +1305,43 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 children.push(self.expr(&jvp.tangent));
                 self.unsupported_after(children)
             }
-            Expr::SpawnOn(spawn) => self.unsupported_after([
-                self.topology(&spawn.top),
-                self.block_with_tail(&spawn.stmts, spawn.ret.as_deref()),
-            ]),
-            Expr::VecMacro(vector) => self.unknown_after(
-                vector
+            Expr::SpawnOn(spawn) => {
+                let topology = self.topology(&spawn.top);
+                let body = self.block_with_tail(&spawn.stmts, spawn.ret.as_deref());
+                self.refusal_after([topology, body])
+            }
+            Expr::VecMacro(vector) => {
+                let elements = vector
                     .elements
                     .iter()
                     .map(|element| self.expr(element))
-                    .collect::<Vec<_>>(),
-            ),
+                    .collect::<Vec<_>>();
+                self.unknown_after(elements)
+            }
             // A closure body is deferred until invocation. Checked closures are normally lowered
             // to a generated `Closure_N` struct before this point; an unlowered literal remains
             // unsupported, but must not execute its body merely because it is being created.
             Expr::Closure(_) => ComptimeEvalOutcome::unsupported(),
-            Expr::AsCast(cast) => self.unknown_after([self.expr(&cast.expr)]),
-            Expr::Print(print) => self.unsupported_after(
-                print
+            Expr::AsCast(cast) => {
+                let value = self.expr(&cast.expr);
+                self.unknown_after([value])
+            }
+            Expr::Print(print) => {
+                let args = print
                     .args
                     .iter()
                     .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>(),
-            ),
-            Expr::Println(print) => self.unsupported_after(
-                print
+                    .collect::<Vec<_>>();
+                self.unsupported_after(args)
+            }
+            Expr::Println(print) => {
+                let args = print
                     .args
                     .iter()
                     .map(|arg| self.expr(arg))
-                    .collect::<Vec<_>>(),
-            ),
+                    .collect::<Vec<_>>();
+                self.unsupported_after(args)
+            }
             Expr::InlineMlir(mlir) => {
                 let mut children = mlir
                     .inputs
@@ -952,7 +1353,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     self.context
                         .note_escaping_write(self.place_facts(clobber).reference_origins);
                 }
-                self.unsupported_after(children)
+                self.refusal_after(children)
             }
         }
     }
@@ -960,15 +1361,18 @@ impl<'graph> ComptimeInterpreter<'graph> {
     fn topology(&mut self, topology: &Topology) -> ComptimeEvalOutcome {
         match topology {
             Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
-                let mut outcome = self.unknown_after([self.expr(index)]);
+                let index = self.expr(index);
+                let mut outcome = self.unknown_after([index]);
                 if outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
                 outcome
             }
             Topology::Slice(base, start, end) => {
-                let mut outcome =
-                    self.unknown_after([self.topology(base), self.expr(start), self.expr(end)]);
+                let base = self.topology(base);
+                let start = self.expr(start);
+                let end = self.expr(end);
+                let mut outcome = self.unknown_after([base, start, end]);
                 if outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
@@ -984,5 +1388,78 @@ impl<'graph> ComptimeInterpreter<'graph> {
             // this self-contained transition harness yet, but it is still a modelled unknown.
             Topology::Current => ComptimeEvalOutcome::unknown(),
         }
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    fn legacy(
+        concrete: Option<Value>,
+        support: ComptimeEvalSupport,
+        flow: ComptimeEvalFlow,
+    ) -> ComptimeNormalizedObservation {
+        ComptimeNormalizedObservation {
+            concrete,
+            support,
+            flow,
+        }
+    }
+
+    #[test]
+    fn statement_only_blocks_normalize_to_no_value() {
+        let observation = ComptimeObservation {
+            outcome: ComptimeEvalOutcome::known(Value::Int(7)),
+            escaping_write: None,
+            call_depth_exceeded: false,
+            has_tail: false,
+        };
+        assert_eq!(
+            observation.compare_legacy(&legacy(
+                None,
+                ComptimeEvalSupport::Supported,
+                ComptimeEvalFlow::Normal,
+            )),
+            ComptimeParity::Agree,
+        );
+    }
+
+    #[test]
+    fn nested_return_flow_difference_is_explicitly_allow_listed() {
+        let mut outcome = ComptimeEvalOutcome::known(Value::Int(1));
+        outcome.flow = ComptimeEvalFlow::Return;
+        let observation = ComptimeObservation {
+            outcome,
+            escaping_write: None,
+            call_depth_exceeded: false,
+            has_tail: true,
+        };
+        assert_eq!(
+            observation.compare_legacy(&legacy(
+                None,
+                ComptimeEvalSupport::Supported,
+                ComptimeEvalFlow::Normal,
+            )),
+            ComptimeParity::AllowedLegacyNestedReturnFlow,
+        );
+    }
+
+    #[test]
+    fn unallowlisted_value_difference_stays_visible() {
+        let observation = ComptimeObservation {
+            outcome: ComptimeEvalOutcome::known(Value::Int(7)),
+            escaping_write: None,
+            call_depth_exceeded: false,
+            has_tail: true,
+        };
+        assert_eq!(
+            observation.compare_legacy(&legacy(
+                Some(Value::Int(8)),
+                ComptimeEvalSupport::Supported,
+                ComptimeEvalFlow::Normal,
+            )),
+            ComptimeParity::ValueMismatch,
+        );
     }
 }

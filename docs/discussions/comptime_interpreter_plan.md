@@ -1,9 +1,9 @@
-# Comptime mutable-reference handoff
+# Comptime interpreter plan
 
 This note records the work on preventing a `comptime` block from folding away a write that can
 reach a binding outside that block.
 
-## 1. Earlier approach: names and syntax
+## 1. First approach
 
 The first approach kept a set of names that looked like mutable aliases of an outer binding. When
 an `if` or `match` condition was unknown, it walked both paths and rejected the `comptime` block
@@ -27,7 +27,7 @@ the same `p` after `p = &mut local`. Adding more name sets only created stale fa
 positives. Separately, the evaluator skipped several composite expressions, so a syntax walk could
 miss a direct path that the evaluator silently folded.
 
-## 2. Current approach: scoped value provenance
+## 2. 2nd approach
 
 The current implementation tracks facts carried by values, not just identifier spellings.
 
@@ -63,123 +63,33 @@ Relevant commits:
 - `66dc5a1d`: restored focused comptime fixtures.
 - `43ce6f90`: aggregate borrows preserve inner mutable references.
 
-## 3. Known open hole before pushing
+### Problems with that approach
 
-Do **not** push until this is fixed.
+The second approach still has two separate traversals: the concrete evaluator and the unknown-path
+effect summary. They can disagree about an expression's children; the former topology-index bug
+silently folded a call because only the summary visited the index. The needed audit was therefore
+unbounded: every child-bearing expression had to be kept in sync in both walkers. Function aliases
+and closure paths also made body discovery depend on spelling outside the comptime block.
 
-The direct evaluator for `Expr::Topology` builds a topology value without evaluating the index
-expression. This program currently folds to `7` and drops the write:
+The imported regression corpus remains valuable behavioral evidence, but extending this split
+design would mean more whack-a-mole coverage work rather than a structural guarantee.
 
-```vx
-fn touch(value : &mut i32) -> i32 {
-  *value = 9i32;
-  return 0i32;
-}
+## 3. Current Design
 
-fn main() -> i32 {
-  let mut outside : i32 = 0i32;
-  let value = comptime {
-    let _ignored = Topology::NPU[touch(&mut outside)];
-    7i32
-  };
-  return value;
-}
-```
+The current design is one comptime interpreter that combines concrete evaluation, abstract
+unknown-path traversal, provenance, and escaping-write detection. Every evaluated value carries
+its provenance. Known paths execute concretely; unknown paths traverse the same owners
+abstractly, so there is one source of truth for both a value and the effects needed to produce it.
+An owner without a supported rule fails closed rather than being silently treated as pure.
 
-The corresponding unknown-branch fixture passes because the static effect walker visits topology
-indices. The direct path bypasses that walker. `spawn on(Topology::NPU[...])` currently refuses to
-fold generically, which is safe, but it should be audited after fixing topology evaluation.
-
-## TODO: close nested-expression coverage systematically
-
-The goal is not to add one special case per bug. Every expression that owns child expressions must
-either evaluate all of them before folding, or mark the enclosing `comptime` evaluation unsupported.
-For a child that can write through a mutable reference, the resulting diagnostic should name the
-outer binding when provenance is known.
-
-### Immediate work
-
-1. Fix `Expr::Topology` evaluation to evaluate its index expressions before constructing `Value::Topology`.
-2. Add a direct failure fixture for `Topology::NPU[touch(&mut outside)]`, with no unknown branch.
-3. Recheck direct `SpawnOn` evaluation after that change. It must either observe nested effects or
-   refuse the fold; it must never fold away the effect.
-4. Repeat the full `comptime*.vx` pass/fail suite and `cargo test --lib`.
-
-### Expression owners to audit
-
-For each item below, test both a direct `comptime` path and the same expression under an unknown
-`if` or `match` path. The direct case catches evaluator skips; the unknown case catches effect
-summary skips.
-
-- `Topology`: NPU, GPU, AccCore, and nested `Slice` indices.
-- `SpawnOn`: topology, body statements, and optional returned value.
-- `StructInit`: fields containing calls, borrows, nested structs, and callable values.
-- `EnumVariant`: payloads containing calls and mutable-reference values; then destructuring via
-  `match`.
-- `Array` and `VecMacro`: elements containing mutable references, callbacks, and nested indexes.
-- `IndexAccess` and assignments: effect in the base, index, and right-hand side.
-- `MemberAccess` and dereference: direct field/ref access and chains such as `&mut **p`.
-- `FunctionCall` and `IndirectCall`: direct calls, function values, closures, unknown callables,
-  and callback values stored inside aggregates.
-- `UnsafeBlock`, nested `ComptimeBlock`, `Match`, `If`, loops, and returns inside those forms.
-- `InlineMlir` inputs and clobbers, plus the argument-bearing autodiff and print expressions.
-
-### Reference/container shapes to test
-
-Use a distinct outer binding name in each failure test so one error cannot satisfy another test's
-`FileCheck` assertion. Every shape needs a matching local-only pass test when the operation is
-otherwise foldable.
-
-- `&mut T`, `&mut &mut T`, `&mut &mut &mut T`, and immutable borrows of each.
-- `struct A { p: &mut T }`, then nested `struct B { a: A }` and several levels of nesting.
-- Mutable references in enum payloads, including a value passed through a `match` binding.
-- Arrays or vectors of references, followed by indexing and a call through the selected element.
-- A reference stored in an aggregate passed by value, `&Aggregate`, and `&mut Aggregate`.
-- A function value or closure stored in an aggregate, including a closure that captures a mutable
-  reference through a nested aggregate.
-- Generic instances whose type arguments contain a mutable reference.
-- Reassignment from an outer alias to a local alias, and the reverse, across nested lexical scopes.
-- Recursive and mutually recursive callees that receive a mutable reference or an aggregate that
-  carries one.
-
-### Guardrails
-
-- Keep the default evaluator rule conservative: an unmodelled expression must refuse to fold.
-- Keep the effect summary value-based and scoped. Do not reintroduce a global set of alias names.
-- Add a test whenever a new `Expr` variant gains child expressions. An exhaustive helper or test
-  that forces a decision for each `Expr` variant would be better than relying on a catch-all arm.
-- For every new failure fixture, first demonstrate that it silently folds on the vulnerable code,
-  then verify the final error names the intended outer binding.
-
-## Existing coverage
-
-The focused fixtures now cover assertions, nested struct fields, enum payload calls, local aliases,
-reborrows, topology/spawn expressions under unknown control flow, value calls through dereference
-and index expressions, aggregate callbacks, closure captures, and aggregate borrows. The local
-struct and scalar-only borrowed-aggregate pass fixtures guard against stale-provenance false
-positives.
-
-That is strong coverage for the known paths, but it is not a proof that every direct evaluator
-form is exhaustive. The topology repro above is the reminder to finish the systematic audit.
-
-## Alternate design notes
-
-Your comptime model seems to intentionally allow reaching into a runtime &mut from inside the block (your repro has outside as an ordinary stack var, not comptime-only storage) — so you can't take Zig's move of forbidding the boundary outright. That's fine, but it means you should take Rust/Miri's move instead: collapse the evaluator and the effect checker into one walk. Concretely:
-
-Get rid of ComptimeEffects as a separate static analysis. Instead, make the evaluator itself always the source of truth: it executes (or, for unknown branches, symbolically executes both arms) using ComptimeValueFacts-style provenance as part of the value representation itself — every value the evaluator produces carries its provenance, always, not just when the checker bothers to compute it.
-For anything the evaluator can't run concretely (unknown branch, opaque callee), it still walks the expression tree the same way it would to evaluate it, just abstractly — same recursive structure, same node handling, so there is no second copy of "what does Expr::Topology contain" living in a different file. One function, one truth, for "what does this subexpression touch."
-Flip the proof obligation the way your guardrails already gesture at: don't try to prove impurity is absent (need-complete-coverage, fails open on omission); prove purity is present (fails closed on omission — an unhandled node type just refuses to fold, which you already do, but currently only because someone remembered to write that arm in both places).
-
-If you do that, the "audit every expression owner" TODO list mostly collapses, because you stop needing FileCheck fixtures to catch the evaluator and checker disagreeing — that failure mode structurally can't occur if there's only one walker.
-
-## Unified comptime evaluation plan (new branch from `main`)
+### Unified comptime evaluation plan (new branch from `main`)
 
 This work replaces the duplicated concrete evaluator and unknown-path effect summary with one
 comptime interpreter. The current branch remains available as a reference implementation and
 regression corpus. The provenance model and its fixtures are behavioral evidence to preserve, not
 a reason to continue extending the two-walker design.
 
-### 1. Evaluation contract — complete
+#### 1. Evaluation contract — complete
 
 A `comptime` block may be replaced by a constant only if all of the following are true:
 
@@ -210,7 +120,7 @@ them into `Option<Value>`. Concrete values stay in the existing `Value` type. A 
 abstract value/result carries an optional concrete value together with
 `ComptimeValueFacts`; provenance is not added to the compiler-wide `Value` representation.
 
-#### Evaluation and abstract-control rules
+##### Evaluation and abstract-control rules
 
 - Every child expression required by the language's evaluation order is interpreted, even when an
   earlier child makes the enclosing result unknown. For example, an unknown array base does not
@@ -236,7 +146,7 @@ abstract value/result carries an optional concrete value together with
   shared interpreter. Unsupported syntax fails closed. There must be no catch-all path that
   silently treats an unhandled AST form as pure or concrete.
 
-#### Diagnostics
+##### Diagnostics
 
 If a possible escaping write has known outer origins, reject the block with E3033 and name one
 deterministically selected origin. Prefer that diagnostic over a generic inability-to-fold error.
@@ -249,10 +159,11 @@ The proof obligation is positive: folding requires a supported, concrete, effect
 Anything not proved safe is left unfolded/refused as required by current `comptime` semantics.
 
 > **Implementation status:** §1 is the settled target contract. The current interpreter implements
-> only the owner slices recorded below; in particular, bounded-loop execution, full callable and
-> closure semantics, aggregate-field precision, and full old/new value parity are still pending.
+> the owner slices recorded below, including bounded finite-range and definite-break loop
+> execution and aggregate-field precision. Full callable/closure semantics, aggregate values as
+> fold results, and full old/new value parity remain pending.
 
-### 2. Shared state and result model — complete
+#### 2. Shared state and result model — complete
 
 - [x] Define the comptime-only result/abstract-value types that represent the contract above.
 - [x] Define one evaluation context for lexical fact scopes, outer-block bindings, possible
@@ -262,7 +173,7 @@ Anything not proved safe is left unfolded/refused as required by current `compti
 - [x] Define cloning and merge rules for abstract branch state, including a deterministic merge of
   escaping origins and a conservative rule for incompatible concrete environments.
 
-### 3. Shared interpreter — staged implementation plan
+#### 3. Shared interpreter — staged implementation plan
 
 The unit of work is one expression owner (or tightly coupled family), not a wholesale rewrite.
 Each unit has an explicit supported or `unsupported` interpreter arm, its child-evaluation order,
@@ -270,7 +181,7 @@ and direct/unknown-control-flow fixtures. Do not add a catch-all arm to the core
 `Statement`, or child-bearing `Topology` dispatch: a new AST variant must make the compiler fail
 to build until the interpreter makes a decision for it.
 
-#### 3.1 Establish the transition harness
+##### 3.1 Establish the transition harness
 
 - [x] Add a private `ComptimeInterpreter` beside the existing evaluator. It owns the concrete
   environment, `ComptimeEvalContext`, and `ComptimeEvalOutcome`; do not edit ordinary `eval_expr`
@@ -284,13 +195,21 @@ to build until the interpreter makes a decision for it.
 - [x] During migration, run the old and new paths for every `comptime` block. The legacy path is
   still authoritative for values, except that the new path may refuse an unsafe fold when it finds
   an escaping write the legacy scan missed.
-- [ ] A narrow escaping-write comparator is live: it rejects that one safety disagreement with
-  E3033. Extend it to normalized value/support/flow observations and record every unallowlisted
-  disagreement as a diagnostic-quality internal failure or focused regression, never as a crash.
-- [ ] Maintain an explicit, fixture-backed allow-list of intentional disagreements: a new-path
-  rejection is allowed only when the old path demonstrably silently folded away the write.
+- [x] Keep the narrow escaping-write comparator live: it rejects that one safety disagreement with
+  E3033.
+- [x] Promote the fixture-backed fail-closed policy for enum values, `SpawnOn`, `Transfer`, and
+  inline MLIR. These owners have no comptime semantics, so their local-only effects may not
+  disappear while broader parity is still transitional.
+- [x] Extend it to normalized value/support/flow observations and record every unallowlisted
+  disagreement as a diagnostic-quality transition warning or focused regression, never as a
+  crash.
+- [x] Maintain an explicit, fixture-backed allow-list of intentional disagreements. It currently
+  contains only legacy bounded recursion (`comptime_recursive_quicksort` and the countdown in
+  `comptime_call_unsupported_body`) and legacy nested-return flow
+  (`comptime_return_unreachable_outer_write`). An allowance must state its semantic reason and
+  must not suppress a possible escaping-write diagnostic.
 
-#### 3.2 Port one expression owner at a time
+##### 3.2 Port one expression owner at a time
 
 For every checked item, use a small reviewable change with the acceptance rule below. Do not move
 to a later family while its direct and unknown-path fixtures disagree with the required behavior.
@@ -300,7 +219,9 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Implement source-order traversal and provenance for identifiers, literals, borrows,
     dereferences, member/index access, assignments, and compound assignments.
   - [x] Preserve evaluated aggregate/member/index facts rather than recovering facts from syntax
-    alone.
+    alone. Arrays and ordinary struct literals retain per-component values, so a selected field
+    does not inherit a sibling's mutable-reference or callable facts; lowered closure
+    environments retain their separate capture model.
   - [x] Write the early-unknown index regression fixture.
   - [x] Cover borrowed places with the direct dereference failure
     `comptime_value_call_deref_outer_write`, the unknown-path reborrow failure
@@ -316,9 +237,15 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     short-circuiting.
   - [x] Write the early-unknown binary-left/effectful-right failure fixture and the
     short-circuit-unreachable-write pass fixture.
-  - [ ] Implement or deliberately reject with focused fixtures aggregate values, casts, ranges,
-    vectors, and enums.
-  - [ ] Add direct/unknown/local-only fixtures and confirm normalized old/new parity.
+  - [x] Preserve precise array-element and ordinary-struct-field provenance. The local-only
+    `comptime_struct_field_precision` fixture proves that writing a local field does not become
+    an outer write merely because a sibling holds `&mut outer`.
+  - [ ] Implement or deliberately reject with focused fixtures aggregate *values* (as fold
+    results), casts, ranges, vectors, and enums. Structs still have no concrete legacy `Value`
+    representation, so this completed provenance work is intentionally not a promise to fold a
+    struct itself.
+  - [ ] Add direct/unknown/local-only fixtures and confirm normalized old/new parity for the
+    remaining container forms.
 
 - [ ] **Topology-bearing predicates — complete only after acceptance**
 
@@ -341,16 +268,16 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Write the direct topology-index and direct `SpawnOn` regressions
     (`comptime_topology_index_outer_write` and `comptime_spawn_topology_outer_write`), and retain
     the imported unknown-path topology/spawn fixtures.
-  - [x] Fixture-back `SpawnOn` as fail-closed pending concrete value semantics:
+  - [x] Promote `SpawnOn` to a live fail-closed refusal pending concrete value semantics:
     `comptime_spawn_local_write_unsupported` rejects even a local-only spawn, while the direct
     outer-write fixture still names the escaping binding.
   - [x] Add the direct `Transfer` outer-write regression
     `comptime_transfer_outer_write`; its operand is observed before the transfer is refused.
-  - [x] Fixture-back `Transfer` as fail-closed pending concrete value semantics:
+  - [x] Promote `Transfer` to a live fail-closed refusal pending concrete value semantics:
     `comptime_transfer_local_write_unsupported` rejects even a local-only transfer.
   - [x] Add the direct inline-MLIR clobber regression
     `comptime_inline_mlir_outer_clobber`; its outer clobber is recorded before MLIR is refused.
-  - [x] Fixture-back inline MLIR as fail-closed pending concrete value semantics:
+  - [x] Promote inline MLIR to a live fail-closed refusal pending concrete value semantics:
     `comptime_inline_mlir_local_clobber_unsupported` rejects even a local-only clobber.
   - [x] Add the local-only topology-index pass fixture
     `comptime_topology_index_local_write`; retain the imported early-unknown topology/spawn
@@ -369,15 +296,21 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     a false `if` arm and a nonmatching scalar `match` arm with unreachable outer writes.
   - [x] Add the direct enum-pattern regression `comptime_enum_match_outer_write`: enum matching
     remains fail-closed for values, but every viable arm is observed for escaping writes.
-  - [x] Add the enum local-only fail-closed fixture
-    `comptime_enum_match_local_write_unsupported`.
-  - [ ] Implement or fixture-back fail-closed bounded-loop recurrence.
-  - [ ] Add any missing direct/local-only control-flow fixtures and confirm parity.
+  - [x] Promote enum values to a live fail-closed refusal pending concrete enum semantics; the
+    local-only fixture `comptime_enum_match_local_write_unsupported` verifies that an enum-driven
+    match cannot make a write vanish.
+  - [x] Execute concrete finite integer ranges and definite-break `loop`s up to the shared loop
+    budget; unsupported/indeterminate recurrence remains fail-closed.
+  - [x] Add bounded-`for` and plain-`loop` outer-write failures, local-only passes, and recurrence
+    passes (`comptime_bounded_for_outer_write`, `comptime_bounded_for_local_write`,
+    `comptime_bounded_for_recurrence`, `comptime_loop_outer_write`,
+    `comptime_loop_local_write`, and `comptime_loop_break_recurrence`).
+  - [ ] Confirm normalized old/new parity for the control-flow fixtures.
 
 - [ ] **Calls and closures — complete only after acceptance**
 
-  - [x] Implement known direct calls with mutable-parameter provenance, recursion rejection, and
-    `MAX_CALL_DEPTH` enforcement.
+  - [x] Implement known direct calls with mutable-parameter provenance, bounded recursive frames,
+    and `MAX_CALL_DEPTH` enforcement.
   - [x] Carry named function values and known targets through locals, aggregates, members, indexes,
     and indirect-call syntax.
   - [x] Represent lowered `Closure_N` values as deferred generated targets with captured
@@ -398,7 +331,7 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [ ] Decide and test concrete semantics versus permanent rejection for each form.
   - [ ] Add fixtures and confirm normalized old/new parity.
 
-#### 3.3 Required acceptance shape for each owner
+##### 3.3 Required acceptance shape for each owner
 
 - [ ] First add a vulnerable direct-fold fixture and demonstrate that the pre-owner implementation
   silently folds it. Keep that demonstration in a separate preparatory commit or recorded test
@@ -418,21 +351,80 @@ to that gate, not evidence that it has passed.
 
 **Known transition gaps to preserve for the next session:**
 
-- Concrete environment scope restoration is now implemented for block declarations, including
-  tail expressions. It still needs shadowing/local-only fixture coverage before the control-flow
-  owner can be accepted.
+- Concrete environment scope restoration, bounded range recurrence, and definite-break loop
+  recurrence are implemented and their six new focused loop fixtures pass when built with LLVM.
+  They still require normalized-parity verification.
 - Lowered closure values now defer their generated body and carry target/environment facts into
   `Closure_N_call`. An unlowered `Expr::Closure` is explicitly unsupported without running its
-  body. Captured-place facts now preserve direct captured-scalar writes; the focused fixture still
-  needs execution and parity verification.
+  body. Captured-place facts now preserve direct captured-scalar writes, including through the
+  generated closure environment; the focused closure-write fixture passes.
 - Named function values and lowered closure values populate `ComptimeValueFacts::callable_targets`.
   The latter also stores target-specific environment facts, so direct/indirect calls can interpret
   each known target with its generated `_env` argument. Opaque calls only reject conservatively
   when existing captured-write facts name an outer binding.
-- The live comparator checks escaping writes only. It does not compare concrete value, support,
-  or flow, and there is no allow-list yet.
+- Topology children are now included in comptime-body discovery, and a write through a mutable
+  callee parameter preserves its caller's outer place origin. This makes direct calls in topology
+  indices and direct mutable-parameter calls reject correctly.
+- An outer function alias may not carry a resolved target into the shadow environment. Such a call
+  is therefore treated as opaque and conservatively records every mutable-reference argument as a
+  possible outer write. This makes the indirect alias and reborrow fixtures reject correctly
+  without requiring a second, alias-sensitive body-discovery pass.
+- Block interpretation now accumulates support status across every statement. An unsupported
+  earlier statement can no longer be hidden by a later supported tail expression.
+- The live comparator checks escaping writes first, then compares normalized concrete value,
+  support, and flow while retaining the legacy fold verdict. An unallowlisted mismatch emits a
+  transition warning rather than crashing or changing that verdict. Its only temporary allowance
+  is nested-return flow, pinned by an existing frontend fixture. A separate narrow refusal policy
+  also covers enum values, `SpawnOn`, `Transfer`, and inline MLIR.
 
-#### 3.4 Cut over only after parity
+#### Current hard stop: use the comparator to retire transition allowances
+
+The LLVM build is now available with:
+
+```bash
+PATH="/opt/homebrew/opt/llvm@22/bin:$PATH" \
+RUSTFLAGS="-Lnative=/opt/homebrew/opt/zstd/lib" \
+cargo test
+```
+
+**Immediate next sequence:**
+
+- [x] **Bounded recursive calls.** The shared interpreter now has the same bounded recursive-call
+  behavior the legacy evaluator currently has, with isolated recursive frames and the existing
+  depth limit still refusing evaluation at the limit. `comptime_recursive_quicksort` and the
+  countdown in `comptime_call_unsupported_body` now agree with legacy evaluation; the recursive
+  allowance is removed.
+- [x] **Depth-limit diagnostic ownership.** The shadow result carries call-depth exhaustion to
+  the fold boundary, which emits E8004 itself for `comptime_call_depth_limit`. During transition
+  it deduplicates an E8004 already emitted by legacy assertion checking.
+- [ ] **Nested-return flow.** Keep the shared interpreter's current flow as the intended
+  semantics: a `return` nested in an expression-valued `if` makes following statements
+  unreachable. Record the legacy evaluator's different behavior only as a transition allowance;
+  remove that allowance when the new interpreter owns the fold verdict.
+- [ ] **Owner acceptance.** Resume §3.2 with the remaining container semantics (aggregate fold
+  values, casts, ranges, and vectors), then calls/closures, control flow, and peripheral forms.
+  Check an owner only after its direct, unknown-path, and local-only fixtures have no
+  unallowlisted comparator result.
+- [ ] **Cut over.** Once every supported owner has parity and every unsupported owner has an
+  explicit permanent refusal policy, use the shared interpreter's value/support/flow verdict for
+  folding. Then delete the legacy fold evaluator and its name-based escaping-write scan in the
+  mechanical cleanup described in §3.4.
+
+The comparator is now implemented and exercised across the complete frontend pass corpus with no
+unallowlisted transition warnings. It normalizes statement-only blocks to “no value,” so a final
+statement value is not mistaken for a block result. The only current allowance is:
+
+1. The legacy evaluator flattens a `return` nested in an expression-valued `if` into a normal
+   expression value. The shared interpreter preserves the return flow and correctly leaves the
+   following write unreachable. This is pinned by
+   `comptime_return_unreachable_outer_write`.
+
+The next work is owner acceptance for the remaining container semantics, followed by
+calls/closures and control flow. Do not enable a blanket “shadow Unsupported refuses”: explicit
+live refusal remains limited to the four local-only `SpawnOn`, `Transfer`, inline-MLIR, and
+enum-match owners.
+
+##### 3.4 Cut over only after parity
 
 - [ ] Keep dual-run enabled until every owner above has completed its fixture set and the full
   imported corpus has no unallowlisted disagreement.
@@ -442,7 +434,7 @@ to that gate, not evidence that it has passed.
 - [ ] Remove transitional comparison code, obsolete state, and comments only after the cutover
   suite is green.
 
-### 4. Migration sequencing
+#### 4. Migration sequencing
 
 - [x] Add the three structural regressions: the direct topology-index write, an unknown base with
   an effectful index/operand, and a call with an earlier unknown plus a later effectful argument.
@@ -450,7 +442,7 @@ to that gate, not evidence that it has passed.
 - [ ] Keep each owner change independently reviewable and bisectable; do not combine unrelated
   owners merely to make a broad test suite pass.
 
-### 5. Regression and acceptance
+#### 5. Regression and acceptance
 
 - [x] Import and retain the existing provenance, aggregate, closure, reborrow, unknown-control-flow, and
   topology/spawn fixtures.
@@ -459,6 +451,9 @@ to that gate, not evidence that it has passed.
   interpreter semantics.
 - [x] Add early-unknown-child cases with a later outer-reference write for indexing, calls, and
   operators.
+- [x] Add `comptime_struct_field_precision`, a local-only aggregate regression where an unrelated
+  sibling retains `&mut outer`; it prevents a member selection from inheriting that sibling's
+  provenance.
 - [x] Add the early-unknown borrowed-place case
   `comptime_unknown_place_later_outer_write`.
 - [x] Add the early-unknown-child case for topology-bearing predicates:
@@ -471,16 +466,20 @@ to that gate, not evidence that it has passed.
   shared interpreter: adding a variant requires an explicit compiler-checked arm. Do not add a
   wildcard arm.
 - [ ] Run focused `comptime*.vx` pass/fail tests, `cargo test --lib`, and the applicable full
-  frontend regression suite. **Current blocker:** this workspace cannot build `vxc` because
-  `llvm-config` is absent from `PATH`; formatting and diff checks pass, but no Rust or frontend
-  test has run in this environment.
+  frontend regression suite. **Latest run:** with the LLVM/zstd environment above, formatting and
+  diff checks pass; `cargo test --lib` passes (562 passed, 1 ignored); and both frontend pass and
+  fail corpora pass. A direct sweep of the complete frontend pass corpus has no unallowlisted
+  comparator warnings. The full suite also
+  has environment-only failures from absent `coremltools` and sandbox-disallowed TCP binds, so it
+  is not the parity gate.
 
-### Completion criteria
+#### Completion criteria
 
 - [ ] No standalone static mutable-effect traversal can disagree with the evaluator about an
   expression's children.
 - [ ] A fold requires a concrete, supported result and no possible escaping write.
 - [ ] Direct topology and early-unknown-child writes cannot silently fold away. The live safety
-  comparator and focused fixtures are present; execution verification is blocked on LLVM.
+  comparator and focused fixtures are present; source execution verifies the covered direct and
+  bounded-loop cases, while the unresolved indirect-call cases remain listed above.
 - [ ] Intended folds and local-only provenance cases still pass.
 - [ ] This branch remains independently reviewable against `main`.

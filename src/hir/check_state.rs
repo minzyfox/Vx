@@ -120,10 +120,20 @@ impl ComptimeValueFacts {
 /// `concrete == None` means the expression was modelled but did not yield a constant. It says
 /// nothing about support or effects; those are independent parts of [`ComptimeEvalOutcome`] and
 /// [`ComptimeEvalContext`].
+/// Component values retained beside the legacy scalar/array [`Value`]. They let the transition
+/// interpreter model structs and partially-known arrays without assigning every field or element
+/// the union of its siblings' mutable-reference and callable facts.
+#[derive(Clone, PartialEq)]
+pub(crate) enum ComptimeAggregateValue {
+    Array(Vec<ComptimeEvalValue>),
+    Struct(HashMap<Symbol, ComptimeEvalValue>),
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct ComptimeEvalValue {
     pub concrete: Option<Value>,
     pub facts: ComptimeValueFacts,
+    pub aggregate: Option<ComptimeAggregateValue>,
 }
 
 impl ComptimeEvalValue {
@@ -131,6 +141,7 @@ impl ComptimeEvalValue {
         Self {
             concrete: Some(value),
             facts: ComptimeValueFacts::default(),
+            aggregate: None,
         }
     }
 
@@ -139,6 +150,33 @@ impl ComptimeEvalValue {
     pub(crate) fn merge_from(&mut self, other: &Self) {
         if self.concrete != other.concrete {
             self.concrete = None;
+        }
+        let aggregates_match = match (&mut self.aggregate, &other.aggregate) {
+            (
+                Some(ComptimeAggregateValue::Array(left)),
+                Some(ComptimeAggregateValue::Array(right)),
+            ) if left.len() == right.len() => {
+                for (left, right) in left.iter_mut().zip(right) {
+                    left.merge_from(right);
+                }
+                true
+            }
+            (
+                Some(ComptimeAggregateValue::Struct(left)),
+                Some(ComptimeAggregateValue::Struct(right)),
+            ) if left.len() == right.len()
+                && left.keys().all(|field| right.contains_key(field)) =>
+            {
+                for (field, left) in left {
+                    // The key-set equality above makes this lookup infallible.
+                    left.merge_from(right.get(field).expect("matching aggregate field"));
+                }
+                true
+            }
+            _ => false,
+        };
+        if !aggregates_match {
+            self.aggregate = None;
         }
         self.facts.merge_from(&other.facts);
     }
@@ -150,6 +188,28 @@ pub(crate) enum ComptimeEvalSupport {
     #[default]
     Supported,
     Unsupported,
+}
+
+/// Why an otherwise unsupported shadow interpretation is known to differ from the legacy
+/// evaluator. The transition comparator may allow only reasons explicitly backed by fixtures;
+/// every other unsupported result remains an unclassified disagreement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ComptimeEvalUnsupportedReason {
+    #[default]
+    None,
+    /// An owner without a recorded transition allowance.
+    Unclassified,
+}
+
+impl ComptimeEvalUnsupportedReason {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        use ComptimeEvalUnsupportedReason::*;
+        *self = match (*self, other) {
+            (None, reason) => reason,
+            (reason, None) => reason,
+            _ => Unclassified,
+        };
+    }
 }
 
 impl ComptimeEvalSupport {
@@ -185,7 +245,13 @@ pub(crate) enum ComptimeEvalFlow {
 pub(crate) struct ComptimeEvalOutcome {
     pub value: ComptimeEvalValue,
     pub support: ComptimeEvalSupport,
+    pub unsupported_reason: ComptimeEvalUnsupportedReason,
     pub flow: ComptimeEvalFlow,
+    /// A deliberately promoted fail-closed owner. During the transition, most unsupported
+    /// results remain observations so they can be compared with the legacy evaluator. This bit
+    /// is reserved for the small, fixture-backed set whose effect cannot disappear even when it
+    /// only touches comptime-local storage.
+    pub requires_refusal: bool,
 }
 
 impl ComptimeEvalOutcome {
@@ -203,6 +269,21 @@ impl ComptimeEvalOutcome {
     pub(crate) fn unsupported() -> Self {
         Self {
             support: ComptimeEvalSupport::Unsupported,
+            unsupported_reason: ComptimeEvalUnsupportedReason::Unclassified,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn mark_unsupported(&mut self) {
+        self.support = ComptimeEvalSupport::Unsupported;
+        self.unsupported_reason = ComptimeEvalUnsupportedReason::Unclassified;
+    }
+
+    pub(crate) fn refusal() -> Self {
+        Self {
+            support: ComptimeEvalSupport::Unsupported,
+            unsupported_reason: ComptimeEvalUnsupportedReason::Unclassified,
+            requires_refusal: true,
             ..Self::default()
         }
     }
@@ -212,6 +293,8 @@ impl ComptimeEvalOutcome {
     pub(crate) fn merge_from(&mut self, other: &Self) {
         self.value.merge_from(&other.value);
         self.support.merge_from(other.support);
+        self.unsupported_reason.merge_from(other.unsupported_reason);
+        self.requires_refusal |= other.requires_refusal;
         if self.flow != other.flow {
             self.flow = ComptimeEvalFlow::Indeterminate;
             self.value.concrete = None;
@@ -230,8 +313,8 @@ pub(crate) struct ComptimeEvalContext {
     outer_reference_bindings: HashSet<Symbol>,
     outer_callable_bindings: HashSet<Symbol>,
     local_scopes: Vec<HashMap<Symbol, ComptimeValueFacts>>,
-    analysis_call_stack: HashSet<Symbol>,
     analysis_call_depth: u32,
+    call_depth_exceeded: bool,
     escaping_writes: HashSet<Symbol>,
 }
 
@@ -246,8 +329,8 @@ impl ComptimeEvalContext {
             outer_reference_bindings,
             outer_callable_bindings,
             local_scopes: vec![HashMap::new()],
-            analysis_call_stack: HashSet::new(),
             analysis_call_depth: 0,
+            call_depth_exceeded: false,
             escaping_writes: HashSet::new(),
         }
     }
@@ -317,18 +400,27 @@ impl ComptimeEvalContext {
             .min_by(|left, right| left.as_ref().cmp(right.as_ref()))
     }
 
-    pub(crate) fn push_call(&mut self, target: Symbol) -> bool {
-        if self.analysis_call_depth >= MAX_CALL_DEPTH || !self.analysis_call_stack.insert(target) {
+    /// Enter one concrete call frame. Recursion is allowed: every frame owns a fresh value
+    /// environment and lexical fact scope, while the shared depth limit stops nontermination.
+    pub(crate) fn push_call(&mut self) -> bool {
+        if self.analysis_call_depth >= MAX_CALL_DEPTH {
+            self.call_depth_exceeded = true;
             return false;
         }
         self.analysis_call_depth += 1;
         true
     }
 
-    pub(crate) fn pop_call(&mut self, target: &Symbol) {
-        if self.analysis_call_stack.remove(target) {
-            self.analysis_call_depth = self.analysis_call_depth.saturating_sub(1);
-        }
+    pub(crate) fn call_depth(&self) -> u32 {
+        self.analysis_call_depth
+    }
+
+    pub(crate) fn call_depth_exceeded(&self) -> bool {
+        self.call_depth_exceeded
+    }
+
+    pub(crate) fn pop_call(&mut self) {
+        self.analysis_call_depth = self.analysis_call_depth.saturating_sub(1);
     }
 
     /// Merge an alternative branch into this one. Branch-local declarations must have been popped
@@ -348,9 +440,8 @@ impl ComptimeEvalContext {
         }
         self.escaping_writes
             .extend(branch.escaping_writes.iter().cloned());
-        self.analysis_call_stack
-            .retain(|target| branch.analysis_call_stack.contains(target));
-        self.analysis_call_depth = self.analysis_call_stack.len() as u32;
+        self.call_depth_exceeded |= branch.call_depth_exceeded;
+        debug_assert_eq!(self.analysis_call_depth, branch.analysis_call_depth);
     }
 }
 
@@ -422,24 +513,22 @@ mod comptime_eval_tests {
     }
 
     #[test]
-    fn call_guard_rejects_recursion_and_the_depth_limit() {
+    fn call_guard_allows_recursion_and_rejects_the_depth_limit() {
         let mut context = ComptimeEvalContext::default();
-        let first = symbol("first");
-        assert!(context.push_call(first.clone()));
-        assert!(!context.push_call(first.clone()));
-        context.pop_call(&first);
+        assert!(context.push_call());
+        assert!(context.push_call());
+        context.pop_call();
+        context.pop_call();
 
-        let targets = (0..MAX_CALL_DEPTH)
-            .map(|index| symbol(&format!("call_{index}")))
-            .collect::<Vec<_>>();
-        for target in &targets {
-            assert!(context.push_call(target.clone()));
+        for _ in 0..MAX_CALL_DEPTH {
+            assert!(context.push_call());
         }
-        assert!(!context.push_call(symbol("too_deep")));
-        for target in targets.iter().rev() {
-            context.pop_call(target);
+        assert!(!context.push_call());
+        assert!(context.call_depth_exceeded());
+        for _ in 0..MAX_CALL_DEPTH {
+            context.pop_call();
         }
-        assert!(context.push_call(symbol("again")));
+        assert!(context.push_call());
     }
 }
 
