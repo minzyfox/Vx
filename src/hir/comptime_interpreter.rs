@@ -634,14 +634,11 @@ impl<'graph> ComptimeInterpreter<'graph> {
         self.note_opaque_callable(&facts, &args);
         let mut targets = facts.callable_targets.iter();
         let Some(first_target) = targets.next() else {
-            // A callable that crossed the block boundary with no body cannot be discarded.
-            // Legacy evaluation can otherwise ignore its statement and fold a later tail, even
-            // though the closure may have effects unavailable at this boundary. The refusal is
-            // intentionally generic unless `note_opaque_callable` found a real outer write.
-            if facts.unknown_callable {
-                return self.refusal_after(args);
-            }
-            return self.unsupported_after(args);
+            // A bodyless direct call (for example FFI), an outer callable, or an otherwise
+            // unresolved callable cannot be discarded. Legacy evaluation can otherwise ignore
+            // its statement and fold a later tail. `note_opaque_callable` may already have
+            // found a concrete outer write; otherwise this remains a generic refusal.
+            return self.refusal_after(args);
         };
 
         let mut merged = self.clone();
@@ -1154,7 +1151,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Expr::MethodCall(call) => {
                 let mut children = vec![self.expr(&call.base)];
                 children.extend(call.args.iter().map(|arg| self.expr(arg)));
-                self.unsupported_after(children)
+                // Semantic checking normally rewrites a method call to the resolved function,
+                // extent access, or intrinsic form. A remaining raw method node has no
+                // transition-model semantics, but its eager receiver and arguments still count.
+                self.refusal_after(children)
             }
             Expr::BinaryOp(op) => {
                 let lhs = self.expr(&op.lhs);
@@ -1587,5 +1587,31 @@ mod parity_tests {
             assert!(observation.outcome.requires_refusal);
             assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
         }
+    }
+
+    #[test]
+    fn raw_method_call_refuses_before_a_foldable_tail() {
+        let span = Span::default();
+        let graph = TransferCostGraph::default();
+        let mut interpreter = ComptimeInterpreter::new(
+            HashMap::new(),
+            HashMap::new(),
+            &graph,
+            ComptimeEvalContext::default(),
+        );
+        let method = Expr::MethodCall(MethodCallExpr::new(
+            Box::new(Expr::Number(NumberExpr::new("1".into(), None, span))),
+            "unlowered".into(),
+            None,
+            vec![Expr::Number(NumberExpr::new("2".into(), None, span))],
+            span,
+        ));
+        let block = [Statement::ExprStmt(ExprStmtStmt::new(method, true, span))];
+        let tail = Expr::Number(NumberExpr::new("7".into(), None, span));
+
+        let observation = interpreter.observe_block(&block, Some(&tail));
+
+        assert!(observation.outcome.requires_refusal);
+        assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
     }
 }

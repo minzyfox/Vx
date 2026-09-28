@@ -346,6 +346,14 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Deliberately live-refuse an unlowered `Expr::Closure` without interpreting its deferred
     body. The unit regression `unlowered_closure_refuses_without_executing_its_deferred_body`
     pins the post-sema invariant and prevents a later tail from erasing a raw closure literal.
+  - [x] Deliberately live-refuse a raw `Expr::MethodCall` after traversing its receiver and
+    arguments. Semantic checking normally rewrites a resolved method to another owner; the unit
+    regression `raw_method_call_refuses_before_a_foldable_tail` pins this defensive boundary.
+  - [x] Live-refuse any callable without an available body, including an FFI declaration, after
+    traversing its arguments. `comptime_extern_call_local_unsupported` prevents an FFI call from
+    disappearing before a foldable tail; `comptime_unknown_extern_call_local_unsupported` keeps
+    the same policy under abstract control flow; `comptime_extern_call_outer_write` preserves a
+    mutable argument's named outer origin.
   - [x] Run the imported and focused call/closure fixtures and confirm normalized old/new parity.
 
 - [ ] **Peripheral forms — complete only after acceptance**
