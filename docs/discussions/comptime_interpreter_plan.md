@@ -95,13 +95,13 @@ A `comptime` block may be replaced by a constant only if all of the following ar
 
 1. Every operation on every concrete or potentially taken path has been interpreted by the shared
    comptime interpreter according to the rules below.
-2. The block reaches a normal completion or `return` with a concrete result that can be converted
+1. The block reaches a normal completion or `return` with a concrete result that can be converted
    to a source-level constant. A block with no result may disappear only after the same safety
    checks.
-3. The interpretation is supported: it did not reach an unmodelled expression, statement,
+1. The interpretation is supported: it did not reach an unmodelled expression, statement,
    operation, opaque operation whose behavior is required, recursion/loop limit, or other
    indeterminate execution.
-4. No executed or potentially executed operation writes a place whose provenance reaches a binding
+1. No executed or potentially executed operation writes a place whose provenance reaches a binding
    declared outside the block.
 
 The interpreter must keep these states distinct. In particular, an absent concrete value must
