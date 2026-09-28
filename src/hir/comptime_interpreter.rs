@@ -21,97 +21,15 @@ use crate::syntax::*;
 /// recursive evaluation onto one larger stack; recursive frames stay on that same thread.
 const COMPTIME_RECURSION_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// The comparison-friendly result of one shadow interpretation.
+/// The result of interpreting one `comptime` block.
 #[derive(Clone, PartialEq)]
 pub(crate) struct ComptimeObservation {
     pub outcome: ComptimeEvalOutcome,
     pub escaping_write: Option<Symbol>,
     pub call_depth_exceeded: bool,
-    has_tail: bool,
 }
 
-/// The dimensions that must agree before the unified interpreter can replace the legacy fold
-/// verdict. Escaping writes are deliberately outside this type: they are already a live safety
-/// comparator with their own diagnostic.
-#[derive(Clone, PartialEq)]
-pub(crate) struct ComptimeNormalizedObservation {
-    pub concrete: Option<Value>,
-    pub support: ComptimeEvalSupport,
-    pub flow: ComptimeEvalFlow,
-}
-
-/// A classified old/new result. The only temporary allowance is recursion, pinned by the
-/// quicksort and countdown fixtures; all other differences are transition bugs to investigate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ComptimeParity {
-    Agree,
-    AllowedLegacyNestedReturnFlow,
-    ValueMismatch,
-    SupportMismatch,
-    FlowMismatch,
-}
-
-impl ComptimeParity {
-    pub(crate) fn is_unallowlisted(self) -> bool {
-        !matches!(self, Self::Agree | Self::AllowedLegacyNestedReturnFlow)
-    }
-
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            Self::Agree => "agreement",
-            Self::AllowedLegacyNestedReturnFlow => {
-                "allow-listed nested-return control-flow difference"
-            }
-            Self::ValueMismatch => "concrete value mismatch",
-            Self::SupportMismatch => "support-status mismatch",
-            Self::FlowMismatch => "control-flow mismatch",
-        }
-    }
-}
-
-impl ComptimeObservation {
-    pub(crate) fn normalized(&self) -> ComptimeNormalizedObservation {
-        ComptimeNormalizedObservation {
-            // A statement-only comptime block has no replacement value. Its final statement may
-            // happen to evaluate to a constant, but that is not a block result and must not be
-            // compared with the legacy evaluator's deliberate no-value observation.
-            concrete: if !self.has_tail && self.outcome.flow == ComptimeEvalFlow::Normal {
-                None
-            } else {
-                self.outcome.value.concrete.clone()
-            },
-            support: self.outcome.support,
-            flow: self.outcome.flow,
-        }
-    }
-
-    pub(crate) fn compare_legacy(&self, legacy: &ComptimeNormalizedObservation) -> ComptimeParity {
-        let shadow = self.normalized();
-        if shadow == *legacy {
-            return ComptimeParity::Agree;
-        }
-        // The legacy evaluator represents a `return` nested inside an expression-valued `if` as
-        // that expression's value and then carries on. The unified interpreter preserves the
-        // real block flow, so the following write is unreachable. The focused
-        // `comptime_return_unreachable_outer_write` fixture pins this transition allowance.
-        if shadow.support == ComptimeEvalSupport::Supported
-            && legacy.support == ComptimeEvalSupport::Supported
-            && shadow.flow == ComptimeEvalFlow::Return
-            && legacy.flow == ComptimeEvalFlow::Normal
-        {
-            return ComptimeParity::AllowedLegacyNestedReturnFlow;
-        }
-        if shadow.flow != legacy.flow {
-            ComptimeParity::FlowMismatch
-        } else if shadow.concrete != legacy.concrete {
-            ComptimeParity::ValueMismatch
-        } else {
-            ComptimeParity::SupportMismatch
-        }
-    }
-}
-
-/// A comptime-only interpreter kept beside the legacy evaluator during migration.
+/// The owner-complete interpreter for a single `comptime` block.
 #[derive(Clone)]
 pub(crate) struct ComptimeInterpreter<'graph> {
     env: HashMap<Symbol, ComptimeEvalValue>,
@@ -148,7 +66,6 @@ impl<'graph> ComptimeInterpreter<'graph> {
             outcome,
             escaping_write: self.context.escaping_write().cloned(),
             call_depth_exceeded: self.context.call_depth_exceeded(),
-            has_tail: tail.is_some(),
         }
     }
 
@@ -1075,10 +992,11 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 // because the legacy evaluator happens to continue to a later tail.
                 self.refusal_after(values)
             }
-            Expr::StringLiteral(_)
-            | Expr::MemorySpace(_)
-            | Expr::SizeOf(_)
-            | Expr::MacroCall(_) => {
+            Expr::SizeOf(size) => comptime_sizeof_bytes(&size.target_ty)
+                .map(Value::Int)
+                .map(ComptimeEvalOutcome::known)
+                .unwrap_or_else(ComptimeEvalOutcome::refusal),
+            Expr::StringLiteral(_) | Expr::MemorySpace(_) | Expr::MacroCall(_) => {
                 // The transition value model cannot faithfully represent these forms.  A raw
                 // memory-space or macro node also violates an earlier lowering invariant, but
                 // must still be live if it reaches this defensive interpreter boundary.
@@ -1446,77 +1364,22 @@ impl<'graph> ComptimeInterpreter<'graph> {
     }
 }
 
-#[cfg(test)]
-mod parity_tests {
-    use super::*;
-
-    fn legacy(
-        concrete: Option<Value>,
-        support: ComptimeEvalSupport,
-        flow: ComptimeEvalFlow,
-    ) -> ComptimeNormalizedObservation {
-        ComptimeNormalizedObservation {
-            concrete,
-            support,
-            flow,
+/// The `sizeof<T>()` subset whose layout is available without the code generator's nominal-type
+/// registry. It deliberately uses the shared scalar layout table so comptime and lowering agree
+/// for every scalar width, including sub-byte scalar spellings that round up to one byte.
+fn comptime_sizeof_bytes(ty: &Type) -> Option<i64> {
+    match ty {
+        Type::Scalar(element) => {
+            crate::layout::scalar_size_align(element).map(|(size, _)| size as i64)
         }
+        Type::Pointer(..) | Type::Borrow { .. } | Type::Ref(..) => Some(8),
+        _ => None,
     }
+}
 
-    #[test]
-    fn statement_only_blocks_normalize_to_no_value() {
-        let observation = ComptimeObservation {
-            outcome: ComptimeEvalOutcome::known(Value::Int(7)),
-            escaping_write: None,
-            call_depth_exceeded: false,
-            has_tail: false,
-        };
-        assert_eq!(
-            observation.compare_legacy(&legacy(
-                None,
-                ComptimeEvalSupport::Supported,
-                ComptimeEvalFlow::Normal,
-            )),
-            ComptimeParity::Agree,
-        );
-    }
-
-    #[test]
-    fn nested_return_flow_difference_is_explicitly_allow_listed() {
-        let mut outcome = ComptimeEvalOutcome::known(Value::Int(1));
-        outcome.flow = ComptimeEvalFlow::Return;
-        let observation = ComptimeObservation {
-            outcome,
-            escaping_write: None,
-            call_depth_exceeded: false,
-            has_tail: true,
-        };
-        assert_eq!(
-            observation.compare_legacy(&legacy(
-                None,
-                ComptimeEvalSupport::Supported,
-                ComptimeEvalFlow::Normal,
-            )),
-            ComptimeParity::AllowedLegacyNestedReturnFlow,
-        );
-    }
-
-    #[test]
-    fn unallowlisted_value_difference_stays_visible() {
-        let observation = ComptimeObservation {
-            outcome: ComptimeEvalOutcome::known(Value::Int(7)),
-            escaping_write: None,
-            call_depth_exceeded: false,
-            has_tail: true,
-        };
-        assert_eq!(
-            observation.compare_legacy(&legacy(
-                Some(Value::Int(8)),
-                ComptimeEvalSupport::Supported,
-                ComptimeEvalFlow::Normal,
-            )),
-            ComptimeParity::ValueMismatch,
-        );
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn unlowered_closure_refuses_without_executing_its_deferred_body() {
@@ -1556,7 +1419,7 @@ mod parity_tests {
 
         assert!(observation.outcome.requires_refusal);
         assert_eq!(observation.escaping_write, None);
-        assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
+        assert_eq!(observation.outcome.value.concrete, Some(Value::Int(7)));
     }
 
     #[test]
@@ -1585,7 +1448,7 @@ mod parity_tests {
             let observation = interpreter.observe_block(&[statement], Some(&tail));
 
             assert!(observation.outcome.requires_refusal);
-            assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
+            assert_eq!(observation.outcome.value.concrete, Some(Value::Int(7)));
         }
     }
 
@@ -1612,6 +1475,6 @@ mod parity_tests {
         let observation = interpreter.observe_block(&block, Some(&tail));
 
         assert!(observation.outcome.requires_refusal);
-        assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
+        assert_eq!(observation.outcome.value.concrete, Some(Value::Int(7)));
     }
 }

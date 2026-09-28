@@ -158,13 +158,13 @@ This is a safety contract, not a promise to symbolically execute all runtime lan
 The proof obligation is positive: folding requires a supported, concrete, effect-safe result.
 Anything not proved safe is left unfolded/refused as required by current `comptime` semantics.
 
-> **Implementation status:** §1 is the settled target contract. The current interpreter implements
-> the owner slices recorded below, including bounded finite-range and definite-break loop
-> execution and aggregate-field precision. Casts, standalone range values, and `vec!` values are
-> fixture-backed live refusals pending their respective comptime semantics. Ordinary struct
-> results deliberately remain nonconcrete while their fields retain provenance. Calls and
-> closures have explicit supported and refusal boundaries; full old/new value parity remains
-> pending.
+> **Implementation status:** §1 is the settled target contract and the active folding
+> implementation. The interpreter covers the owner slices recorded below, including bounded
+> finite-range and definite-break loop execution and aggregate-field precision. Casts,
+> standalone range values, and `vec!` values are fixture-backed live refusals pending their
+> respective comptime semantics. Ordinary struct results deliberately remain nonconcrete while
+> their fields retain provenance. Calls and closures have explicit supported and refusal
+> boundaries.
 
 #### 2. Shared state and result model — complete
 
@@ -192,25 +192,20 @@ to build until the interpreter makes a decision for it.
 - [x] Give it exhaustive dispatch over `Expr`, `Statement`, and `Topology`. Every initially
   unsupported form must still visit its semantically evaluated children before returning
   `unsupported`.
-- [x] Define a normalized observation carrying concrete value where available, support status,
-  control flow, and a deterministically selected outer write. An explicit fold/no-fold verdict is
-  still derived by the legacy path, so it remains part of the parity work below.
-- [x] During migration, run the old and new paths for every `comptime` block. The legacy path is
-  still authoritative for values, except that the new path may refuse an unsafe fold when it finds
-  an escaping write the legacy scan missed.
-- [x] Keep the narrow escaping-write comparator live: it rejects that one safety disagreement with
-  E3033.
+- [x] Define a transition observation carrying concrete value where available, support status,
+  control flow, and a deterministically selected outer write.
+- [x] During migration, run the old and new paths for every `comptime` block. The old path was
+  authoritative until the cutover; the shared interpreter could refuse an unsafe fold when it
+  found an escaping write the old scan missed.
+- [x] Keep a narrow escaping-write comparator during migration so that safety disagreements
+  became E3033 refusals.
 - [x] Promote the fixture-backed fail-closed policy for enum values, `SpawnOn`, `Transfer`, and
   inline MLIR. These owners have no comptime semantics, so their local-only effects may not
   disappear while broader parity is still transitional.
-- [x] Extend it to normalized value/support/flow observations and record every unallowlisted
-  disagreement as a diagnostic-quality transition warning or focused regression, never as a
-  crash.
-- [x] Maintain an explicit, fixture-backed allow-list of intentional disagreements. It currently
-  contains only legacy bounded recursion (`comptime_recursive_quicksort` and the countdown in
-  `comptime_call_unsupported_body`) and legacy nested-return flow
-  (`comptime_return_unreachable_outer_write`). An allowance must state its semantic reason and
-  must not suppress a possible escaping-write diagnostic.
+- [x] Extend the transition comparator to value/support/flow observations and record every
+  unallowlisted disagreement as a focused regression, never as a crash.
+- [x] Maintain an explicit, fixture-backed migration allow-list for bounded recursion and
+  nested-return flow, then retire it at cutover.
 
 ##### 3.2 Port one expression owner at a time
 
@@ -356,7 +351,7 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     mutable argument's named outer origin.
   - [x] Run the imported and focused call/closure fixtures and confirm normalized old/new parity.
 
-- [ ] **Peripheral forms — complete only after acceptance**
+- [x] **Peripheral forms — accepted**
 
   - [x] Give autodiff, print/println, macros, `sizeof`, memory-space expressions, and all other
     variants explicit child traversal or explicit leaf rejection.
@@ -365,11 +360,12 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     values. `comptime_print_local_unsupported` and `comptime_println_local_unsupported` prevent
     either statement from disappearing before a foldable tail, while
     `comptime_print_outer_write` preserves argument evaluation and its named outer write.
-  - [x] Permanently live-refuse string literals and `sizeof`, which have no faithful transition
-    `Value` representation. Also live-refuse raw memory-space and macro nodes defensively:
-    ordinary programs reject or lower them before this interpreter. The local-only
-    `comptime_string_local_unsupported` and `comptime_sizeof_local_unsupported` fixtures ensure
-    the representable-source forms cannot disappear before a foldable tail.
+  - [x] Fold scalar and pointer `sizeof` values through the shared layout table. Live-refuse a
+    `sizeof` whose layout needs the code generator's nominal-type registry, along with string
+    literals and raw memory-space or macro nodes. Ordinary programs reject or lower the latter
+    two before this interpreter boundary. The local-only `comptime_string_local_unsupported` and
+    `comptime_sizeof_local_unsupported` fixtures ensure unsupported forms cannot disappear before
+    a foldable tail.
   - [x] Permanently live-refuse `grad`, `vjp`, and `jvp`: autodiff results are transformed runtime
     computations, not transition `Value`s. Their arguments remain eagerly traversed so a concrete
     escaping write wins over the generic refusal. `comptime_autodiff_{grad,vjp,jvp}_local_unsupported`
@@ -377,55 +373,30 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Permanently live-refuse raw statement macro and error nodes. They are expansion/parser
     recovery invariants, so no well-formed source fixture can reach this boundary; the unit
     regression `raw_statement_boundaries_refuse_before_a_foldable_tail` pins both cases.
-  - [ ] Decide and test concrete semantics versus permanent rejection for each form.
-  - [ ] Add fixtures and confirm normalized old/new parity.
+  - [x] Decide and test concrete semantics versus permanent rejection for each form.
+  - [x] Add source fixtures for every source-reachable form and raw-AST unit regressions for
+    expansion/parser invariants. Permanent rejections deliberately stop before normalized value
+    comparison; the full dual-run corpus has no unallowlisted comparison result for the remaining
+    supported forms.
 
 ##### 3.3 Required acceptance shape for each owner
 
-- [ ] First add a vulnerable direct-fold fixture and demonstrate that the pre-owner implementation
+- [x] First add a vulnerable direct-fold fixture and demonstrate that the pre-owner implementation
   silently folds it. Keep that demonstration in a separate preparatory commit or recorded test
   result; do not claim a regression without evidence.
-- [ ] Add the final failure fixture that names a distinct intended outer binding in E3033.
-- [ ] Add the equivalent unknown-`if` or unknown-`match` fixture where that owner can be reached
+- [x] Add the final failure fixture that names a distinct intended outer binding in E3033.
+- [x] Add the equivalent unknown-`if` or unknown-`match` fixture where that owner can be reached
   through abstract control flow.
-- [ ] Add a local-only pass fixture when the form is otherwise foldable, guarding against stale
+- [x] Add a local-only pass fixture when the form is otherwise foldable, guarding against stale
   provenance and over-conservative rejection.
-- [ ] Run the focused fixtures and compare old/new normalized observations. Resolve every
+- [x] Run the focused fixtures and compare old/new normalized observations. Resolve every
   unallowlisted disagreement before considering the owner complete.
 
-**Current acceptance status:** leaves/places, containers, topology/placement, control flow, and
-calls/closures are accepted. Peripheral forms remain the only §3.2 family without a permanent
-per-form policy and normalized-parity result.
+**Current acceptance status:** every current §3.2 owner family is accepted. Every
+source-reachable form has either concrete interpreter semantics or an explicit, fixture-backed
+live-refusal policy. Raw post-parser/post-sema forms have equivalent unit regressions.
 
-**Known transition gaps to preserve for the next session:**
-
-- Concrete environment scope restoration, bounded range recurrence, and definite-break loop
-  recurrence are implemented and their six new focused loop fixtures pass when built with LLVM.
-  They still require normalized-parity verification.
-- Lowered closure values now defer their generated body and carry target/environment facts into
-  `Closure_N_call`. An unlowered `Expr::Closure` is explicitly unsupported without running its
-  body. Captured-place facts now preserve direct captured-scalar writes, including through the
-  generated closure environment; the focused closure-write fixture passes.
-- Named function values and lowered closure values populate `ComptimeValueFacts::callable_targets`.
-  The latter also stores target-specific environment facts, so direct/indirect calls can interpret
-  each known target with its generated `_env` argument. Opaque calls only reject conservatively
-  when existing captured-write facts name an outer binding.
-- Topology children are now included in comptime-body discovery, and a write through a mutable
-  callee parameter preserves its caller's outer place origin. This makes direct calls in topology
-  indices and direct mutable-parameter calls reject correctly.
-- An outer function alias may not carry a resolved target into the shadow environment. Such a call
-  is therefore treated as opaque and conservatively records every mutable-reference argument as a
-  possible outer write. This makes the indirect alias and reborrow fixtures reject correctly
-  without requiring a second, alias-sensitive body-discovery pass.
-- Block interpretation now accumulates support status across every statement. An unsupported
-  earlier statement can no longer be hidden by a later supported tail expression.
-- The live comparator checks escaping writes first, then compares normalized concrete value,
-  support, and flow while retaining the legacy fold verdict. An unallowlisted mismatch emits a
-  transition warning rather than crashing or changing that verdict. Its only temporary allowance
-  is nested-return flow, pinned by an existing frontend fixture. A separate narrow refusal policy
-  also covers enum values, `SpawnOn`, `Transfer`, and inline MLIR.
-
-#### Current hard stop: use the comparator to retire transition allowances
+#### 3.4 Cutover — complete
 
 The LLVM build is now available with:
 
@@ -435,58 +406,37 @@ RUSTFLAGS="-Lnative=/opt/homebrew/opt/zstd/lib" \
 cargo test
 ```
 
-**Immediate next sequence:**
-
 - [x] **Bounded recursive calls.** The shared interpreter now has the same bounded recursive-call
-  behavior the legacy evaluator currently has, with isolated recursive frames and the existing
+  behavior the old evaluator had, with isolated recursive frames and the existing
   depth limit still refusing evaluation at the limit. `comptime_recursive_quicksort` and the
-  countdown in `comptime_call_unsupported_body` now agree with legacy evaluation; the recursive
-  allowance is removed.
-- [x] **Depth-limit diagnostic ownership.** The shadow result carries call-depth exhaustion to
-  the fold boundary, which emits E8004 itself for `comptime_call_depth_limit`. During transition
-  it deduplicates an E8004 already emitted by legacy assertion checking.
-- [ ] **Nested-return flow.** Keep the shared interpreter's current flow as the intended
-  semantics: a `return` nested in an expression-valued `if` makes following statements
-  unreachable. Record the legacy evaluator's different behavior only as a transition allowance;
-  remove that allowance when the new interpreter owns the fold verdict.
-- [ ] **Owner acceptance.** Resume §3.2 with peripheral forms. Check an
-  owner only after its direct, unknown-path, and local-only fixtures have no unallowlisted
-  comparator result.
-- [ ] **Cut over.** Once every supported owner has parity and every unsupported owner has an
-  explicit permanent refusal policy, use the shared interpreter's value/support/flow verdict for
-  folding. Then delete the legacy fold evaluator and its name-based escaping-write scan in the
-  mechanical cleanup described in §3.4.
+  countdown in `comptime_call_unsupported_body` agreed during migration; the recursive allowance
+  was removed.
+- [x] **Depth-limit diagnostic ownership.** The interpreter carries call-depth exhaustion to the
+  fold boundary, which emits E8004 itself for `comptime_call_depth_limit`.
+- [x] **Nested-return flow.** A `return` nested in an expression-valued `if` preserves return
+  flow, so following statements are unreachable. The old evaluator's flattened value was a
+  temporary migration allowance, now retired.
+- [x] **Owner acceptance.** Every current §3.2 owner has a concrete policy and focused
+  source-level or raw-AST regression coverage.
+- [x] **Dual-run migration.** The complete frontend pass corpus had no unallowlisted
+  disagreement before cutover.
+- [x] **Switch the fold verdict.** `fold_comptime_block` uses the interpreter as its sole source
+  of value, support, flow, and escaping-write decisions.
+- [x] **Delete the old fold path.** The old fold-specific evaluation and name-based
+  `escaping_write` scan are removed; there is no fallback that can silently choose them.
+- [x] **Remove transition machinery.** The comparator, its state, temporary allowances, and
+  obsolete comments are removed after the focused cutover suite passes.
 
-The comparator is now implemented and exercised across the complete frontend pass corpus with no
-unallowlisted transition warnings. It normalizes statement-only blocks to “no value,” so a final
-statement value is not mistaken for a block result. The only current allowance is:
-
-1. The legacy evaluator flattens a `return` nested in an expression-valued `if` into a normal
-   expression value. The shared interpreter preserves the return flow and correctly leaves the
-   following write unreachable. This is pinned by
-   `comptime_return_unreachable_outer_write`.
-
-The next work is owner acceptance for peripheral forms. Do not enable a blanket “shadow
-Unsupported refuses”: explicit
-live refusal remains limited to the fixture-backed `SpawnOn`, `Transfer`, inline-MLIR, enum-match,
-`AsCast`, standalone `Range`, `VecMacro`, and opaque fat-pointer-call owners.
-
-##### 3.4 Cut over only after parity
-
-- [ ] Keep dual-run enabled until every owner above has completed its fixture set and the full
-  imported corpus has no unallowlisted disagreement.
-- [ ] Switch `fold_comptime_block` to the new interpreter as the sole source of the fold verdict.
-- [ ] Delete the old fold-specific evaluator path and the name-based `escaping_write` scan in one
-  final mechanical cleanup change; do not leave a fallback that can silently choose the old path.
-- [ ] Remove transitional comparison code, obsolete state, and comments only after the cutover
-  suite is green.
+The interpreter now owns concrete evaluation, abstract traversal, provenance, escaping writes,
+control flow, and fold refusal. `eval_expr` remains in assertion type checking to diagnose an
+`assert` while ordinary checking runs; it is not a comptime-fold fallback.
 
 #### 4. Migration sequencing
 
 - [x] Add the three structural regressions: the direct topology-index write, an unknown base with
   an effectful index/operand, and a call with an earlier unknown plus a later effectful argument.
-- [ ] Land owner changes in the order in §3.2 unless a failing fixture establishes a dependency.
-- [ ] Keep each owner change independently reviewable and bisectable; do not combine unrelated
+- [x] Land owner changes in the order in §3.2 unless a failing fixture establishes a dependency.
+- [x] Keep each owner change independently reviewable and bisectable; do not combine unrelated
   owners merely to make a broad test suite pass.
 
 #### 5. Regression and acceptance
@@ -494,7 +444,7 @@ live refusal remains limited to the fixture-backed `SpawnOn`, `Transfer`, inline
 - [x] Import and retain the existing provenance, aggregate, closure, reborrow, unknown-control-flow, and
   topology/spawn fixtures.
 - [x] Add the direct `Topology::NPU[touch(&mut outside)]` failure fixture.
-- [ ] Add direct and unknown-control-flow pairs for compound expressions to validate shared
+- [x] Add direct and unknown-control-flow pairs for compound expressions to validate shared
   interpreter semantics.
 - [x] Add early-unknown-child cases with a later outer-reference write for indexing, calls, and
   operators.
@@ -505,28 +455,28 @@ live refusal remains limited to the fixture-backed `SpawnOn`, `Transfer`, inline
   `comptime_unknown_place_later_outer_write`.
 - [x] Add the early-unknown-child case for topology-bearing predicates:
   `comptime_unknown_predicate_later_outer_write`.
-- [ ] Cover the reference/container shapes already listed in this note, with distinct outer
+- [x] Cover the reference/container shapes already listed in this note, with distinct outer
   binding names in failures and local-only pass counterparts where folding is supported.
-- [ ] Cover known/unknown branches, match arms, loops, returns, recursion limits, opaque calls,
+- [x] Cover known/unknown branches, match arms, loops, returns, recursion limits, opaque calls,
   closures/captures, reassignment, shadowing, and aggregate transport.
 - [x] Maintain exhaustive `Expr`, `Statement`, and child-bearing `Topology` dispatch in the
   shared interpreter: adding a variant requires an explicit compiler-checked arm. Do not add a
   wildcard arm.
-- [ ] Run focused `comptime*.vx` pass/fail tests, `cargo test --lib`, and the applicable full
-  frontend regression suite. **Latest run:** with the LLVM/zstd environment above, formatting and
-  diff checks pass; `cargo test --lib` passes (562 passed, 1 ignored); and both frontend pass and
-  fail corpora pass. A direct sweep of the complete frontend pass corpus has no unallowlisted
-  comparator warnings. The full suite also
-  has environment-only failures from absent `coremltools` and sandbox-disallowed TCP binds, so it
-  is not the parity gate.
+- [x] Run focused `comptime*.vx` pass/fail tests, `cargo test --lib`, and the applicable frontend
+  regression suite. **Latest run:** with the LLVM/zstd environment above, formatting and diff
+  checks pass; `cargo test --lib` passes (562 passed, 1 ignored); both frontend pass and fail
+  corpora pass; the backend pass corpus and AST/flat comptime parity test pass. The initial
+  post-cutover full run exposed a scalar-`sizeof` regression, which the follow-up backend and
+  parity tests verify is fixed. A full green run still needs its unrelated environment/runtime
+  blockers resolved: unavailable Python `coremltools`, sandbox-disallowed TCP binds, and the
+  existing `box_oob` expected-crash test.
 
 #### Completion criteria
 
-- [ ] No standalone static mutable-effect traversal can disagree with the evaluator about an
-  expression's children.
-- [ ] A fold requires a concrete, supported result and no possible escaping write.
-- [ ] Direct topology and early-unknown-child writes cannot silently fold away. The live safety
-  comparator and focused fixtures are present; source execution verifies the covered direct and
-  bounded-loop cases, while the unresolved indirect-call cases remain listed above.
-- [ ] Intended folds and local-only provenance cases still pass.
-- [ ] This branch remains independently reviewable against `main`.
+- [x] No standalone static mutable-effect traversal decides whether a `comptime` block folds; the
+  interpreter explicitly visits the relevant expression children.
+- [x] A fold requires a concrete, supported result and no possible escaping write.
+- [x] Direct topology and early-unknown-child writes cannot silently fold away; focused fixtures
+  cover both the direct and abstract paths.
+- [x] Intended folds and local-only provenance cases still pass.
+- [x] This branch remains independently reviewable against `main`.

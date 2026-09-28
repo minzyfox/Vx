@@ -14,9 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 use super::super::*;
-use crate::hir::check_state::{ComptimeEvalFlow, ComptimeEvalSupport};
-use crate::hir::comptime_interpreter::{ComptimeNormalizedObservation, ComptimeParity};
-use crate::hir::stmt::EvalFlow;
+use crate::hir::check_state::ComptimeEvalFlow;
 use std::collections::HashMap;
 
 /// What running a `comptime` block produced.
@@ -28,14 +26,6 @@ enum ComptimeFold {
     /// It could not be run. Reported already, unless this is a closure body -- which is not
     /// asked to fold where it is written.
     Refused,
-}
-
-/// The legacy evaluator's result, normalized to the same value/support/flow dimensions as the
-/// shadow interpreter. `has_tail` distinguishes a no-value comptime statement from an
-/// expression whose value could not be computed; folding still follows the legacy verdict.
-struct LegacyComptimeObservation {
-    normalized: ComptimeNormalizedObservation,
-    has_tail: bool,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -62,58 +52,27 @@ impl<'a> TypeChecker<'a> {
         ret: Option<&Expr>,
         before: &HashMap<crate::symbol::Symbol, Value>,
     ) -> ComptimeFold {
-        // The new interpreter shadows the legacy path while expression-owner semantics are
-        // migrated. Its first live comparator is deliberately narrow: a possible escaping write
-        // is a safety property, so a new-path proof of one must prevent the legacy evaluator from
-        // folding the block away even before value-parity cutover.
-        let shadow = self.observe_comptime_block(stmts, ret, before);
-        // Anything it writes that outlives it would have to survive, and the block does not.
-        if let Some(name) = Self::escaping_write(stmts) {
-            self.report_comptime_block_failure(
-                &format!(
-                    "it writes to '{}', which is declared outside it -- the block disappears, \
-                     so the write would have to disappear with it",
-                    name
-                ),
-                &ret.map(|r| r.span()).unwrap_or_default(),
-            );
-            return ComptimeFold::Refused;
-        }
-        if let Some(name) = shadow.escaping_write {
-            self.report_comptime_block_failure(
-                &format!(
-                    "it writes to '{}', which is declared outside it -- the block disappears, \
-                     so the write would have to disappear with it",
-                    name
-                ),
-                &ret.map(|r| r.span()).unwrap_or_default(),
-            );
-            return ComptimeFold::Refused;
-        }
-        if shadow.call_depth_exceeded {
-            self.report_comptime_depth_exceeded(&ret.map(|r| r.span()).unwrap_or_default());
-            return ComptimeFold::Refused;
-        }
-        // These are the first fixture-backed transition policies promoted beyond observation.
-        // They name owners with no comptime semantics at all (enum values, transfer, placement,
-        // and inline MLIR), so even a local-only effect may not disappear with the block. Other
-        // unsupported shadow results remain on the legacy path until value/support/flow parity
-        // has an explicit allow-list.
-        if shadow.outcome.requires_refusal {
-            self.report_comptime_block_failure(
-                "it holds a statement the evaluator cannot run",
-                &ret.map(|r| r.span()).unwrap_or_default(),
-            );
-            return ComptimeFold::Refused;
-        }
-        let legacy = self.observe_legacy_comptime_block(stmts, ret, before);
-        let parity = shadow.compare_legacy(&legacy.normalized);
-        if parity.is_unallowlisted() {
-            self.report_comptime_parity_disagreement(parity);
-        }
-
+        let interpretation = self.observe_comptime_block(stmts, ret, before);
         let span = ret.map(|r| r.span()).unwrap_or_default();
-        if !legacy.normalized.support.is_supported() {
+
+        // Anything it writes that outlives it would have to survive, and the block does not.
+        if let Some(name) = interpretation.escaping_write {
+            self.report_comptime_block_failure(
+                &format!(
+                    "it writes to '{}', which is declared outside it -- the block disappears, \
+                     so the write would have to disappear with it",
+                    name
+                ),
+                &span,
+            );
+            return ComptimeFold::Refused;
+        }
+        if interpretation.call_depth_exceeded {
+            self.report_comptime_depth_exceeded(&span);
+            return ComptimeFold::Refused;
+        }
+        if interpretation.outcome.requires_refusal || !interpretation.outcome.support.is_supported()
+        {
             self.report_comptime_block_failure(
                 "it holds a statement the evaluator cannot run",
                 &span,
@@ -123,62 +82,20 @@ impl<'a> TypeChecker<'a> {
         // A `return` inside the block, where the block is a closure or function body, is
         // that body's value -- `|| comptime { ..; return x; }` is how the closure fixtures
         // are written. Answer with it, the same as a trailing expression.
-        if legacy.normalized.flow == ComptimeEvalFlow::Return {
-            return self.fold_value(legacy.normalized.concrete, &span);
+        if interpretation.outcome.flow == ComptimeEvalFlow::Return {
+            return self.fold_value(interpretation.outcome.value.concrete, &span);
         }
-        if !legacy.has_tail {
+        if interpretation.outcome.flow != ComptimeEvalFlow::Normal {
+            self.report_comptime_block_failure(
+                "its control flow does not complete normally",
+                &span,
+            );
+            return ComptimeFold::Refused;
+        }
+        if ret.is_none() {
             return ComptimeFold::NoValue;
         }
-        self.fold_value(legacy.normalized.concrete, &span)
-    }
-
-    fn observe_legacy_comptime_block(
-        &self,
-        stmts: &[Statement],
-        ret: Option<&Expr>,
-        before: &HashMap<crate::symbol::Symbol, Value>,
-    ) -> LegacyComptimeObservation {
-        let mut env = before.clone();
-        let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
-        let flow = self.eval_block(stmts, &mut env);
-        let supported = !self.consteval.unsupported_stmt.get();
-        self.consteval.unsupported_stmt.set(outer_unsupported);
-
-        let (flow, concrete) = if !supported {
-            (ComptimeEvalFlow::Normal, None)
-        } else {
-            match flow {
-                EvalFlow::Normal => (
-                    ComptimeEvalFlow::Normal,
-                    ret.and_then(|tail| self.eval_expr(tail, &env)),
-                ),
-                EvalFlow::Return(value) => (ComptimeEvalFlow::Return, value),
-                EvalFlow::Break => (ComptimeEvalFlow::Break, None),
-                EvalFlow::Continue => (ComptimeEvalFlow::Continue, None),
-            }
-        };
-        LegacyComptimeObservation {
-            normalized: ComptimeNormalizedObservation {
-                concrete,
-                support: if supported {
-                    ComptimeEvalSupport::Supported
-                } else {
-                    ComptimeEvalSupport::Unsupported
-                },
-                flow,
-            },
-            has_tail: ret.is_some(),
-        }
-    }
-
-    fn report_comptime_parity_disagreement(&mut self, parity: ComptimeParity) {
-        if self.speculating || self.consteval.closure_body_depth > 0 {
-            return;
-        }
-        self.errors.push_warning(format!(
-            "comptime interpreter transition disagreement: {}",
-            parity.description()
-        ));
+        self.fold_value(interpretation.outcome.value.concrete, &span)
     }
 
     fn report_comptime_depth_exceeded(&mut self, span: &Span) {
@@ -216,58 +133,6 @@ impl<'a> TypeChecker<'a> {
                 ComptimeFold::Refused
             }
         }
-    }
-
-    /// A name the block writes that was declared outside it.
-    ///
-    /// The block disappears, so anything it did has to disappear with it. Writing to a
-    /// variable that outlives the block is an effect that cannot: the write would simply
-    /// stop happening, which is how this turned a program that printed 4 into one that
-    /// printed 0.
-    fn escaping_write(stmts: &[Statement]) -> Option<crate::symbol::Symbol> {
-        fn walk(
-            stmts: &[Statement],
-            declared: &mut std::collections::HashSet<String>,
-            written: &mut Vec<crate::symbol::Symbol>,
-        ) {
-            for stmt in stmts {
-                match stmt {
-                    Statement::LetDecl(d) => {
-                        declared.insert(d.name.to_string());
-                    }
-                    Statement::Assign(a) => {
-                        if let Some(root) = TypeChecker::place_root(&a.lhs) {
-                            written.push(root.clone());
-                        }
-                    }
-                    Statement::CompoundAssign(c) => {
-                        if let Some(root) = TypeChecker::place_root(&c.lhs) {
-                            written.push(root.clone());
-                        }
-                    }
-                    Statement::ForLoop(f) => {
-                        declared.insert(f.iter.to_string());
-                        walk(&f.body, declared, written);
-                    }
-                    Statement::Loop(l) => walk(&l.body, declared, written),
-                    Statement::ExprStmt(e) => {
-                        if let Expr::If(i) = &e.expr {
-                            walk(&i.then_block, declared, written);
-                            if let Some(otherwise) = &i.else_block {
-                                walk(otherwise, declared, written);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut declared = std::collections::HashSet::new();
-        let mut written = Vec::new();
-        walk(stmts, &mut declared, &mut written);
-        written
-            .into_iter()
-            .find(|name| !declared.contains(name.as_ref()))
     }
 
     fn report_comptime_block_failure(&mut self, why: &str, span: &Span) {
