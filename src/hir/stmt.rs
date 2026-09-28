@@ -79,7 +79,7 @@ impl<'a> TypeChecker<'a> {
         let mut interpreter = ComptimeInterpreter::new(
             before.clone(),
             function_bodies,
-            &self.transfer_cost_graph,
+            self.transfer_cost_graph,
             ComptimeEvalContext::new(
                 outer_bindings,
                 outer_reference_bindings,
