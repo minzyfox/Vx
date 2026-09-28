@@ -240,9 +240,11 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     facts.reference_origins.insert(name.clone());
                 }
                 if self.context.outer_callable_binding(name) {
-                    // The closure's environment is outside the disappearing comptime block. Its
-                    // body is unavailable here, so invoking it may write anything it captured.
-                    facts.captured_writes.insert(name.clone());
+                    // A fat-pointer closure crossed the comptime boundary without the facts of
+                    // the environment it captured. Its body is unavailable, but the closure
+                    // variable is not itself storage the call may write. `callable_call` still
+                    // conservatively records known captured writes and mutable-reference
+                    // arguments; do not invent an escaping write named after this callable.
                     facts.unknown_callable = true;
                 }
                 if self.function_bodies.contains_key(name) {
@@ -386,7 +388,12 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 flow: ComptimeEvalFlow::Continue,
                 ..ComptimeEvalOutcome::default()
             },
-            Statement::MacroCall(_) | Statement::Error(_) => ComptimeEvalOutcome::unsupported(),
+            Statement::MacroCall(_) | Statement::Error(_) => {
+                // Both forms are supposed to have been eliminated before semantic checking. If
+                // either escapes that boundary, it cannot be silently skipped before a later
+                // foldable tail.
+                ComptimeEvalOutcome::refusal()
+            }
         }
     }
 
@@ -627,6 +634,13 @@ impl<'graph> ComptimeInterpreter<'graph> {
         self.note_opaque_callable(&facts, &args);
         let mut targets = facts.callable_targets.iter();
         let Some(first_target) = targets.next() else {
+            // A callable that crossed the block boundary with no body cannot be discarded.
+            // Legacy evaluation can otherwise ignore its statement and fold a later tail, even
+            // though the closure may have effects unavailable at this boundary. The refusal is
+            // intentionally generic unless `note_opaque_callable` found a real outer write.
+            if facts.unknown_callable {
+                return self.refusal_after(args);
+            }
             return self.unsupported_after(args);
         };
 
@@ -1067,7 +1081,12 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Expr::StringLiteral(_)
             | Expr::MemorySpace(_)
             | Expr::SizeOf(_)
-            | Expr::MacroCall(_) => ComptimeEvalOutcome::unsupported(),
+            | Expr::MacroCall(_) => {
+                // The transition value model cannot faithfully represent these forms.  A raw
+                // memory-space or macro node also violates an earlier lowering invariant, but
+                // must still be live if it reaches this defensive interpreter boundary.
+                ComptimeEvalOutcome::refusal()
+            }
             Expr::Transfer(transfer) => {
                 let value = self.expr(&transfer.expr);
                 self.refusal_after([value])
@@ -1087,8 +1106,16 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     }
                     _ => None,
                 };
+                let Some(concrete) = concrete else {
+                    // The transfer graph can answer reachability only for concrete topology
+                    // values. A runtime index must not be collapsed to the device kind and
+                    // silently make a predicate statement disappear before a later folded tail.
+                    // `refusal_after` still visits both operands, so an escaping write wins over
+                    // this generic refusal.
+                    return self.refusal_after([from, to]);
+                };
                 let mut outcome = self.unknown_after([from, to]);
-                outcome.value.concrete = concrete;
+                outcome.value.concrete = Some(concrete);
                 outcome
             }
             Expr::FunctionCall(call) => {
@@ -1237,6 +1264,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 );
                 let target: Symbol = format!("{}_call", init.name).into();
                 if !init.name.starts_with("Closure_") {
+                    // This abstract structure is deliberately not a concrete legacy `Value`:
+                    // its components are available for local member/provenance reasoning, but
+                    // an ordinary struct literal cannot itself replace a comptime block until
+                    // the fold-value representation can spell structs back into source.
                     outcome.value.aggregate = Some(ComptimeAggregateValue::Struct(
                         fields
                             .iter()
@@ -1288,7 +1319,9 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .iter()
                     .map(|arg| self.expr(arg))
                     .collect::<Vec<_>>();
-                self.unsupported_after(args)
+                // Differentiation produces a transformed runtime computation, not a value the
+                // transition model can represent. Eager operands still retain their effects.
+                self.refusal_after(args)
             }
             Expr::Vjp(vjp) => {
                 let mut children = vjp
@@ -1297,7 +1330,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .map(|arg| self.expr(arg))
                     .collect::<Vec<_>>();
                 children.push(self.expr(&vjp.cotangent));
-                self.unsupported_after(children)
+                self.refusal_after(children)
             }
             Expr::Jvp(jvp) => {
                 let mut children = jvp
@@ -1306,7 +1339,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .map(|arg| self.expr(arg))
                     .collect::<Vec<_>>();
                 children.push(self.expr(&jvp.tangent));
-                self.unsupported_after(children)
+                self.refusal_after(children)
             }
             Expr::SpawnOn(spawn) => {
                 let topology = self.topology(&spawn.top);
@@ -1319,12 +1352,18 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .iter()
                     .map(|element| self.expr(element))
                     .collect::<Vec<_>>();
-                self.unknown_after(elements)
+                // Checked source normally lowers `vec![..]` into allocation and `push` calls
+                // before this interpreter runs. Preserve the same fail-closed rule for a raw
+                // macro node too, so a changed lowering order cannot make an allocation-backed
+                // vector disappear with a comptime block.
+                self.refusal_after(elements)
             }
             // A closure body is deferred until invocation. Checked closures are normally lowered
-            // to a generated `Closure_N` struct before this point; an unlowered literal remains
-            // unsupported, but must not execute its body merely because it is being created.
-            Expr::Closure(_) => ComptimeEvalOutcome::unsupported(),
+            // to a generated `Closure_N` struct before this point. If an unlowered literal
+            // reaches this late boundary, it has no concrete callable/environment model, so it
+            // must refuse the fold rather than letting a later tail erase it. Deliberately do not
+            // interpret the body here: creation alone does not run a closure.
+            Expr::Closure(_) => ComptimeEvalOutcome::refusal(),
             Expr::AsCast(cast) => {
                 let value = self.expr(&cast.expr);
                 // The legacy value model has no target type, so using its `Int`/`Number`
@@ -1341,7 +1380,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .iter()
                     .map(|arg| self.expr(arg))
                     .collect::<Vec<_>>();
-                self.unsupported_after(args)
+                // Printing is an observable run-time effect. A comptime block disappears, so a
+                // local print cannot be left to the legacy evaluator to drop before folding a
+                // later tail; arguments are still evaluated first for escaping writes.
+                self.refusal_after(args)
             }
             Expr::Println(print) => {
                 let args = print
@@ -1349,7 +1391,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     .iter()
                     .map(|arg| self.expr(arg))
                     .collect::<Vec<_>>();
-                self.unsupported_after(args)
+                self.refusal_after(args)
             }
             Expr::InlineMlir(mlir) => {
                 let mut children = mlir
@@ -1371,8 +1413,9 @@ impl<'graph> ComptimeInterpreter<'graph> {
         match topology {
             Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
                 let index = self.expr(index);
+                let index_is_concrete = index.value.concrete.is_some();
                 let mut outcome = self.unknown_after([index]);
-                if outcome.support.is_supported() {
+                if index_is_concrete && outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
                 outcome
@@ -1381,8 +1424,11 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let base = self.topology(base);
                 let start = self.expr(start);
                 let end = self.expr(end);
+                let components_are_concrete = base.value.concrete.is_some()
+                    && start.value.concrete.is_some()
+                    && end.value.concrete.is_some();
                 let mut outcome = self.unknown_after([base, start, end]);
-                if outcome.support.is_supported() {
+                if components_are_concrete && outcome.support.is_supported() {
                     outcome.value.concrete = Some(Value::Topology(topology.clone()));
                 }
                 outcome
@@ -1470,5 +1516,76 @@ mod parity_tests {
             )),
             ComptimeParity::ValueMismatch,
         );
+    }
+
+    #[test]
+    fn unlowered_closure_refuses_without_executing_its_deferred_body() {
+        let span = Span::default();
+        let outside: Symbol = "outside".into();
+        let graph = TransferCostGraph::default();
+        let mut interpreter = ComptimeInterpreter::new(
+            HashMap::new(),
+            HashMap::new(),
+            &graph,
+            ComptimeEvalContext::new(
+                std::collections::HashSet::from([outside.clone()]),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            ),
+        );
+        let body = Expr::ComptimeBlock(ComptimeBlockExpr::new(
+            vec![Statement::Assign(AssignStmt::new(
+                Expr::Identifier(IdentifierExpr::new(outside, span)),
+                Expr::Number(NumberExpr::new("9".into(), None, span)),
+                span,
+            ))],
+            None,
+            span,
+        ));
+        let closure = Expr::Closure(ClosureExpr::new(vec![], Box::new(body), span));
+        let block = [Statement::LetDecl(LetDeclStmt::new(
+            "callback".into(),
+            false,
+            None,
+            closure,
+            span,
+        ))];
+        let tail = Expr::Number(NumberExpr::new("7".into(), None, span));
+
+        let observation = interpreter.observe_block(&block, Some(&tail));
+
+        assert!(observation.outcome.requires_refusal);
+        assert_eq!(observation.escaping_write, None);
+        assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
+    }
+
+    #[test]
+    fn raw_statement_boundaries_refuse_before_a_foldable_tail() {
+        let span = Span::default();
+        let graph = TransferCostGraph::default();
+        let tail = Expr::Number(NumberExpr::new("7".into(), None, span));
+        let statements = [
+            Statement::MacroCall(MacroCallStmt::new(
+                "unexpanded".into(),
+                TokenTree::Group(vec![]),
+                None,
+                true,
+                span,
+            )),
+            Statement::Error(span),
+        ];
+
+        for statement in statements {
+            let mut interpreter = ComptimeInterpreter::new(
+                HashMap::new(),
+                HashMap::new(),
+                &graph,
+                ComptimeEvalContext::default(),
+            );
+            let observation = interpreter.observe_block(&[statement], Some(&tail));
+
+            assert!(observation.outcome.requires_refusal);
+            assert_eq!(observation.normalized().concrete, Some(Value::Int(7)));
+        }
     }
 }

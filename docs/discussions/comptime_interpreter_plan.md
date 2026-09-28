@@ -160,9 +160,11 @@ Anything not proved safe is left unfolded/refused as required by current `compti
 
 > **Implementation status:** §1 is the settled target contract. The current interpreter implements
 > the owner slices recorded below, including bounded finite-range and definite-break loop
-> execution and aggregate-field precision. Casts and standalone range values are fixture-backed
-> live refusals pending typed comptime values. Full callable/closure semantics, aggregate values
-> as fold results, and full old/new value parity remain pending.
+> execution and aggregate-field precision. Casts, standalone range values, and `vec!` values are
+> fixture-backed live refusals pending their respective comptime semantics. Ordinary struct
+> results deliberately remain nonconcrete while their fields retain provenance. Calls and
+> closures have explicit supported and refusal boundaries; full old/new value parity remains
+> pending.
 
 #### 2. Shared state and result model — complete
 
@@ -215,7 +217,7 @@ to build until the interpreter makes a decision for it.
 For every checked item, use a small reviewable change with the acceptance rule below. Do not move
 to a later family while its direct and unknown-path fixtures disagree with the required behavior.
 
-- [ ] **Leaves and places — complete only after acceptance**
+- [x] **Leaves and places — accepted**
 
   - [x] Implement source-order traversal and provenance for identifiers, literals, borrows,
     dereferences, member/index access, assignments, and compound assignments.
@@ -228,9 +230,9 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     `comptime_value_call_deref_outer_write`, the unknown-path reborrow failure
     `comptime_unknown_reborrow_outer_write`, and the local-only reassignment/shadowing pass case
     `comptime_scoped_reference_provenance`.
-  - [ ] Run those fixtures and confirm normalized old/new parity.
+  - [x] Run those fixtures and confirm normalized old/new parity.
 
-- [ ] **Pure operators and containers (non-topology) — complete only after acceptance**
+- [x] **Pure operators and containers (non-topology) — accepted**
 
   - [x] Implement structural traversal for unary/binary/relational/logical operators, casts,
     ranges, arrays, vectors, struct literals, and enum payloads.
@@ -251,27 +253,35 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     `comptime_unknown_range_outer_write` covers the unknown-path first bound, and
     `comptime_range_local_unsupported` proves a local range statement cannot vanish before a
     foldable tail.
-  - [ ] Implement or deliberately reject with focused fixtures aggregate *values* (as fold
-    results), vectors, and enums. Structs still have no concrete legacy `Value` representation,
-    so this completed provenance work is intentionally not a promise to fold a struct itself.
-  - [ ] Add direct/unknown/local-only fixtures and confirm normalized old/new parity for the
-    remaining container forms.
+  - [x] Promote `VecMacro` to a live refusal. Source `vec!` lowers to allocation and `push` calls,
+    so `comptime_vec_outer_write` and `comptime_unknown_vec_outer_write` verify that those
+    generated paths still observe element writes; `comptime_vec_local_unsupported` verifies that
+    a local vector cannot disappear before a foldable tail.
+  - [x] Deliberately retain ordinary struct results as nonconcrete: a struct can carry precise
+    local provenance but has no legacy `Value` or source-level folded spelling. The direct
+    `comptime_struct_result_outer_write`, unknown-path
+    `comptime_unknown_struct_result_outer_write`, and safe
+    `comptime_struct_result_unsupported` fixtures pin that result boundary. Enum values are
+    already a fixture-backed live refusal in control flow.
+  - [x] Run the complete container fixture set and confirm normalized old/new parity.
 
-- [ ] **Topology-bearing predicates — complete only after acceptance**
+- [x] **Topology-bearing predicates — accepted**
 
   - [x] Traverse every topology child and query concrete `TransferPredicate` reachability when
     both topologies are known.
-  - [ ] Model dynamic topology-index values precisely enough for predicate results, or retain a
-    tested fail-closed rule.
+  - [x] Retain a tested fail-closed rule for dynamic topology-index predicates. Both operands are
+    observed, but a runtime index cannot be collapsed to a concrete reachability answer;
+    `comptime_dynamic_predicate_local_unsupported` prevents that predicate statement from
+    disappearing before a foldable tail.
   - [x] Add the early-unknown predicate fixture
     `comptime_unknown_predicate_later_outer_write`: an unknown first topology index cannot hide a
     write in the later topology operand.
   - [x] Add the direct predicate failure fixture
     `comptime_predicate_later_outer_write`.
   - [x] Add the local-only predicate pass fixture `comptime_predicate_local_write`.
-  - [ ] Run fixtures and confirm normalized old/new parity.
+  - [x] Run fixtures and confirm normalized old/new parity.
 
-- [ ] **Topology and placement owners — complete only after acceptance**
+- [x] **Topology and placement owners — accepted**
 
   - [x] Traverse `Topology` (NPU/GPU/AccCore and nested `Slice` indices), `Transfer`, `SpawnOn`,
     and `InlineMlir`; record MLIR clobber-place writes.
@@ -292,9 +302,9 @@ to a later family while its direct and unknown-path fixtures disagree with the r
   - [x] Add the local-only topology-index pass fixture
     `comptime_topology_index_local_write`; retain the imported early-unknown topology/spawn
     failures.
-  - [ ] Confirm normalized old/new parity for the placement fixtures.
+  - [x] Confirm normalized old/new parity for the placement fixtures.
 
-- [ ] **Blocks and control flow — complete only after acceptance**
+- [x] **Blocks and control flow — accepted**
 
   - [x] Implement lexical concrete-environment restoration for blocks and tail expressions.
   - [x] Implement known/unknown `if`, known-scalar/abstract `match`, and abstract `for`/`loop`
@@ -315,9 +325,9 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     passes (`comptime_bounded_for_outer_write`, `comptime_bounded_for_local_write`,
     `comptime_bounded_for_recurrence`, `comptime_loop_outer_write`,
     `comptime_loop_local_write`, and `comptime_loop_break_recurrence`).
-  - [ ] Confirm normalized old/new parity for the control-flow fixtures.
+  - [x] Confirm normalized old/new parity for the control-flow fixtures.
 
-- [ ] **Calls and closures — complete only after acceptance**
+- [x] **Calls and closures — accepted**
 
   - [x] Implement known direct calls with mutable-parameter provenance, bounded recursive frames,
     and `MAX_CALL_DEPTH` enforcement.
@@ -329,15 +339,36 @@ to a later family while its direct and unknown-path fixtures disagree with the r
     aggregate-callback, and closure fixtures.
   - [x] Write the local-only closure-capture pass fixture
     `comptime_closure_local_capture_write`.
-  - [ ] Model unlowered `Expr::Closure`, remaining closure/capture shapes, and opaque-call behavior
-    with focused local-only cases.
-  - [ ] Run the call/closure fixtures and confirm normalized old/new parity.
+  - [x] Live-refuse an opaque fat-pointer closure without inventing a write to its callback
+    variable. `comptime_opaque_closure_local_unsupported` pins the local-only boundary; known
+    captured writes and mutable-reference arguments remain the only opaque-call sources of a
+    named E3033 diagnostic, including `comptime_opaque_closure_outer_write`.
+  - [x] Deliberately live-refuse an unlowered `Expr::Closure` without interpreting its deferred
+    body. The unit regression `unlowered_closure_refuses_without_executing_its_deferred_body`
+    pins the post-sema invariant and prevents a later tail from erasing a raw closure literal.
+  - [x] Run the imported and focused call/closure fixtures and confirm normalized old/new parity.
 
 - [ ] **Peripheral forms — complete only after acceptance**
 
   - [x] Give autodiff, print/println, macros, `sizeof`, memory-space expressions, and all other
     variants explicit child traversal or explicit leaf rejection.
   - [x] Keep every peripheral form fail-closed pending concrete semantics.
+  - [x] Permanently live-refuse `print` and `println`: they are observable output, not comptime
+    values. `comptime_print_local_unsupported` and `comptime_println_local_unsupported` prevent
+    either statement from disappearing before a foldable tail, while
+    `comptime_print_outer_write` preserves argument evaluation and its named outer write.
+  - [x] Permanently live-refuse string literals and `sizeof`, which have no faithful transition
+    `Value` representation. Also live-refuse raw memory-space and macro nodes defensively:
+    ordinary programs reject or lower them before this interpreter. The local-only
+    `comptime_string_local_unsupported` and `comptime_sizeof_local_unsupported` fixtures ensure
+    the representable-source forms cannot disappear before a foldable tail.
+  - [x] Permanently live-refuse `grad`, `vjp`, and `jvp`: autodiff results are transformed runtime
+    computations, not transition `Value`s. Their arguments remain eagerly traversed so a concrete
+    escaping write wins over the generic refusal. `comptime_autodiff_{grad,vjp,jvp}_local_unsupported`
+    cover every form; `comptime_autodiff_grad_outer_write` covers the retained argument effect.
+  - [x] Permanently live-refuse raw statement macro and error nodes. They are expansion/parser
+    recovery invariants, so no well-formed source fixture can reach this boundary; the unit
+    regression `raw_statement_boundaries_refuse_before_a_foldable_tail` pins both cases.
   - [ ] Decide and test concrete semantics versus permanent rejection for each form.
   - [ ] Add fixtures and confirm normalized old/new parity.
 
@@ -354,10 +385,9 @@ to a later family while its direct and unknown-path fixtures disagree with the r
 - [ ] Run the focused fixtures and compare old/new normalized observations. Resolve every
   unallowlisted disagreement before considering the owner complete.
 
-**Current acceptance status:** no §3.2 owner is checked off yet. The interpreter slices above are
-implementation milestones only; each family still needs its direct/unknown/local-only fixtures
-and normalized-parity result. The imported fixtures and the new structural regressions are input
-to that gate, not evidence that it has passed.
+**Current acceptance status:** leaves/places, containers, topology/placement, control flow, and
+calls/closures are accepted. Peripheral forms remain the only §3.2 family without a permanent
+per-form policy and normalized-parity result.
 
 **Known transition gaps to preserve for the next session:**
 
@@ -411,8 +441,7 @@ cargo test
   semantics: a `return` nested in an expression-valued `if` makes following statements
   unreachable. Record the legacy evaluator's different behavior only as a transition allowance;
   remove that allowance when the new interpreter owns the fold verdict.
-- [ ] **Owner acceptance.** Resume §3.2 with the remaining container semantics (aggregate fold
-  values and vectors), then calls/closures, control flow, and peripheral forms. Check an
+- [ ] **Owner acceptance.** Resume §3.2 with peripheral forms. Check an
   owner only after its direct, unknown-path, and local-only fixtures have no unallowlisted
   comparator result.
 - [ ] **Cut over.** Once every supported owner has parity and every unsupported owner has an
@@ -429,10 +458,10 @@ statement value is not mistaken for a block result. The only current allowance i
    following write unreachable. This is pinned by
    `comptime_return_unreachable_outer_write`.
 
-The next work is owner acceptance for the remaining container semantics, followed by
-calls/closures and control flow. Do not enable a blanket “shadow Unsupported refuses”: explicit
+The next work is owner acceptance for peripheral forms. Do not enable a blanket “shadow
+Unsupported refuses”: explicit
 live refusal remains limited to the fixture-backed `SpawnOn`, `Transfer`, inline-MLIR, enum-match,
-`AsCast`, and standalone `Range` owners.
+`AsCast`, standalone `Range`, `VecMacro`, and opaque fat-pointer-call owners.
 
 ##### 3.4 Cut over only after parity
 
