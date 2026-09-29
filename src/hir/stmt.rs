@@ -16,7 +16,9 @@ use super::*;
 
 use crate::hir;
 use crate::hir::check_state::ComptimeEvalContext;
-use crate::hir::comptime_interpreter::{ComptimeInterpreter, ComptimeObservation};
+use crate::hir::comptime_interpreter::{
+    ComptimeFunctionBodies, ComptimeInterpreter, ComptimeObservation,
+};
 use crate::syntax;
 
 /// What running a statement did to the block it sits in.
@@ -62,24 +64,19 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
-        let mut function_bodies = self.env.comptime_bodies.clone();
-        function_bodies.extend(
-            self.env
-                .syntax_functions
-                .iter()
-                .filter(|(_, function)| !function.body.is_empty())
-                .map(|(name, function)| (name.clone(), (**function).clone())),
+        // The interpreter mutates its value environment, but function bodies are immutable.
+        // Borrow the three existing registries instead of rebuilding and cloning their complete
+        // union for every comptime block (and for every speculative branch it explores).
+        let function_bodies = ComptimeFunctionBodies::new(
+            &self.env.comptime_bodies,
+            &self.env.syntax_functions,
+            &self.mono.functions,
         );
-        for (function, _) in &self.mono.functions {
-            function_bodies
-                .entry(function.name.clone())
-                .or_insert_with(|| function.clone());
-        }
-
         let mut interpreter = ComptimeInterpreter::new(
-            before.clone(),
+            before,
             function_bodies,
             self.transfer_cost_graph,
+            self.active_topology.clone(),
             ComptimeEvalContext::new(
                 outer_bindings,
                 outer_reference_bindings,
@@ -1274,8 +1271,22 @@ impl<'a> TypeChecker<'a> {
             // `Reachable<A, B>`: true iff a transfer path exists in the cost graph. Topology
             // variables have already been substituted during monomorphization.
             Expr::TransferPredicate(e) => {
-                let mfrom = self.transfer_cost_graph.default_memory_for(&e.from);
-                let mto = self.transfer_cost_graph.default_memory_for(&e.to);
+                // `Current` is concrete at this checking site. Passing the surface spelling on
+                // to the graph is a compiler bug: the graph deliberately requires a real
+                // device topology because a default memory for an unresolved `Current` would
+                // be meaningless.
+                let from = if matches!(e.from, Topology::Current) {
+                    &self.active_topology
+                } else {
+                    &e.from
+                };
+                let to = if matches!(e.to, Topology::Current) {
+                    &self.active_topology
+                } else {
+                    &e.to
+                };
+                let mfrom = self.transfer_cost_graph.default_memory_for(from);
+                let mto = self.transfer_cost_graph.default_memory_for(to);
                 Some(Value::Bool(
                     self.transfer_cost_graph
                         .transfer_path(&mfrom, &mto)

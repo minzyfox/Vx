@@ -29,29 +29,89 @@ pub(crate) struct ComptimeObservation {
     pub call_depth_exceeded: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ComptimeFunctionBodies<'bodies> {
+    comptime_bodies: &'bodies HashMap<Symbol, Function>,
+    syntax_functions: &'bodies HashMap<Symbol, &'bodies Function>,
+    mono_functions: &'bodies [(Function, u64)],
+}
+
+impl<'bodies> ComptimeFunctionBodies<'bodies> {
+    pub(crate) fn new(
+        comptime_bodies: &'bodies HashMap<Symbol, Function>,
+        syntax_functions: &'bodies HashMap<Symbol, &'bodies Function>,
+        mono_functions: &'bodies [(Function, u64)],
+    ) -> Self {
+        Self {
+            comptime_bodies,
+            syntax_functions,
+            mono_functions,
+        }
+    }
+
+    fn get(&self, name: &Symbol) -> Option<&Function> {
+        self.syntax_functions
+            .get(name)
+            .filter(|function| !function.body.is_empty())
+            .copied()
+            .or_else(|| self.comptime_bodies.get(name))
+            .or_else(|| {
+                self.mono_functions
+                    .iter()
+                    .find(|(function, _)| function.name == *name)
+                    .map(|(function, _)| function)
+            })
+    }
+
+    fn contains(&self, name: &Symbol) -> bool {
+        self.get(name).is_some()
+    }
+}
+
 /// The owner-complete interpreter for a single `comptime` block.
 #[derive(Clone)]
-pub(crate) struct ComptimeInterpreter<'graph> {
+pub(crate) struct ComptimeInterpreter<'graph, 'bodies> {
     env: HashMap<Symbol, ComptimeEvalValue>,
-    function_bodies: HashMap<Symbol, Function>,
+    function_bodies: ComptimeFunctionBodies<'bodies>,
     transfer_cost_graph: &'graph TransferCostGraph,
+    active_topology: Topology,
     context: ComptimeEvalContext,
 }
 
-impl<'graph> ComptimeInterpreter<'graph> {
+/// A directly modelled local place that can receive an interpreted write. Anything more complex
+/// is deliberately invalidated rather than leaving an older component value behind as certainty.
+enum ComptimeWritePlace {
+    Binding {
+        name: Symbol,
+        through_reference: bool,
+    },
+    ArrayElement {
+        base: Symbol,
+        index: Option<usize>,
+    },
+    StructField {
+        base: Symbol,
+        field: Symbol,
+    },
+    Unknown,
+}
+
+impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     pub(crate) fn new(
-        env: HashMap<Symbol, Value>,
-        function_bodies: HashMap<Symbol, Function>,
+        env: &HashMap<Symbol, Value>,
+        function_bodies: ComptimeFunctionBodies<'bodies>,
         transfer_cost_graph: &'graph TransferCostGraph,
+        active_topology: Topology,
         context: ComptimeEvalContext,
     ) -> Self {
         Self {
             env: env
-                .into_iter()
-                .map(|(name, value)| (name, ComptimeEvalValue::known(value)))
+                .iter()
+                .map(|(name, value)| (name.clone(), ComptimeEvalValue::known(value.clone())))
                 .collect(),
             function_bodies,
             transfer_cost_graph,
+            active_topology,
             context,
         }
     }
@@ -164,7 +224,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                     // arguments; do not invent an escaping write named after this callable.
                     facts.unknown_callable = true;
                 }
-                if self.function_bodies.contains_key(name) {
+                if self.function_bodies.contains(name) {
                     facts.callable_targets.insert(name.clone());
                 }
                 facts
@@ -223,20 +283,20 @@ impl<'graph> ComptimeInterpreter<'graph> {
     /// `let` in an `if`/`match` arm can leak a stale constant into the enclosing path.
     fn block_with_tail(&mut self, stmts: &[Statement], tail: Option<&Expr>) -> ComptimeEvalOutcome {
         let mut shadowed = HashMap::new();
-        for stmt in stmts {
-            if let Statement::LetDecl(decl) = stmt {
-                shadowed
-                    .entry(decl.name.clone())
-                    .or_insert_with(|| self.env.get(&decl.name).cloned());
-            }
-        }
-
         self.context.push_scope();
         let mut result = ComptimeEvalOutcome::unknown();
         let mut support = ComptimeEvalSupport::Supported;
         let mut unsupported_reason = ComptimeEvalUnsupportedReason::None;
         let mut requires_refusal = false;
         for stmt in stmts {
+            // A lexical binding starts only once execution reaches its declaration. Saving
+            // every declaration up front made an unreachable `let total = ...` undo a prior
+            // write to the enclosing `total` when the block exited after `break` or `return`.
+            if let Statement::LetDecl(decl) = stmt {
+                shadowed
+                    .entry(decl.name.clone())
+                    .or_insert_with(|| self.env.get(&decl.name).cloned());
+            }
             result = self.statement(stmt);
             support.merge_from(result.support);
             unsupported_reason.merge_from(result.unsupported_reason);
@@ -315,60 +375,232 @@ impl<'graph> ComptimeInterpreter<'graph> {
     }
 
     fn assign(&mut self, lhs: &Expr, rhs: &Expr) -> ComptimeEvalOutcome {
-        let left = self.expr(lhs);
+        let (left, place) = self.write_place(lhs);
         let right = self.expr(rhs);
-        if let Expr::Identifier(id) = lhs {
-            if self.context.is_outer_binding(&id.name) {
-                self.context.note_escaping_write([id.name.clone()]);
-            } else if let Some(captured_place) = self
-                .context
-                .binding_facts(&id.name)
-                .map(|binding| binding.captured_place_origins.clone())
-            {
-                self.context
-                    .note_escaping_write(captured_place.iter().cloned());
-                if captured_place.is_empty() {
-                    self.context.reassign(&id.name, right.value.facts.clone());
-                    self.env.insert(id.name.clone(), right.value.clone());
-                }
-            } else {
-                self.context.reassign(&id.name, right.value.facts.clone());
-                self.env.insert(id.name.clone(), right.value.clone());
-            }
-        } else {
-            self.context
-                .note_escaping_write(self.place_facts(lhs).reference_origins);
-        }
+        self.store_place(lhs, place, right.value.clone());
         self.unknown_after([left, right])
     }
 
     fn compound_assign(&mut self, lhs: &Expr, op: &BinaryOp, rhs: &Expr) -> ComptimeEvalOutcome {
-        let left = self.expr(lhs);
+        let (left, place) = self.write_place(lhs);
         let right = self.expr(rhs);
         let updated = self.binary(left.clone(), right.clone(), op);
-        if let Expr::Identifier(id) = lhs {
-            if self.context.is_outer_binding(&id.name) {
-                self.context.note_escaping_write([id.name.clone()]);
-            } else if let Some(captured_place) = self
-                .context
-                .binding_facts(&id.name)
-                .map(|binding| binding.captured_place_origins.clone())
-            {
-                self.context
-                    .note_escaping_write(captured_place.iter().cloned());
-                if captured_place.is_empty() {
-                    self.context.reassign(&id.name, updated.value.facts.clone());
-                    self.env.insert(id.name.clone(), updated.value.clone());
-                }
-            } else {
-                self.context.reassign(&id.name, updated.value.facts.clone());
-                self.env.insert(id.name.clone(), updated.value.clone());
-            }
-        } else {
-            self.context
-                .note_escaping_write(self.place_facts(lhs).reference_origins);
-        }
+        self.store_place(lhs, place, updated.value.clone());
         updated
+    }
+
+    /// Evaluate a writable place once, in source evaluation order, and retain the direct local
+    /// path needed to update it after the right-hand side has run.
+    fn write_place(&mut self, expr: &Expr) -> (ComptimeEvalOutcome, ComptimeWritePlace) {
+        match expr {
+            Expr::Identifier(id) => (
+                self.expr(expr),
+                ComptimeWritePlace::Binding {
+                    name: id.name.clone(),
+                    through_reference: false,
+                },
+            ),
+            Expr::Dereference(deref) => {
+                let outcome = self.expr(&deref.expr);
+                let place = if let Expr::Identifier(id) = &*deref.expr {
+                    ComptimeWritePlace::Binding {
+                        name: id.name.clone(),
+                        through_reference: true,
+                    }
+                } else {
+                    ComptimeWritePlace::Unknown
+                };
+                (outcome, place)
+            }
+            Expr::IndexAccess(access) => {
+                let base = self.expr(&access.base);
+                let index = self.expr(&access.index);
+                let place = if let Expr::Identifier(id) = &*access.base {
+                    let index = match index.value.concrete.as_ref() {
+                        Some(Value::Int(index)) if *index >= 0 => Some(*index as usize),
+                        _ => None,
+                    };
+                    ComptimeWritePlace::ArrayElement {
+                        base: id.name.clone(),
+                        index,
+                    }
+                } else {
+                    ComptimeWritePlace::Unknown
+                };
+                (self.index_access(base, index), place)
+            }
+            Expr::MemberAccess(access) => {
+                let base = self.expr(&access.base);
+                let place = if let Expr::Identifier(id) = &*access.base {
+                    ComptimeWritePlace::StructField {
+                        base: id.name.clone(),
+                        field: access.member.clone(),
+                    }
+                } else {
+                    ComptimeWritePlace::Unknown
+                };
+                (self.member_access(base, &access.member), place)
+            }
+            _ => (self.expr(expr), ComptimeWritePlace::Unknown),
+        }
+    }
+
+    fn store_place(&mut self, lhs: &Expr, place: ComptimeWritePlace, value: ComptimeEvalValue) {
+        match place {
+            ComptimeWritePlace::Binding {
+                name,
+                through_reference,
+            } => {
+                if through_reference {
+                    self.context
+                        .note_escaping_write(self.place_facts(lhs).reference_origins);
+                }
+                self.store_binding(name, value);
+            }
+            ComptimeWritePlace::ArrayElement { base, index } => {
+                self.context
+                    .note_escaping_write(self.place_facts(lhs).reference_origins);
+                let stored = self.update_local_value(&base, |stored| {
+                    let Some(index) = index else {
+                        return false;
+                    };
+                    if let Some(ComptimeAggregateValue::Array(items)) = &mut stored.aggregate {
+                        let Some(slot) = items.get_mut(index) else {
+                            return false;
+                        };
+                        *slot = value.clone();
+                        Self::refresh_aggregate(stored);
+                        return true;
+                    }
+                    let Some(Value::Array(items)) = &mut stored.concrete else {
+                        return false;
+                    };
+                    let Some(slot) = items.get_mut(index) else {
+                        return false;
+                    };
+                    let Some(concrete) = value.concrete.clone() else {
+                        return false;
+                    };
+                    *slot = concrete;
+                    true
+                });
+                if !stored {
+                    self.invalidate_binding(&base);
+                }
+            }
+            ComptimeWritePlace::StructField { base, field } => {
+                self.context
+                    .note_escaping_write(self.place_facts(lhs).reference_origins);
+                let stored = self.update_local_value(&base, |stored| {
+                    let Some(ComptimeAggregateValue::Struct(fields)) = &mut stored.aggregate else {
+                        return false;
+                    };
+                    let Some(slot) = fields.get_mut(&field) else {
+                        return false;
+                    };
+                    *slot = value;
+                    Self::refresh_aggregate(stored);
+                    true
+                });
+                if !stored {
+                    self.invalidate_binding(&base);
+                }
+            }
+            ComptimeWritePlace::Unknown => {
+                self.context
+                    .note_escaping_write(self.place_facts(lhs).reference_origins);
+            }
+        }
+    }
+
+    fn store_binding(&mut self, name: Symbol, value: ComptimeEvalValue) {
+        if self.context.is_outer_binding(&name) {
+            self.context.note_escaping_write([name]);
+            return;
+        }
+        let captured_place = self
+            .context
+            .binding_facts(&name)
+            .map(|binding| binding.captured_place_origins.clone())
+            .unwrap_or_default();
+        self.context
+            .note_escaping_write(captured_place.iter().cloned());
+        if captured_place.is_empty() {
+            self.context.reassign(&name, value.facts.clone());
+            self.env.insert(name, value);
+        }
+    }
+
+    /// Apply a component write to a local value. A caller cannot rely on a stale component when
+    /// the container was unknown or the write could not be represented, so that binding is
+    /// invalidated by the caller instead.
+    fn update_local_value(
+        &mut self,
+        name: &Symbol,
+        update: impl FnOnce(&mut ComptimeEvalValue) -> bool,
+    ) -> bool {
+        if self.context.is_outer_binding(name) {
+            self.context.note_escaping_write([name.clone()]);
+            return false;
+        }
+        let captured_place = self
+            .context
+            .binding_facts(name)
+            .map(|binding| binding.captured_place_origins.clone())
+            .unwrap_or_default();
+        self.context
+            .note_escaping_write(captured_place.iter().cloned());
+        if !captured_place.is_empty() {
+            return false;
+        }
+        let facts = {
+            let Some(value) = self.env.get_mut(name) else {
+                return false;
+            };
+            if !update(value) {
+                return false;
+            }
+            value.facts.clone()
+        };
+        self.context.reassign(name, facts);
+        true
+    }
+
+    fn invalidate_binding(&mut self, name: &Symbol) {
+        if !self.context.is_outer_binding(name) {
+            self.env.remove(name);
+            self.context.reassign(name, ComptimeValueFacts::default());
+        }
+    }
+
+    fn refresh_aggregate(value: &mut ComptimeEvalValue) {
+        match &value.aggregate {
+            Some(ComptimeAggregateValue::Array(items)) => {
+                value.concrete = items
+                    .iter()
+                    .map(|item| item.concrete.clone())
+                    .collect::<Option<Vec<_>>>()
+                    .map(Value::Array);
+                value.facts =
+                    items
+                        .iter()
+                        .fold(ComptimeValueFacts::default(), |mut facts, item| {
+                            facts.merge_from(&item.facts);
+                            facts
+                        });
+            }
+            Some(ComptimeAggregateValue::Struct(fields)) => {
+                value.concrete = None;
+                value.facts =
+                    fields
+                        .values()
+                        .fold(ComptimeValueFacts::default(), |mut facts, item| {
+                            facts.merge_from(&item.facts);
+                            facts
+                        });
+            }
+            None => {}
+        }
     }
 
     fn binary(
@@ -399,6 +631,52 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let mut outcome = self.unknown_after([lhs, rhs]);
         outcome.value.concrete = concrete;
         outcome
+    }
+
+    fn relational_value(lhs: &Value, rhs: &Value, op: &RelationalOp) -> Option<Value> {
+        let comparison = match (lhs, rhs) {
+            // Keep integer comparisons exact: routing large integers through `f64` changes the
+            // answer above 2^53.
+            (Value::Int(left), Value::Int(right)) => match op {
+                RelationalOp::Eq => left == right,
+                RelationalOp::NotEq => left != right,
+                RelationalOp::Lt => left < right,
+                RelationalOp::Gt => left > right,
+                RelationalOp::Le => left <= right,
+                RelationalOp::Ge => left >= right,
+            },
+            // Mixed and floating numeric comparisons use the same numeric rule as the legacy
+            // evaluator.
+            _ if lhs.as_f64().is_some() && rhs.as_f64().is_some() => {
+                let (left, right) = (lhs.as_f64()?, rhs.as_f64()?);
+                match op {
+                    RelationalOp::Eq => left == right,
+                    RelationalOp::NotEq => left != right,
+                    RelationalOp::Lt => left < right,
+                    RelationalOp::Gt => left > right,
+                    RelationalOp::Le => left <= right,
+                    RelationalOp::Ge => left >= right,
+                }
+            }
+            (Value::Bool(left), Value::Bool(right)) => match op {
+                RelationalOp::Eq => left == right,
+                RelationalOp::NotEq => left != right,
+                _ => return None,
+            },
+            (Value::Topology(left), Value::Topology(right)) => match op {
+                RelationalOp::Eq => {
+                    crate::arch::topology_dispatch_id(left)
+                        == crate::arch::topology_dispatch_id(right)
+                }
+                RelationalOp::NotEq => {
+                    crate::arch::topology_dispatch_id(left)
+                        != crate::arch::topology_dispatch_id(right)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Value::Bool(comparison))
     }
 
     fn array(&mut self, elements: Vec<ComptimeEvalOutcome>) -> ComptimeEvalOutcome {
@@ -475,15 +753,29 @@ impl<'graph> ComptimeInterpreter<'graph> {
         target: &Symbol,
         args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
+        self.known_function_call_with_writebacks(target, args, Vec::new())
+    }
+
+    fn known_function_call_with_writebacks(
+        &mut self,
+        target: &Symbol,
+        args: Vec<ComptimeEvalOutcome>,
+        writebacks: Vec<Option<Symbol>>,
+    ) -> ComptimeEvalOutcome {
         if self.context.call_depth() == 0 {
             let target = target.clone();
             let worker_args = args.clone();
+            let worker_writebacks = writebacks.clone();
             return std::thread::scope(|scope| {
                 let worker = std::thread::Builder::new()
                     .name("vx-comptime".into())
                     .stack_size(COMPTIME_RECURSION_STACK_SIZE)
                     .spawn_scoped(scope, move || {
-                        self.known_function_call_on_current_stack(&target, worker_args)
+                        self.known_function_call_on_current_stack(
+                            &target,
+                            worker_args,
+                            worker_writebacks,
+                        )
                     });
                 match worker {
                     Ok(worker) => worker
@@ -495,25 +787,28 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 }
             });
         }
-        self.known_function_call_on_current_stack(target, args)
+        self.known_function_call_on_current_stack(target, args, writebacks)
     }
 
     fn known_function_call_on_current_stack(
         &mut self,
         target: &Symbol,
         args: Vec<ComptimeEvalOutcome>,
+        writebacks: Vec<Option<Symbol>>,
     ) -> ComptimeEvalOutcome {
         let Some(function) = self.function_bodies.get(target).cloned() else {
             return self.unsupported_after(args);
         };
-        if function.params.len() != args.len() {
+        if function.params.len() != args.len()
+            || (!writebacks.is_empty() && writebacks.len() != args.len())
+        {
             return self.unsupported_after(args);
         }
         if !self.context.push_call() {
             return self.unsupported_after(args);
         }
 
-        let saved_env = std::mem::take(&mut self.env);
+        let mut saved_env = std::mem::take(&mut self.env);
         self.context.push_scope();
         for ((parameter, _), argument) in function.params.iter().zip(&args) {
             self.context
@@ -521,7 +816,28 @@ impl<'graph> ComptimeInterpreter<'graph> {
             self.env.insert(parameter.clone(), argument.value.clone());
         }
         let body = self.block(&function.body);
+        let caller_updates = function
+            .params
+            .iter()
+            .zip(writebacks.into_iter().chain(std::iter::repeat(None)))
+            .filter_map(|((parameter, _), caller)| {
+                caller.map(|caller| (caller, self.env.get(parameter).cloned()))
+            })
+            .collect::<Vec<_>>();
         self.context.pop_scope();
+        for (caller, value) in caller_updates {
+            match value {
+                Some(value) => {
+                    self.context.reassign(&caller, value.facts.clone());
+                    saved_env.insert(caller, value);
+                }
+                None => {
+                    self.context
+                        .reassign(&caller, ComptimeValueFacts::default());
+                    saved_env.remove(&caller);
+                }
+            }
+        }
         self.env = saved_env;
         self.context.pop_call();
 
@@ -530,7 +846,15 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 flow: ComptimeEvalFlow::Normal,
                 ..body
             },
-            ComptimeEvalFlow::Normal => ComptimeEvalOutcome::unknown(),
+            ComptimeEvalFlow::Normal => {
+                // A fall-through function has no call value, but every support/refusal fact from
+                // its body is still a property of evaluating the call. Dropping that state would
+                // let `fn log() { print(..) }` disappear before a later comptime tail folded.
+                let mut outcome = body;
+                outcome.value.concrete = None;
+                outcome.value.aggregate = None;
+                outcome
+            }
             _ => ComptimeEvalOutcome::unsupported(),
         };
         for argument in args {
@@ -603,10 +927,37 @@ impl<'graph> ComptimeInterpreter<'graph> {
     fn function_call(
         &mut self,
         call: &FunctionCallExpr,
-        args: Vec<ComptimeEvalOutcome>,
+        mut args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
-        if self.function_bodies.contains_key(&call.name) {
-            self.known_function_call(&call.name, args)
+        if self.function_bodies.contains(&call.name) {
+            let writebacks = call
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    Expr::Borrow(borrow) if borrow.is_mut => match &*borrow.expr {
+                        Expr::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // The borrow outcome deliberately has no scalar `Value`: `comptime { &mut x }`
+            // cannot replace itself with `x`. A known direct callee, however, needs the current
+            // pointee value in its private parameter frame so `*param = ...` can compute a
+            // write-back. Preserve the borrow's provenance and support state while supplying
+            // only that frame-local value.
+            for (argument, source) in args.iter_mut().zip(writebacks.iter()) {
+                let Some(source) = source.as_ref() else {
+                    continue;
+                };
+                let Some(value) = self.env.get(source) else {
+                    continue;
+                };
+                argument.value.concrete = value.concrete.clone();
+                argument.value.aggregate = value.aggregate.clone();
+                argument.value.facts.merge_from(&value.facts);
+            }
+            self.known_function_call_with_writebacks(&call.name, args, writebacks)
         } else {
             self.callable_call(self.identifier_facts(&call.name), args)
         }
@@ -752,15 +1103,56 @@ impl<'graph> ComptimeInterpreter<'graph> {
         }
     }
 
-    fn match_arm(
-        &mut self,
-        arm: &MatchArm,
-        scrutinee_facts: &ComptimeValueFacts,
-    ) -> ComptimeEvalOutcome {
+    fn pattern_binding_names(pattern: &Pattern, names: &mut Vec<Symbol>) {
+        match pattern {
+            Pattern::Identifier(name) => names.push(name.clone()),
+            Pattern::EnumVariant(_, _, Some(payloads)) => {
+                for payload in payloads {
+                    Self::pattern_binding_names(payload, names);
+                }
+            }
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::EnumVariant(_, _, None) => {}
+        }
+    }
+
+    fn bind_pattern_value(&mut self, pattern: &Pattern, value: &ComptimeEvalValue) {
+        match pattern {
+            // A selected identifier arm binds the scrutinee itself. Retaining only its facts
+            // made `match 2 { value => value + 1 }` lose the concrete `2` before the arm ran.
+            Pattern::Identifier(name) => {
+                self.context.declare(name.clone(), value.facts.clone());
+                self.env.insert(name.clone(), value.clone());
+            }
+            // Enum payload components need their own concrete representation. Until that owner
+            // exists, keep the existing conservative provenance-only binding for them.
+            _ => self.bind_pattern_facts(pattern, &value.facts),
+        }
+    }
+
+    fn match_arm(&mut self, arm: &MatchArm, scrutinee: &ComptimeEvalValue) -> ComptimeEvalOutcome {
+        let mut names = Vec::new();
+        Self::pattern_binding_names(&arm.pattern, &mut names);
+        let shadowed = names
+            .into_iter()
+            .map(|name| {
+                let value = self.env.get(&name).cloned();
+                (name, value)
+            })
+            .collect::<HashMap<_, _>>();
         self.context.push_scope();
-        self.bind_pattern_facts(&arm.pattern, scrutinee_facts);
+        self.bind_pattern_value(&arm.pattern, scrutinee);
         let outcome = self.block(&arm.body);
         self.context.pop_scope();
+        for (name, value) in shadowed {
+            match value {
+                Some(value) => {
+                    self.env.insert(name, value);
+                }
+                None => {
+                    self.env.remove(&name);
+                }
+            }
+        }
         outcome
     }
 
@@ -800,12 +1192,12 @@ impl<'graph> ComptimeInterpreter<'graph> {
         let scrutinee_known = scrutinee.value.concrete.is_some();
         let scrutinee_support = scrutinee.support;
         let scrutinee_requires_refusal = scrutinee.requires_refusal;
-        let scrutinee_facts = scrutinee.value.facts;
+        let scrutinee_value = scrutinee.value.clone();
         let mut merged = self.clone();
-        let mut outcome = merged.match_arm(first, &scrutinee_facts);
+        let mut outcome = merged.match_arm(first, &scrutinee_value);
         for arm in rest {
             let mut branch = self.clone();
-            let branch_outcome = branch.match_arm(arm, &scrutinee_facts);
+            let branch_outcome = branch.match_arm(arm, &scrutinee_value);
             merged.context.merge_branch(&branch.context);
             merged.env = Self::merge_environments(merged.env, &branch.env);
             outcome.merge_from(&branch_outcome);
@@ -1083,17 +1475,12 @@ impl<'graph> ComptimeInterpreter<'graph> {
                 let lhs = self.expr(&op.lhs);
                 let rhs = self.expr(&op.rhs);
                 let mut outcome = self.unknown_after([lhs.clone(), rhs.clone()]);
-                outcome.value.concrete = match (&lhs.value.concrete, &rhs.value.concrete) {
-                    (Some(Value::Int(a)), Some(Value::Int(b))) => Some(Value::Bool(match &op.op {
-                        RelationalOp::Eq => a == b,
-                        RelationalOp::NotEq => a != b,
-                        RelationalOp::Lt => a < b,
-                        RelationalOp::Gt => a > b,
-                        RelationalOp::Le => a <= b,
-                        RelationalOp::Ge => a >= b,
-                    })),
-                    _ => None,
-                };
+                outcome.value.concrete = lhs
+                    .value
+                    .concrete
+                    .as_ref()
+                    .zip(rhs.value.concrete.as_ref())
+                    .and_then(|(lhs, rhs)| Self::relational_value(lhs, rhs, &op.op));
                 outcome
             }
             Expr::LogicalOp(op) => {
@@ -1162,6 +1549,10 @@ impl<'graph> ComptimeInterpreter<'graph> {
             Expr::Dereference(deref) => {
                 let inner = self.expr(&deref.expr);
                 let mut outcome = self.unknown_after([inner.clone()]);
+                // Direct calls install the pointee value in their parameter frame. A
+                // dereference is the boundary at which that private representation becomes an
+                // ordinary value again; a borrow expression itself remains non-foldable.
+                outcome.value.concrete = inner.value.concrete;
                 outcome.value.facts = inner.value.facts;
                 outcome.value.aggregate = inner.value.aggregate;
                 outcome
@@ -1193,7 +1584,7 @@ impl<'graph> ComptimeInterpreter<'graph> {
                             .collect(),
                     ));
                 }
-                if init.name.starts_with("Closure_") && self.function_bodies.contains_key(&target) {
+                if init.name.starts_with("Closure_") && self.function_bodies.contains(&target) {
                     let mut environment = ComptimeValueFacts::default();
                     for (_, field, place) in fields {
                         environment.merge_from(&field.value.facts);
@@ -1357,9 +1748,9 @@ impl<'graph> ComptimeInterpreter<'graph> {
             | Topology::CpuAvx512
             | Topology::CpuNeon
             | Topology::Custom(_) => ComptimeEvalOutcome::known(Value::Topology(topology.clone())),
-            // `Current` depends on the checker’s active topology; it has no constant spelling in
-            // this self-contained transition harness yet, but it is still a modelled unknown.
-            Topology::Current => ComptimeEvalOutcome::unknown(),
+            Topology::Current => {
+                ComptimeEvalOutcome::known(Value::Topology(self.active_topology.clone()))
+            }
         }
     }
 }
@@ -1386,10 +1777,15 @@ mod tests {
         let span = Span::default();
         let outside: Symbol = "outside".into();
         let graph = TransferCostGraph::default();
+        let env = HashMap::new();
+        let comptime_bodies = HashMap::new();
+        let syntax_functions: HashMap<Symbol, &Function> = HashMap::new();
+        let mono_functions: Vec<(Function, u64)> = Vec::new();
         let mut interpreter = ComptimeInterpreter::new(
-            HashMap::new(),
-            HashMap::new(),
+            &env,
+            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
             &graph,
+            Topology::CPU,
             ComptimeEvalContext::new(
                 std::collections::HashSet::from([outside.clone()]),
                 std::collections::HashSet::new(),
@@ -1426,6 +1822,10 @@ mod tests {
     fn raw_statement_boundaries_refuse_before_a_foldable_tail() {
         let span = Span::default();
         let graph = TransferCostGraph::default();
+        let env = HashMap::new();
+        let comptime_bodies = HashMap::new();
+        let syntax_functions: HashMap<Symbol, &Function> = HashMap::new();
+        let mono_functions: Vec<(Function, u64)> = Vec::new();
         let tail = Expr::Number(NumberExpr::new("7".into(), None, span));
         let statements = [
             Statement::MacroCall(MacroCallStmt::new(
@@ -1440,9 +1840,10 @@ mod tests {
 
         for statement in statements {
             let mut interpreter = ComptimeInterpreter::new(
-                HashMap::new(),
-                HashMap::new(),
+                &env,
+                ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
                 &graph,
+                Topology::CPU,
                 ComptimeEvalContext::default(),
             );
             let observation = interpreter.observe_block(&[statement], Some(&tail));
@@ -1456,10 +1857,15 @@ mod tests {
     fn raw_method_call_refuses_before_a_foldable_tail() {
         let span = Span::default();
         let graph = TransferCostGraph::default();
+        let env = HashMap::new();
+        let comptime_bodies = HashMap::new();
+        let syntax_functions: HashMap<Symbol, &Function> = HashMap::new();
+        let mono_functions: Vec<(Function, u64)> = Vec::new();
         let mut interpreter = ComptimeInterpreter::new(
-            HashMap::new(),
-            HashMap::new(),
+            &env,
+            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
             &graph,
+            Topology::CPU,
             ComptimeEvalContext::default(),
         );
         let method = Expr::MethodCall(MethodCallExpr::new(
