@@ -15,12 +15,24 @@ struct Holder {
   field : i32,
 }
 
+struct Nested {
+  field : i32,
+}
+
+struct Outer {
+  nested : Nested,
+}
+
 fn increment(value : &mut Tensor<i32, [1]>) -> void {
   value[0i32] = value[0i32] + 1i32;
 }
 
 fn increment_scalar(value : &mut i32) -> void {
   *value = *value + 1i32;
+}
+
+fn forward_increment(value : &mut i32) -> void {
+  increment_scalar(value);
 }
 
 fn main() -> i32 {
@@ -48,9 +60,41 @@ fn main() -> i32 {
     value
   };
 
-  return array_value + field_value + parameter_value + scalar_parameter_value;
+  let field_parameter_value = comptime {
+    let mut holder = Holder { field : 1i32 };
+    increment_scalar(&mut holder.field);
+    holder.field
+  };
+
+  let forwarded_parameter_value = comptime {
+    let mut value = 1i32;
+    forward_increment(&mut value);
+    value
+  };
+
+  let nested_field_value = comptime {
+    let mut outer = Outer { nested : Nested { field : 1i32 } };
+    outer.nested.field = 10i32;
+    outer.nested.field
+  };
+
+  let alias_value = comptime {
+    let mut value = 1i32;
+    let pointer = &mut value;
+    *pointer = 10i32;
+    *pointer
+  };
+
+  return array_value + field_value + parameter_value + scalar_parameter_value
+    + field_parameter_value + forwarded_parameter_value + nested_field_value + alias_value;
 }
 
 // CHECK-LABEL: func.func @main
-// CHECK-COUNT-2: arith.constant 10 : i32
-// CHECK-COUNT-2: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32

@@ -72,6 +72,13 @@ impl<'bodies> ComptimeFunctionBodies<'bodies> {
 #[derive(Clone)]
 pub(crate) struct ComptimeInterpreter<'graph, 'bodies> {
     env: HashMap<Symbol, ComptimeEvalValue>,
+    /// Local names whose values are mutable references, mapped to the place their next write
+    /// reaches. Function parameters use a binding in their private call frame; their caller
+    /// receives that frame's final value through the call write-back below.
+    reference_places: HashMap<Symbol, ComptimeWritePlace>,
+    /// Mutable references stored inside a local aggregate, keyed by the aggregate projection
+    /// which contains the reference (for example `holder.value`).
+    reference_projection_places: HashMap<ComptimeWritePlace, ComptimeWritePlace>,
     function_bodies: ComptimeFunctionBodies<'bodies>,
     transfer_cost_graph: &'graph TransferCostGraph,
     active_topology: Topology,
@@ -80,20 +87,20 @@ pub(crate) struct ComptimeInterpreter<'graph, 'bodies> {
 
 /// A directly modelled local place that can receive an interpreted write. Anything more complex
 /// is deliberately invalidated rather than leaving an older component value behind as certainty.
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum ComptimeWritePlace {
-    Binding {
-        name: Symbol,
-        through_reference: bool,
-    },
-    ArrayElement {
-        base: Symbol,
-        index: Option<usize>,
-    },
-    StructField {
-        base: Symbol,
-        field: Symbol,
+    Binding(Symbol),
+    Projection {
+        root: Symbol,
+        projections: Vec<ComptimePlaceProjection>,
     },
     Unknown,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ComptimePlaceProjection {
+    ArrayElement(usize),
+    StructField(Symbol),
 }
 
 impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
@@ -109,6 +116,8 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 .iter()
                 .map(|(name, value)| (name.clone(), ComptimeEvalValue::known(value.clone())))
                 .collect(),
+            reference_places: HashMap::new(),
+            reference_projection_places: HashMap::new(),
             function_bodies,
             transfer_cost_graph,
             active_topology,
@@ -293,9 +302,13 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             // every declaration up front made an unreachable `let total = ...` undo a prior
             // write to the enclosing `total` when the block exited after `break` or `return`.
             if let Statement::LetDecl(decl) = stmt {
-                shadowed
-                    .entry(decl.name.clone())
-                    .or_insert_with(|| self.env.get(&decl.name).cloned());
+                shadowed.entry(decl.name.clone()).or_insert_with(|| {
+                    (
+                        self.env.get(&decl.name).cloned(),
+                        self.reference_places.get(&decl.name).cloned(),
+                        self.projection_references_for_root(&decl.name),
+                    )
+                });
             }
             result = self.statement(stmt);
             support.merge_from(result.support);
@@ -317,15 +330,24 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         result.unsupported_reason.merge_from(unsupported_reason);
         result.requires_refusal |= requires_refusal;
         self.context.pop_scope();
-        for (name, value) in shadowed {
+        for (name, (value, reference_place, projection_references)) in shadowed {
             match value {
                 Some(value) => {
-                    self.env.insert(name, value);
+                    self.env.insert(name.clone(), value);
                 }
                 None => {
                     self.env.remove(&name);
                 }
             }
+            match reference_place {
+                Some(place) => {
+                    self.reference_places.insert(name.clone(), place);
+                }
+                None => {
+                    self.reference_places.remove(&name);
+                }
+            }
+            self.restore_projection_references_for_root(&name, projection_references);
         }
         result
     }
@@ -334,10 +356,25 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         match stmt {
             Statement::LetDecl(let_decl) => {
                 let outcome = self.expr(&let_decl.expr);
+                let reference_place = match &let_decl.expr {
+                    Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
+                    Expr::Identifier(id) => self
+                        .reference_places
+                        .get(&id.name)
+                        .cloned()
+                        .or_else(|| Some(ComptimeWritePlace::Binding(id.name.clone()))),
+                    _ => None,
+                };
                 self.context
                     .declare(let_decl.name.clone(), outcome.value.facts.clone());
                 self.env
                     .insert(let_decl.name.clone(), outcome.value.clone());
+                if let Some(place) = reference_place {
+                    self.reference_places.insert(let_decl.name.clone(), place);
+                } else {
+                    self.reference_places.remove(&let_decl.name);
+                }
+                self.record_aggregate_reference_places(&let_decl.name, &let_decl.expr);
                 outcome
             }
             Statement::Return(ret) => {
@@ -377,138 +414,365 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     fn assign(&mut self, lhs: &Expr, rhs: &Expr) -> ComptimeEvalOutcome {
         let (left, place) = self.write_place(lhs);
         let right = self.expr(rhs);
-        self.store_place(lhs, place, right.value.clone());
-        self.unknown_after([left, right])
+        let stored = self.store_place(lhs, place, right.value.clone());
+        self.update_reference_binding(lhs, rhs);
+        let mut outcome = self.unknown_after([left, right]);
+        if !stored {
+            outcome.mark_unsupported();
+        }
+        outcome
     }
 
     fn compound_assign(&mut self, lhs: &Expr, op: &BinaryOp, rhs: &Expr) -> ComptimeEvalOutcome {
         let (left, place) = self.write_place(lhs);
         let right = self.expr(rhs);
-        let updated = self.binary(left.clone(), right.clone(), op);
-        self.store_place(lhs, place, updated.value.clone());
+        let mut updated = self.binary(left.clone(), right.clone(), op);
+        if !self.store_place(lhs, place, updated.value.clone()) {
+            updated.mark_unsupported();
+        }
         updated
     }
 
     /// Evaluate a writable place once, in source evaluation order, and retain the direct local
     /// path needed to update it after the right-hand side has run.
     fn write_place(&mut self, expr: &Expr) -> (ComptimeEvalOutcome, ComptimeWritePlace) {
+        let outcome = self.expr(expr);
+        (outcome, self.direct_place(expr))
+    }
+
+    /// A concrete, local lvalue. A projection stays attached to its root so that a call can
+    /// write through `&mut holder.field`, a reborrowed parameter, or any depth of local
+    /// aggregate rather than being mistaken for an unrelated scalar binding.
+    fn direct_place(&self, expr: &Expr) -> ComptimeWritePlace {
         match expr {
-            Expr::Identifier(id) => (
-                self.expr(expr),
-                ComptimeWritePlace::Binding {
-                    name: id.name.clone(),
-                    through_reference: false,
-                },
-            ),
+            Expr::Identifier(id) => ComptimeWritePlace::Binding(id.name.clone()),
             Expr::Dereference(deref) => {
-                let outcome = self.expr(&deref.expr);
-                let place = if let Expr::Identifier(id) = &*deref.expr {
-                    ComptimeWritePlace::Binding {
-                        name: id.name.clone(),
-                        through_reference: true,
-                    }
+                if let Expr::Identifier(id) = &*deref.expr {
+                    self.reference_places
+                        .get(&id.name)
+                        .cloned()
+                        // An incoming mutable-reference parameter is represented by its local
+                        // binding until it is reborrowed. Keeping that binding lets the context
+                        // still report an outer write instead of degrading it to a generic
+                        // unsupported operation.
+                        .unwrap_or_else(|| ComptimeWritePlace::Binding(id.name.clone()))
                 } else {
                     ComptimeWritePlace::Unknown
-                };
-                (outcome, place)
+                }
             }
             Expr::IndexAccess(access) => {
-                let base = self.expr(&access.base);
-                let index = self.expr(&access.index);
-                let place = if let Expr::Identifier(id) = &*access.base {
-                    let index = match index.value.concrete.as_ref() {
-                        Some(Value::Int(index)) if *index >= 0 => Some(*index as usize),
-                        _ => None,
-                    };
-                    ComptimeWritePlace::ArrayElement {
-                        base: id.name.clone(),
-                        index,
-                    }
-                } else {
-                    ComptimeWritePlace::Unknown
+                let Some(index) = self.place_index(&access.index) else {
+                    return ComptimeWritePlace::Unknown;
                 };
-                (self.index_access(base, index), place)
+                Self::project_place(
+                    self.direct_place(&access.base),
+                    ComptimePlaceProjection::ArrayElement(index),
+                )
             }
-            Expr::MemberAccess(access) => {
-                let base = self.expr(&access.base);
-                let place = if let Expr::Identifier(id) = &*access.base {
-                    ComptimeWritePlace::StructField {
-                        base: id.name.clone(),
-                        field: access.member.clone(),
-                    }
-                } else {
-                    ComptimeWritePlace::Unknown
-                };
-                (self.member_access(base, &access.member), place)
-            }
-            _ => (self.expr(expr), ComptimeWritePlace::Unknown),
+            Expr::MemberAccess(access) => Self::project_place(
+                self.direct_place(&access.base),
+                ComptimePlaceProjection::StructField(access.member.clone()),
+            ),
+            _ => ComptimeWritePlace::Unknown,
         }
     }
 
-    fn store_place(&mut self, lhs: &Expr, place: ComptimeWritePlace, value: ComptimeEvalValue) {
+    fn place_index(&self, expr: &Expr) -> Option<usize> {
+        // The destination must be determined without replaying an effectful index expression:
+        // its ordinary evaluation already ran while evaluating the lvalue. Loop arithmetic such
+        // as `j + 1` is pure, however, and must retain the same concrete index as `j` itself.
+        if !Self::is_pure_index_expr(expr) {
+            return None;
+        }
+        let mut probe = self.clone();
+        let value = probe.expr(expr).value.concrete?;
+        match value {
+            Value::Int(index) if index >= 0 => Some(index as usize),
+            _ => None,
+        }
+    }
+
+    fn is_pure_index_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Number(_) | Expr::Identifier(_) => true,
+            Expr::BinaryOp(op) => {
+                Self::is_pure_index_expr(&op.lhs) && Self::is_pure_index_expr(&op.rhs)
+            }
+            Expr::UnaryOp(op) => Self::is_pure_index_expr(&op.expr),
+            _ => false,
+        }
+    }
+
+    fn project_place(
+        place: ComptimeWritePlace,
+        projection: ComptimePlaceProjection,
+    ) -> ComptimeWritePlace {
         match place {
-            ComptimeWritePlace::Binding {
-                name,
-                through_reference,
+            ComptimeWritePlace::Binding(root) => ComptimeWritePlace::Projection {
+                root,
+                projections: vec![projection],
+            },
+            ComptimeWritePlace::Projection {
+                root,
+                mut projections,
             } => {
-                if through_reference {
+                projections.push(projection);
+                ComptimeWritePlace::Projection { root, projections }
+            }
+            ComptimeWritePlace::Unknown => ComptimeWritePlace::Unknown,
+        }
+    }
+
+    /// `Some` means the argument is a mutable-reference argument. Its destination must be
+    /// exact: `Some(Unknown)` deliberately makes the enclosing call refuse to fold.
+    fn mutable_argument_place(&self, expr: &Expr) -> Option<ComptimeWritePlace> {
+        let direct = self.direct_place(expr);
+        if let Some(place) = self.reference_projection_places.get(&direct) {
+            return Some(place.clone());
+        }
+        match expr {
+            Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
+            Expr::Identifier(id) => self.reference_places.get(&id.name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn update_reference_binding(&mut self, lhs: &Expr, rhs: &Expr) {
+        let Expr::Identifier(lhs) = lhs else {
+            return;
+        };
+        let place = match rhs {
+            Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
+            Expr::Identifier(rhs) => self
+                .reference_places
+                .get(&rhs.name)
+                .cloned()
+                .or_else(|| Some(ComptimeWritePlace::Binding(rhs.name.clone()))),
+            _ => None,
+        };
+        if let Some(place) = place {
+            self.reference_places.insert(lhs.name.clone(), place);
+        } else {
+            self.reference_places.remove(&lhs.name);
+        }
+    }
+
+    fn place_root(place: &ComptimeWritePlace) -> Option<&Symbol> {
+        match place {
+            ComptimeWritePlace::Binding(root) | ComptimeWritePlace::Projection { root, .. } => {
+                Some(root)
+            }
+            ComptimeWritePlace::Unknown => None,
+        }
+    }
+
+    fn projection_references_for_root(
+        &self,
+        root: &Symbol,
+    ) -> Vec<(ComptimeWritePlace, ComptimeWritePlace)> {
+        self.reference_projection_places
+            .iter()
+            .filter(|(place, _)| Self::place_root(place) == Some(root))
+            .map(|(place, target)| (place.clone(), target.clone()))
+            .collect()
+    }
+
+    fn restore_projection_references_for_root(
+        &mut self,
+        root: &Symbol,
+        saved: Vec<(ComptimeWritePlace, ComptimeWritePlace)>,
+    ) {
+        self.reference_projection_places
+            .retain(|place, _| Self::place_root(place) != Some(root));
+        self.reference_projection_places.extend(saved);
+    }
+
+    fn record_aggregate_reference_places(&mut self, root: &Symbol, expr: &Expr) {
+        let Expr::StructInit(init) = expr else {
+            return;
+        };
+        for (field, value) in &init.fields {
+            let target = match value {
+                Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
+                Expr::Identifier(id) => self
+                    .reference_places
+                    .get(&id.name)
+                    .cloned()
+                    .or_else(|| Some(ComptimeWritePlace::Binding(id.name.clone()))),
+                _ => None,
+            };
+            if let Some(target) = target {
+                self.reference_projection_places.insert(
+                    ComptimeWritePlace::Projection {
+                        root: root.clone(),
+                        projections: vec![ComptimePlaceProjection::StructField(field.clone())],
+                    },
+                    target,
+                );
+            }
+        }
+    }
+
+    fn store_place(
+        &mut self,
+        lhs: &Expr,
+        place: ComptimeWritePlace,
+        value: ComptimeEvalValue,
+    ) -> bool {
+        match place {
+            ComptimeWritePlace::Binding(_) | ComptimeWritePlace::Projection { .. } => {
+                if let ComptimeWritePlace::Projection { .. } = &place {
                     self.context
                         .note_escaping_write(self.place_facts(lhs).reference_origins);
                 }
-                self.store_binding(name, value);
-            }
-            ComptimeWritePlace::ArrayElement { base, index } => {
-                self.context
-                    .note_escaping_write(self.place_facts(lhs).reference_origins);
-                let stored = self.update_local_value(&base, |stored| {
-                    let Some(index) = index else {
-                        return false;
-                    };
-                    if let Some(ComptimeAggregateValue::Array(items)) = &mut stored.aggregate {
-                        let Some(slot) = items.get_mut(index) else {
-                            return false;
-                        };
-                        *slot = value.clone();
-                        Self::refresh_aggregate(stored);
-                        return true;
-                    }
-                    let Some(Value::Array(items)) = &mut stored.concrete else {
-                        return false;
-                    };
-                    let Some(slot) = items.get_mut(index) else {
-                        return false;
-                    };
-                    let Some(concrete) = value.concrete.clone() else {
-                        return false;
-                    };
-                    *slot = concrete;
-                    true
-                });
-                if !stored {
-                    self.invalidate_binding(&base);
-                }
-            }
-            ComptimeWritePlace::StructField { base, field } => {
-                self.context
-                    .note_escaping_write(self.place_facts(lhs).reference_origins);
-                let stored = self.update_local_value(&base, |stored| {
-                    let Some(ComptimeAggregateValue::Struct(fields)) = &mut stored.aggregate else {
-                        return false;
-                    };
-                    let Some(slot) = fields.get_mut(&field) else {
-                        return false;
-                    };
-                    *slot = value;
-                    Self::refresh_aggregate(stored);
-                    true
-                });
-                if !stored {
-                    self.invalidate_binding(&base);
-                }
+                self.store_resolved_place(place, value)
             }
             ComptimeWritePlace::Unknown => {
                 self.context
                     .note_escaping_write(self.place_facts(lhs).reference_origins);
+                self.invalidate_unknown_local_place(lhs)
+            }
+        }
+    }
+
+    /// An unknown local array index is still a real write, but it cannot affect storage outside
+    /// the block. Forget the whole local aggregate so a later read cannot use a stale component;
+    /// this is safer and more precise than rejecting a block whose unknown write is provably dead.
+    fn invalidate_unknown_local_place(&mut self, expr: &Expr) -> bool {
+        let base = match expr {
+            Expr::IndexAccess(access) => &access.base,
+            Expr::MemberAccess(access) => &access.base,
+            _ => return false,
+        };
+        let place = self.direct_place(base);
+        let Some(root) = Self::place_root(&place).cloned() else {
+            return false;
+        };
+        let known = self.env.contains_key(&root) || self.root_write_escapes(&root);
+        self.invalidate_binding(&root);
+        known
+    }
+
+    fn store_resolved_place(
+        &mut self,
+        place: ComptimeWritePlace,
+        value: ComptimeEvalValue,
+    ) -> bool {
+        match place {
+            ComptimeWritePlace::Binding(name) => {
+                self.store_binding(name, value);
+                true
+            }
+            ComptimeWritePlace::Projection { root, projections } => {
+                let stored = self.update_local_value(&root, |stored| {
+                    Self::update_projection(stored, &projections, &value)
+                });
+                if !stored {
+                    self.invalidate_binding(&root);
+                }
+                stored || self.root_write_escapes(&root)
+            }
+            ComptimeWritePlace::Unknown => false,
+        }
+    }
+
+    fn read_place(&self, place: &ComptimeWritePlace) -> Option<ComptimeEvalValue> {
+        match place {
+            ComptimeWritePlace::Binding(name) => self.env.get(name).cloned(),
+            ComptimeWritePlace::Projection { root, projections } => {
+                let value = self.env.get(root)?;
+                Self::read_projection(value, projections)
+            }
+            ComptimeWritePlace::Unknown => None,
+        }
+    }
+
+    fn read_projection(
+        value: &ComptimeEvalValue,
+        projections: &[ComptimePlaceProjection],
+    ) -> Option<ComptimeEvalValue> {
+        let Some((projection, rest)) = projections.split_first() else {
+            return Some(value.clone());
+        };
+        match projection {
+            ComptimePlaceProjection::ArrayElement(index) => {
+                if let Some(ComptimeAggregateValue::Array(items)) = &value.aggregate {
+                    return Self::read_projection(items.get(*index)?, rest);
+                }
+                if !rest.is_empty() {
+                    return None;
+                }
+                let Value::Array(items) = value.concrete.as_ref()? else {
+                    return None;
+                };
+                Some(ComptimeEvalValue::known(items.get(*index)?.clone()))
+            }
+            ComptimePlaceProjection::StructField(field) => {
+                let ComptimeAggregateValue::Struct(fields) = value.aggregate.as_ref()? else {
+                    return None;
+                };
+                Self::read_projection(fields.get(field)?, rest)
+            }
+        }
+    }
+
+    fn root_write_escapes(&self, name: &Symbol) -> bool {
+        self.context.is_outer_binding(name)
+            || self
+                .context
+                .binding_facts(name)
+                .is_some_and(|facts| !facts.captured_place_origins.is_empty())
+    }
+
+    fn update_projection(
+        value: &mut ComptimeEvalValue,
+        projections: &[ComptimePlaceProjection],
+        replacement: &ComptimeEvalValue,
+    ) -> bool {
+        let Some((projection, rest)) = projections.split_first() else {
+            *value = replacement.clone();
+            return true;
+        };
+        match projection {
+            ComptimePlaceProjection::ArrayElement(index) => {
+                if let Some(ComptimeAggregateValue::Array(items)) = &mut value.aggregate {
+                    let Some(item) = items.get_mut(*index) else {
+                        return false;
+                    };
+                    let updated = Self::update_projection(item, rest, replacement);
+                    if updated {
+                        Self::refresh_aggregate(value);
+                    }
+                    return updated;
+                }
+                if !rest.is_empty() {
+                    return false;
+                }
+                let Some(Value::Array(items)) = &mut value.concrete else {
+                    return false;
+                };
+                let Some(item) = items.get_mut(*index) else {
+                    return false;
+                };
+                let Some(concrete) = replacement.concrete.clone() else {
+                    return false;
+                };
+                *item = concrete;
+                value.facts.merge_from(&replacement.facts);
+                true
+            }
+            ComptimePlaceProjection::StructField(field) => {
+                let Some(ComptimeAggregateValue::Struct(fields)) = &mut value.aggregate else {
+                    return false;
+                };
+                let Some(item) = fields.get_mut(field) else {
+                    return false;
+                };
+                let updated = Self::update_projection(item, rest, replacement);
+                if updated {
+                    Self::refresh_aggregate(value);
+                }
+                updated
             }
         }
     }
@@ -633,7 +897,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         outcome
     }
 
-    fn relational_value(lhs: &Value, rhs: &Value, op: &RelationalOp) -> Option<Value> {
+    fn relational_value(&self, lhs: &Value, rhs: &Value, op: &RelationalOp) -> Option<Value> {
         let comparison = match (lhs, rhs) {
             // Keep integer comparisons exact: routing large integers through `f64` changes the
             // answer above 2^53.
@@ -664,19 +928,55 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 _ => return None,
             },
             (Value::Topology(left), Value::Topology(right)) => match op {
-                RelationalOp::Eq => {
-                    crate::arch::topology_dispatch_id(left)
-                        == crate::arch::topology_dispatch_id(right)
-                }
-                RelationalOp::NotEq => {
-                    crate::arch::topology_dispatch_id(left)
-                        != crate::arch::topology_dispatch_id(right)
-                }
+                RelationalOp::Eq => self.topologies_equal(left, right)?,
+                RelationalOp::NotEq => !self.topologies_equal(left, right)?,
                 _ => return None,
             },
             _ => return None,
         };
         Some(Value::Bool(comparison))
+    }
+
+    /// Semantic topology equality. `topology_dispatch_id` is a compact placement key and can
+    /// collide for distinct slices, so it must never decide a language-level comparison.
+    fn topologies_equal(&self, left: &Topology, right: &Topology) -> Option<bool> {
+        match (left, right) {
+            (Topology::CPU, Topology::CPU)
+            | (Topology::CpuAvx512, Topology::CpuAvx512)
+            | (Topology::CpuNeon, Topology::CpuNeon)
+            | (Topology::AMX, Topology::AMX)
+            | (Topology::ANE, Topology::ANE)
+            | (Topology::Current, Topology::Current) => Some(true),
+            (Topology::GPU(left), Topology::GPU(right))
+            | (Topology::NPU(left), Topology::NPU(right))
+            | (Topology::AccCore(left), Topology::AccCore(right)) => {
+                self.topology_exprs_equal(left, right)
+            }
+            (
+                Topology::Slice(left_topology, left_start, left_end),
+                Topology::Slice(right_topology, right_start, right_end),
+            ) => Some(
+                self.topologies_equal(left_topology, right_topology)?
+                    && self.topology_exprs_equal(left_start, right_start)?
+                    && self.topology_exprs_equal(left_end, right_end)?,
+            ),
+            (Topology::Custom(left), Topology::Custom(right)) => Some(left == right),
+            _ => Some(false),
+        }
+    }
+
+    fn topology_exprs_equal(&self, left: &Expr, right: &Expr) -> Option<bool> {
+        let mut left_interpreter = self.clone();
+        let mut right_interpreter = self.clone();
+        let left = left_interpreter.expr(left).value.concrete?;
+        let right = right_interpreter.expr(right).value.concrete?;
+        match (left, right) {
+            (Value::Int(left), Value::Int(right)) => Some(left == right),
+            (Value::Number(left), Value::Number(right)) => Some((left - right).abs() < 1e-9),
+            (Value::Bool(left), Value::Bool(right)) => Some(left == right),
+            (Value::Topology(left), Value::Topology(right)) => self.topologies_equal(&left, &right),
+            _ => None,
+        }
     }
 
     fn array(&mut self, elements: Vec<ComptimeEvalOutcome>) -> ComptimeEvalOutcome {
@@ -760,7 +1060,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         &mut self,
         target: &Symbol,
         args: Vec<ComptimeEvalOutcome>,
-        writebacks: Vec<Option<Symbol>>,
+        writebacks: Vec<Option<ComptimeWritePlace>>,
     ) -> ComptimeEvalOutcome {
         if self.context.call_depth() == 0 {
             let target = target.clone();
@@ -794,7 +1094,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         &mut self,
         target: &Symbol,
         args: Vec<ComptimeEvalOutcome>,
-        writebacks: Vec<Option<Symbol>>,
+        writebacks: Vec<Option<ComptimeWritePlace>>,
     ) -> ComptimeEvalOutcome {
         let Some(function) = self.function_bodies.get(target).cloned() else {
             return self.unsupported_after(args);
@@ -808,12 +1108,40 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             return self.unsupported_after(args);
         }
 
-        let mut saved_env = std::mem::take(&mut self.env);
+        let saved_env = std::mem::take(&mut self.env);
+        let saved_reference_places = std::mem::take(&mut self.reference_places);
+        let saved_reference_projection_places =
+            std::mem::take(&mut self.reference_projection_places);
+        self.reference_projection_places = saved_reference_projection_places
+            .iter()
+            .filter(|(place, _)| {
+                Self::place_root(place).is_some_and(|root| {
+                    function
+                        .params
+                        .iter()
+                        .any(|(parameter, _)| parameter == root)
+                })
+            })
+            .map(|(place, target)| (place.clone(), target.clone()))
+            .collect();
         self.context.push_scope();
-        for ((parameter, _), argument) in function.params.iter().zip(&args) {
+        for (((parameter, parameter_ty), argument), writeback) in function
+            .params
+            .iter()
+            .zip(&args)
+            .zip(writebacks.iter().chain(std::iter::repeat(&None)))
+        {
             self.context
                 .declare(parameter.clone(), argument.value.facts.clone());
             self.env.insert(parameter.clone(), argument.value.clone());
+            if matches!(parameter_ty, Type::Borrow { is_mut: true, .. }) && writeback.is_some() {
+                // The parameter's private binding is its lvalue inside this call. When the call
+                // returns, its final value is copied to the caller's tracked place below.
+                self.reference_places.insert(
+                    parameter.clone(),
+                    ComptimeWritePlace::Binding(parameter.clone()),
+                );
+            }
         }
         let body = self.block(&function.body);
         let caller_updates = function
@@ -825,20 +1153,20 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             })
             .collect::<Vec<_>>();
         self.context.pop_scope();
+        self.env = saved_env;
+        self.reference_places = saved_reference_places;
+        self.reference_projection_places = saved_reference_projection_places;
+        let mut writebacks_supported = true;
         for (caller, value) in caller_updates {
             match value {
                 Some(value) => {
-                    self.context.reassign(&caller, value.facts.clone());
-                    saved_env.insert(caller, value);
+                    writebacks_supported &= self.store_resolved_place(caller, value);
                 }
                 None => {
-                    self.context
-                        .reassign(&caller, ComptimeValueFacts::default());
-                    saved_env.remove(&caller);
+                    writebacks_supported = false;
                 }
             }
         }
-        self.env = saved_env;
         self.context.pop_call();
 
         let mut outcome = match body.flow {
@@ -863,6 +1191,9 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 .unsupported_reason
                 .merge_from(argument.unsupported_reason);
             outcome.requires_refusal |= argument.requires_refusal;
+        }
+        if !writebacks_supported {
+            outcome.mark_unsupported();
         }
         outcome
     }
@@ -917,10 +1248,18 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             let branch_outcome = branch.known_function_call(target, branch_args);
             merged.context.merge_branch(&branch.context);
             merged.env = Self::merge_environments(merged.env, &branch.env);
+            merged.reference_places =
+                Self::merge_reference_places(merged.reference_places, &branch.reference_places);
+            merged.reference_projection_places = Self::merge_projection_reference_places(
+                merged.reference_projection_places,
+                &branch.reference_projection_places,
+            );
             outcome.merge_from(&branch_outcome);
         }
         self.context = merged.context;
         self.env = merged.env;
+        self.reference_places = merged.reference_places;
+        self.reference_projection_places = merged.reference_projection_places;
         outcome
     }
 
@@ -929,38 +1268,86 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         call: &FunctionCallExpr,
         mut args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
-        if self.function_bodies.contains(&call.name) {
+        if let Some(function) = self.function_bodies.get(&call.name).cloned() {
             let writebacks = call
                 .args
                 .iter()
-                .map(|arg| match arg {
-                    Expr::Borrow(borrow) if borrow.is_mut => match &*borrow.expr {
-                        Expr::Identifier(id) => Some(id.name.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                })
+                .map(|arg| self.mutable_argument_place(arg))
                 .collect::<Vec<_>>();
+            if writebacks
+                .iter()
+                .flatten()
+                .any(|place| matches!(place, ComptimeWritePlace::Unknown))
+            {
+                return self.refusal_after(args);
+            }
             // The borrow outcome deliberately has no scalar `Value`: `comptime { &mut x }`
             // cannot replace itself with `x`. A known direct callee, however, needs the current
             // pointee value in its private parameter frame so `*param = ...` can compute a
             // write-back. Preserve the borrow's provenance and support state while supplying
             // only that frame-local value.
-            for (argument, source) in args.iter_mut().zip(writebacks.iter()) {
-                let Some(source) = source.as_ref() else {
+            for (argument, place) in args.iter_mut().zip(writebacks.iter()) {
+                let Some(place) = place.as_ref() else {
                     continue;
                 };
-                let Some(value) = self.env.get(source) else {
-                    continue;
-                };
-                argument.value.concrete = value.concrete.clone();
-                argument.value.aggregate = value.aggregate.clone();
-                argument.value.facts.merge_from(&value.facts);
+                if let Some(value) = self.read_place(place) {
+                    argument.value.concrete = value.concrete.clone();
+                    argument.value.aggregate = value.aggregate.clone();
+                    argument.value.facts.merge_from(&value.facts);
+                } else if !Self::place_root(place).is_some_and(|root| self.root_write_escapes(root))
+                {
+                    return self.refusal_after(args);
+                }
             }
-            self.known_function_call_with_writebacks(&call.name, args, writebacks)
+            let temporary_projection_places =
+                self.forward_projection_reference_places(&function.params, &call.args);
+            let outcome = self.known_function_call_with_writebacks(&call.name, args, writebacks);
+            for place in temporary_projection_places {
+                self.reference_projection_places.remove(&place);
+            }
+            outcome
         } else {
             self.callable_call(self.identifier_facts(&call.name), args)
         }
+    }
+
+    /// A borrowed aggregate parameter retains the reference destinations of fields inside it.
+    /// The temporary keys are installed under the callee's parameter name, then removed as soon
+    /// as its frame returns; the caller's aggregate map remains untouched.
+    fn forward_projection_reference_places(
+        &mut self,
+        params: &[(Symbol, Type)],
+        args: &[Expr],
+    ) -> Vec<ComptimeWritePlace> {
+        let mut inserted = Vec::new();
+        for ((parameter, _), arg) in params.iter().zip(args) {
+            let source = match arg {
+                Expr::Borrow(borrow) => self.direct_place(&borrow.expr),
+                _ => self.direct_place(arg),
+            };
+            let Some(source_root) = Self::place_root(&source) else {
+                continue;
+            };
+            let mappings = self
+                .reference_projection_places
+                .iter()
+                .filter(|(place, _)| Self::place_root(place) == Some(source_root))
+                .map(|(place, target)| (place.clone(), target.clone()))
+                .collect::<Vec<_>>();
+            for (place, target) in mappings {
+                let ComptimeWritePlace::Projection { projections, .. } = place else {
+                    continue;
+                };
+                let forwarded = ComptimeWritePlace::Projection {
+                    root: parameter.clone(),
+                    projections,
+                };
+                self.reference_projection_places
+                    .insert(forwarded.clone(), target);
+                inserted.push(forwarded);
+            }
+        }
+        inserted
     }
 
     /// An opaque callable cannot be assumed pure. Captured writes and mutable-reference arguments
@@ -999,6 +1386,25 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             value.merge_from(other);
             true
         });
+        left
+    }
+
+    /// A reference alias remains usable after an abstract join only when both paths point to
+    /// precisely the same local place. Keeping an alias from one arm would make a later `*p =`
+    /// look concrete even though the other arm may have made `p` point elsewhere.
+    fn merge_reference_places(
+        mut left: HashMap<Symbol, ComptimeWritePlace>,
+        right: &HashMap<Symbol, ComptimeWritePlace>,
+    ) -> HashMap<Symbol, ComptimeWritePlace> {
+        left.retain(|name, place| right.get(name).is_some_and(|other| place == other));
+        left
+    }
+
+    fn merge_projection_reference_places(
+        mut left: HashMap<ComptimeWritePlace, ComptimeWritePlace>,
+        right: &HashMap<ComptimeWritePlace, ComptimeWritePlace>,
+    ) -> HashMap<ComptimeWritePlace, ComptimeWritePlace> {
+        left.retain(|place, target| right.get(place).is_some_and(|other| target == other));
         left
     }
 
@@ -1051,6 +1457,14 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .merge_branch(&else_interpreter.context);
         self.context = then_interpreter.context;
         self.env = Self::merge_environments(then_interpreter.env, &else_interpreter.env);
+        self.reference_places = Self::merge_reference_places(
+            then_interpreter.reference_places,
+            &else_interpreter.reference_places,
+        );
+        self.reference_projection_places = Self::merge_projection_reference_places(
+            then_interpreter.reference_projection_places,
+            &else_interpreter.reference_projection_places,
+        );
 
         let mut outcome = then_outcome;
         outcome.merge_from(&else_outcome);
@@ -1136,20 +1550,29 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .into_iter()
             .map(|name| {
                 let value = self.env.get(&name).cloned();
-                (name, value)
+                let reference_place = self.reference_places.get(&name).cloned();
+                (name, (value, reference_place))
             })
             .collect::<HashMap<_, _>>();
         self.context.push_scope();
         self.bind_pattern_value(&arm.pattern, scrutinee);
         let outcome = self.block(&arm.body);
         self.context.pop_scope();
-        for (name, value) in shadowed {
+        for (name, (value, reference_place)) in shadowed {
             match value {
                 Some(value) => {
-                    self.env.insert(name, value);
+                    self.env.insert(name.clone(), value);
                 }
                 None => {
                     self.env.remove(&name);
+                }
+            }
+            match reference_place {
+                Some(place) => {
+                    self.reference_places.insert(name, place);
+                }
+                None => {
+                    self.reference_places.remove(&name);
                 }
             }
         }
@@ -1200,10 +1623,18 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             let branch_outcome = branch.match_arm(arm, &scrutinee_value);
             merged.context.merge_branch(&branch.context);
             merged.env = Self::merge_environments(merged.env, &branch.env);
+            merged.reference_places =
+                Self::merge_reference_places(merged.reference_places, &branch.reference_places);
+            merged.reference_projection_places = Self::merge_projection_reference_places(
+                merged.reference_projection_places,
+                &branch.reference_projection_places,
+            );
             outcome.merge_from(&branch_outcome);
         }
         self.context = merged.context;
         self.env = merged.env;
+        self.reference_places = merged.reference_places;
+        self.reference_projection_places = merged.reference_projection_places;
 
         // Known scalar patterns have a concrete selected arm. Unknown and enum-pattern cases
         // still need pattern/value modelling before their value can fold, but their effects have
@@ -1234,6 +1665,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             {
                 let iterator: Symbol = loop_stmt.iter.clone().into();
                 let shadowed = self.env.get(&iterator).cloned();
+                let shadowed_reference = self.reference_places.remove(&iterator);
                 self.context.push_scope();
                 self.context
                     .declare(iterator.clone(), ComptimeValueFacts::default());
@@ -1252,6 +1684,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                         iterator.clone(),
                         ComptimeEvalValue::known(Value::Int(index)),
                     );
+                    self.reference_places.remove(&iterator);
                     let body = self.block(&loop_stmt.body);
                     outcome.support.merge_from(body.support);
                     outcome
@@ -1277,10 +1710,18 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 self.context.pop_scope();
                 match shadowed {
                     Some(value) => {
-                        self.env.insert(iterator, value);
+                        self.env.insert(iterator.clone(), value);
                     }
                     None => {
                         self.env.remove(&iterator);
+                    }
+                }
+                match shadowed_reference {
+                    Some(place) => {
+                        self.reference_places.insert(iterator, place);
+                    }
+                    None => {
+                        self.reference_places.remove(&iterator);
                     }
                 }
                 return outcome;
@@ -1308,6 +1749,14 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
 
         self.context.merge_branch(&one_iteration.context);
         self.env = Self::merge_environments(self.env.clone(), &one_iteration.env);
+        self.reference_places = Self::merge_reference_places(
+            self.reference_places.clone(),
+            &one_iteration.reference_places,
+        );
+        self.reference_projection_places = Self::merge_projection_reference_places(
+            self.reference_projection_places.clone(),
+            &one_iteration.reference_projection_places,
+        );
         let mut outcome = ComptimeEvalOutcome::unsupported();
         outcome.support.merge_from(iterable.support);
         outcome
@@ -1480,7 +1929,16 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     .concrete
                     .as_ref()
                     .zip(rhs.value.concrete.as_ref())
-                    .and_then(|(lhs, rhs)| Self::relational_value(lhs, rhs, &op.op));
+                    .and_then(|(lhs, rhs)| self.relational_value(lhs, rhs, &op.op));
+                if matches!(
+                    (&lhs.value.concrete, &rhs.value.concrete),
+                    (Some(Value::Topology(_)), Some(Value::Topology(_)))
+                ) && outcome.value.concrete.is_none()
+                {
+                    // Neither an unequal topology nor an unresolved slice index may be guessed.
+                    // Preserve the operands' effects, then reject the enclosing fold.
+                    outcome.mark_unsupported();
+                }
                 outcome
             }
             Expr::LogicalOp(op) => {
@@ -1548,13 +2006,27 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             }
             Expr::Dereference(deref) => {
                 let inner = self.expr(&deref.expr);
+                let place = if let Expr::Identifier(id) = &*deref.expr {
+                    self.reference_places.get(&id.name)
+                } else {
+                    None
+                };
+                if matches!(place, Some(ComptimeWritePlace::Unknown)) {
+                    return self.refusal_after([inner]);
+                }
+                let referenced = place.and_then(|place| self.read_place(place));
                 let mut outcome = self.unknown_after([inner.clone()]);
                 // Direct calls install the pointee value in their parameter frame. A
                 // dereference is the boundary at which that private representation becomes an
                 // ordinary value again; a borrow expression itself remains non-foldable.
-                outcome.value.concrete = inner.value.concrete;
-                outcome.value.facts = inner.value.facts;
-                outcome.value.aggregate = inner.value.aggregate;
+                if let Some(referenced) = referenced {
+                    outcome.value = referenced;
+                    outcome.value.facts.merge_from(&inner.value.facts);
+                } else {
+                    outcome.value.concrete = inner.value.concrete;
+                    outcome.value.facts = inner.value.facts;
+                    outcome.value.aggregate = inner.value.aggregate;
+                }
                 outcome
             }
             Expr::UnsafeBlock(block) => self.block_with_tail(&block.stmts, block.ret.as_deref()),
