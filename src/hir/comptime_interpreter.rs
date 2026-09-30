@@ -6,6 +6,7 @@
 //! compile error instead of a silently pure catch-all.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::arch::TransferCostGraph;
 use crate::hir::check_state::{
@@ -32,11 +33,12 @@ pub(crate) struct ComptimeObservation {
     pub call_depth_exceeded: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ComptimeFunctionBodies<'bodies> {
     comptime_bodies: &'bodies HashMap<Symbol, Function>,
     syntax_functions: &'bodies HashMap<Symbol, &'bodies Function>,
     mono_functions: &'bodies [(Function, u64)],
+    mutable_reference_params: Arc<HashMap<Symbol, Vec<bool>>>,
 }
 
 impl<'bodies> ComptimeFunctionBodies<'bodies> {
@@ -44,11 +46,35 @@ impl<'bodies> ComptimeFunctionBodies<'bodies> {
         comptime_bodies: &'bodies HashMap<Symbol, Function>,
         syntax_functions: &'bodies HashMap<Symbol, &'bodies Function>,
         mono_functions: &'bodies [(Function, u64)],
+        type_can_carry_mut_reference: impl Fn(&Type) -> bool,
     ) -> Self {
+        let parameter_flags = |function: &Function| {
+            function
+                .params
+                .iter()
+                .map(|(_, ty)| type_can_carry_mut_reference(ty))
+                .collect::<Vec<_>>()
+        };
+        let mut mutable_reference_params = HashMap::new();
+        // `get` selects the first monomorphized body, then lets a comptime body and a non-empty
+        // syntax body override it. Build the parameter facts with the same precedence.
+        for (function, _) in mono_functions.iter().rev() {
+            mutable_reference_params.insert(function.name.clone(), parameter_flags(function));
+        }
+        for function in comptime_bodies.values() {
+            mutable_reference_params.insert(function.name.clone(), parameter_flags(function));
+        }
+        for function in syntax_functions
+            .values()
+            .filter(|function| !function.body.is_empty())
+        {
+            mutable_reference_params.insert(function.name.clone(), parameter_flags(function));
+        }
         Self {
             comptime_bodies,
             syntax_functions,
             mono_functions,
+            mutable_reference_params: Arc::new(mutable_reference_params),
         }
     }
 
@@ -68,6 +94,13 @@ impl<'bodies> ComptimeFunctionBodies<'bodies> {
 
     fn contains(&self, name: &Symbol) -> bool {
         self.get(name).is_some()
+    }
+
+    fn mutable_reference_params(&self, name: &Symbol) -> &[bool] {
+        self.mutable_reference_params
+            .get(name)
+            .map(Vec::as_slice)
+            .expect("every comptime function body must have mutable-reference parameter facts")
     }
 }
 
@@ -584,6 +617,13 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     .outer_reference_binding(&rhs.name)
                     .then(|| ComptimeWritePlace::Binding(rhs.name.clone()))
             }),
+            Expr::MemberAccess(_) | Expr::IndexAccess(_) => {
+                let direct = self.direct_place(rhs);
+                if let Some(target) = self.reference_projection_places.get(&direct) {
+                    return Some(target.clone());
+                }
+                (!self.value_facts(rhs).reference_origins.is_empty()).then_some(direct)
+            }
             _ => None,
         }
     }
@@ -1097,8 +1137,13 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         let Some(function) = self.function_bodies.get(target).cloned() else {
             return self.unsupported_after(args);
         };
+        let mutable_reference_params = self
+            .function_bodies
+            .mutable_reference_params(target)
+            .to_vec();
         if function.params.len() != args.len()
             || (!writebacks.is_empty() && writebacks.len() != args.len())
+            || mutable_reference_params.len() != function.params.len()
         {
             return self.unsupported_after(args);
         }
@@ -1123,16 +1168,17 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .map(|(place, target)| (place.clone(), target.clone()))
             .collect();
         self.context.push_scope();
-        for (((parameter, parameter_ty), argument), writeback) in function
+        for ((((parameter, _), parameter_can_carry_mut_reference), argument), writeback) in function
             .params
             .iter()
+            .zip(&mutable_reference_params)
             .zip(&args)
             .zip(writebacks.iter().chain(std::iter::repeat(&None)))
         {
             self.context
                 .declare(parameter.clone(), argument.value.facts.clone());
             self.env.insert(parameter.clone(), argument.value.clone());
-            if matches!(parameter_ty, Type::Borrow { is_mut: true, .. }) && writeback.is_some() {
+            if *parameter_can_carry_mut_reference && writeback.is_some() {
                 // The parameter's private binding is its lvalue inside this call. When the call
                 // returns, its final value is copied to the caller's tracked place below.
                 self.reference_places.insert(
@@ -1145,13 +1191,16 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         let caller_updates = function
             .params
             .iter()
+            .zip(&mutable_reference_params)
             .zip(writebacks.into_iter().chain(std::iter::repeat(None)))
-            .filter_map(|((parameter, parameter_ty), caller)| {
-                matches!(parameter_ty, Type::Borrow { is_mut: true, .. })
-                    .then_some(caller)
-                    .flatten()
-                    .map(|caller| (caller, self.env.get(parameter).cloned()))
-            })
+            .filter_map(
+                |(((parameter, _), parameter_can_carry_mut_reference), caller)| {
+                    parameter_can_carry_mut_reference
+                        .then_some(caller)
+                        .flatten()
+                        .map(|caller| (caller, self.env.get(parameter).cloned()))
+                },
+            )
             .collect::<Vec<_>>();
         self.context.pop_scope();
         self.env = saved_env;
@@ -1270,12 +1319,16 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         mut args: Vec<ComptimeEvalOutcome>,
     ) -> ComptimeEvalOutcome {
         if let Some(function) = self.function_bodies.get(&call.name).cloned() {
+            let mutable_reference_params = self
+                .function_bodies
+                .mutable_reference_params(&call.name)
+                .to_vec();
             let writebacks = call
                 .args
                 .iter()
-                .zip(&function.params)
-                .map(|(arg, (_, parameter_ty))| {
-                    matches!(parameter_ty, Type::Borrow { is_mut: true, .. })
+                .zip(&mutable_reference_params)
+                .map(|(arg, parameter_can_carry_mut_reference)| {
+                    parameter_can_carry_mut_reference
                         .then(|| self.mutable_argument_place(arg))
                         .flatten()
                 })
@@ -1305,8 +1358,11 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     return self.refusal_after(args);
                 }
             }
-            let temporary_projection_places =
-                self.forward_projection_reference_places(&function.params, &call.args);
+            let temporary_projection_places = self.forward_projection_reference_places(
+                &function.params,
+                &mutable_reference_params,
+                &call.args,
+            );
             let outcome = self.known_function_call_with_writebacks(&call.name, args, writebacks);
             for place in temporary_projection_places {
                 self.reference_projection_places.remove(&place);
@@ -1323,11 +1379,14 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     fn forward_projection_reference_places(
         &mut self,
         params: &[(Symbol, Type)],
+        mutable_reference_params: &[bool],
         args: &[Expr],
     ) -> Vec<ComptimeWritePlace> {
         let mut inserted = Vec::new();
-        for ((parameter, parameter_ty), arg) in params.iter().zip(args) {
-            if !matches!(parameter_ty, Type::Borrow { is_mut: true, .. }) {
+        for (((parameter, _), parameter_can_carry_mut_reference), arg) in
+            params.iter().zip(mutable_reference_params).zip(args)
+        {
+            if !parameter_can_carry_mut_reference {
                 continue;
             }
             let source = match arg {
@@ -2276,7 +2335,12 @@ mod tests {
         let mono_functions: Vec<(Function, u64)> = Vec::new();
         let mut interpreter = ComptimeInterpreter::new(
             &env,
-            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
+            ComptimeFunctionBodies::new(
+                &comptime_bodies,
+                &syntax_functions,
+                &mono_functions,
+                |_| false,
+            ),
             &graph,
             Topology::CPU,
             ComptimeEvalContext::new(
@@ -2334,7 +2398,12 @@ mod tests {
         for statement in statements {
             let mut interpreter = ComptimeInterpreter::new(
                 &env,
-                ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
+                ComptimeFunctionBodies::new(
+                    &comptime_bodies,
+                    &syntax_functions,
+                    &mono_functions,
+                    |_| false,
+                ),
                 &graph,
                 Topology::CPU,
                 ComptimeEvalContext::default(),
@@ -2356,7 +2425,12 @@ mod tests {
         let mono_functions: Vec<(Function, u64)> = Vec::new();
         let mut interpreter = ComptimeInterpreter::new(
             &env,
-            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
+            ComptimeFunctionBodies::new(
+                &comptime_bodies,
+                &syntax_functions,
+                &mono_functions,
+                |_| false,
+            ),
             &graph,
             Topology::CPU,
             ComptimeEvalContext::default(),
@@ -2387,7 +2461,12 @@ mod tests {
         let mono_functions: Vec<(Function, u64)> = Vec::new();
         let mut interpreter = ComptimeInterpreter::new(
             &env,
-            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
+            ComptimeFunctionBodies::new(
+                &comptime_bodies,
+                &syntax_functions,
+                &mono_functions,
+                |_| false,
+            ),
             &graph,
             Topology::CPU,
             ComptimeEvalContext::new(

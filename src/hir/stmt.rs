@@ -70,6 +70,7 @@ impl<'a> TypeChecker<'a> {
             &self.env.comptime_bodies,
             &self.env.syntax_functions,
             &self.mono.functions,
+            |ty| self.type_can_carry_mut_reference(ty),
         );
         let mut interpreter = ComptimeInterpreter::new(
             before,
