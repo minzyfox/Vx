@@ -19,7 +19,10 @@ use crate::syntax::*;
 /// Recursive comptime calls clone enough lexical state that the compiler worker's ordinary stack
 /// can run out before the language-level 256-call limit. The outermost call moves the whole
 /// recursive evaluation onto one larger stack; recursive frames stay on that same thread.
-const COMPTIME_RECURSION_STACK_SIZE: usize = 16 * 1024 * 1024;
+// Debug builds retain considerably larger interpreter frames than the optimized CI binary. The
+// language permits 256 nested comptime calls, so reserve enough stack for that documented limit
+// in both profiles rather than making a valid program overflow only for a debug compiler.
+const COMPTIME_RECURSION_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The result of interpreting one `comptime` block.
 #[derive(Clone, PartialEq)]
@@ -1078,9 +1081,13 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                         )
                     });
                 match worker {
-                    Ok(worker) => worker
-                        .join()
-                        .unwrap_or_else(|_| Self::unsupported_outcome(args)),
+                    Ok(worker) => match worker.join() {
+                        Ok(outcome) => outcome,
+                        // This worker only provides a larger stack. An interpreter/compiler bug
+                        // must retain its panic and backtrace; translating it into E3033 would
+                        // falsely blame the user's comptime expression.
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    },
                     // The transition interpreter must never make a failed worker allocation a
                     // compiler crash. Refuse this fold and retain all argument effects instead.
                     Err(_) => Self::unsupported_outcome(args),
@@ -2354,5 +2361,35 @@ mod tests {
 
         assert!(observation.outcome.requires_refusal);
         assert_eq!(observation.outcome.value.concrete, Some(Value::Int(7)));
+    }
+
+    #[test]
+    fn opaque_callable_records_captured_outer_writes() {
+        let outside: Symbol = "outside".into();
+        let graph = TransferCostGraph::default();
+        let env = HashMap::new();
+        let comptime_bodies = HashMap::new();
+        let syntax_functions: HashMap<Symbol, &Function> = HashMap::new();
+        let mono_functions: Vec<(Function, u64)> = Vec::new();
+        let mut interpreter = ComptimeInterpreter::new(
+            &env,
+            ComptimeFunctionBodies::new(&comptime_bodies, &syntax_functions, &mono_functions),
+            &graph,
+            Topology::CPU,
+            ComptimeEvalContext::new(
+                std::collections::HashSet::from([outside.clone()]),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            ),
+        );
+        let facts = ComptimeValueFacts {
+            unknown_callable: true,
+            captured_writes: std::collections::HashSet::from([outside.clone()]),
+            ..ComptimeValueFacts::default()
+        };
+
+        interpreter.note_opaque_callable(&facts, &[]);
+
+        assert_eq!(interpreter.context.escaping_write(), Some(&outside));
     }
 }
