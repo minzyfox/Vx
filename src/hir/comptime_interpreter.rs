@@ -17,8 +17,8 @@ use crate::symbol::Symbol;
 use crate::syntax::*;
 
 /// Recursive comptime calls clone enough lexical state that the compiler worker's ordinary stack
-/// can run out before the language-level 256-call limit. The outermost call moves the whole
-/// recursive evaluation onto one larger stack; recursive frames stay on that same thread.
+/// can run out before the language-level 256-call limit. Each comptime block runs on one larger
+/// stack; every call made while interpreting that block stays on the same worker thread.
 // Debug builds retain considerably larger interpreter frames than the optimized CI binary. The
 // language permits 256 nested comptime calls, so reserve enough stack for that documented limit
 // in both profiles rather than making a valid program overflow only for a debug compiler.
@@ -129,6 +129,39 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
     }
 
     pub(crate) fn observe_block(
+        &mut self,
+        stmts: &[Statement],
+        tail: Option<&Expr>,
+    ) -> ComptimeObservation {
+        // The worker is a stack boundary for the whole block, not for an individual call. A
+        // loop of independent calls therefore pays for one worker rather than allocating and
+        // joining a 64 MiB stack on every iteration.
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("vx-comptime".into())
+                .stack_size(COMPTIME_RECURSION_STACK_SIZE)
+                .spawn_scoped(scope, move || {
+                    self.observe_block_on_current_stack(stmts, tail)
+                });
+            match worker {
+                Ok(worker) => match worker.join() {
+                    Ok(observation) => observation,
+                    // The worker only supplies stack space. Do not turn a compiler panic into
+                    // an E3033 on user code.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
+                // A failed worker allocation cannot safely evaluate the block. Keep the
+                // conservative E3033 path rather than crashing the compiler.
+                Err(_) => ComptimeObservation {
+                    outcome: ComptimeEvalOutcome::refusal(),
+                    escaping_write: None,
+                    call_depth_exceeded: false,
+                },
+            }
+        })
+    }
+
+    fn observe_block_on_current_stack(
         &mut self,
         stmts: &[Statement],
         tail: Option<&Expr>,
@@ -359,15 +392,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         match stmt {
             Statement::LetDecl(let_decl) => {
                 let outcome = self.expr(&let_decl.expr);
-                let reference_place = match &let_decl.expr {
-                    Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
-                    Expr::Identifier(id) => self
-                        .reference_places
-                        .get(&id.name)
-                        .cloned()
-                        .or_else(|| Some(ComptimeWritePlace::Binding(id.name.clone()))),
-                    _ => None,
-                };
+                let reference_place = self.reference_source_place(&let_decl.expr);
                 self.context
                     .declare(let_decl.name.clone(), outcome.value.facts.clone());
                 self.env
@@ -533,30 +558,33 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         if let Some(place) = self.reference_projection_places.get(&direct) {
             return Some(place.clone());
         }
-        match expr {
-            Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
-            Expr::Identifier(id) => self.reference_places.get(&id.name).cloned(),
-            _ => None,
-        }
+        self.reference_source_place(expr)
     }
 
     fn update_reference_binding(&mut self, lhs: &Expr, rhs: &Expr) {
         let Expr::Identifier(lhs) = lhs else {
             return;
         };
-        let place = match rhs {
-            Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
-            Expr::Identifier(rhs) => self
-                .reference_places
-                .get(&rhs.name)
-                .cloned()
-                .or_else(|| Some(ComptimeWritePlace::Binding(rhs.name.clone()))),
-            _ => None,
-        };
+        let place = self.reference_source_place(rhs);
         if let Some(place) = place {
             self.reference_places.insert(lhs.name.clone(), place);
         } else {
             self.reference_places.remove(&lhs.name);
+        }
+    }
+
+    /// The destination carried by an actual mutable-reference expression. An identifier is a
+    /// reference only when it was previously introduced as one (or is an outer `&mut` binding);
+    /// a normal value copy such as `let n = size` must never manufacture an alias to `size`.
+    fn reference_source_place(&self, rhs: &Expr) -> Option<ComptimeWritePlace> {
+        match rhs {
+            Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
+            Expr::Identifier(rhs) => self.reference_places.get(&rhs.name).cloned().or_else(|| {
+                self.context
+                    .outer_reference_binding(&rhs.name)
+                    .then(|| ComptimeWritePlace::Binding(rhs.name.clone()))
+            }),
+            _ => None,
         }
     }
 
@@ -595,15 +623,7 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             return;
         };
         for (field, value) in &init.fields {
-            let target = match value {
-                Expr::Borrow(borrow) if borrow.is_mut => Some(self.direct_place(&borrow.expr)),
-                Expr::Identifier(id) => self
-                    .reference_places
-                    .get(&id.name)
-                    .cloned()
-                    .or_else(|| Some(ComptimeWritePlace::Binding(id.name.clone()))),
-                _ => None,
-            };
+            let target = self.reference_source_place(value);
             if let Some(target) = target {
                 self.reference_projection_places.insert(
                     ComptimeWritePlace::Projection {
@@ -1065,35 +1085,6 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         args: Vec<ComptimeEvalOutcome>,
         writebacks: Vec<Option<ComptimeWritePlace>>,
     ) -> ComptimeEvalOutcome {
-        if self.context.call_depth() == 0 {
-            let target = target.clone();
-            let worker_args = args.clone();
-            let worker_writebacks = writebacks.clone();
-            return std::thread::scope(|scope| {
-                let worker = std::thread::Builder::new()
-                    .name("vx-comptime".into())
-                    .stack_size(COMPTIME_RECURSION_STACK_SIZE)
-                    .spawn_scoped(scope, move || {
-                        self.known_function_call_on_current_stack(
-                            &target,
-                            worker_args,
-                            worker_writebacks,
-                        )
-                    });
-                match worker {
-                    Ok(worker) => match worker.join() {
-                        Ok(outcome) => outcome,
-                        // This worker only provides a larger stack. An interpreter/compiler bug
-                        // must retain its panic and backtrace; translating it into E3033 would
-                        // falsely blame the user's comptime expression.
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    },
-                    // The transition interpreter must never make a failed worker allocation a
-                    // compiler crash. Refuse this fold and retain all argument effects instead.
-                    Err(_) => Self::unsupported_outcome(args),
-                }
-            });
-        }
         self.known_function_call_on_current_stack(target, args, writebacks)
     }
 
@@ -1155,8 +1146,11 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             .params
             .iter()
             .zip(writebacks.into_iter().chain(std::iter::repeat(None)))
-            .filter_map(|((parameter, _), caller)| {
-                caller.map(|caller| (caller, self.env.get(parameter).cloned()))
+            .filter_map(|((parameter, parameter_ty), caller)| {
+                matches!(parameter_ty, Type::Borrow { is_mut: true, .. })
+                    .then_some(caller)
+                    .flatten()
+                    .map(|caller| (caller, self.env.get(parameter).cloned()))
             })
             .collect::<Vec<_>>();
         self.context.pop_scope();
@@ -1279,7 +1273,12 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             let writebacks = call
                 .args
                 .iter()
-                .map(|arg| self.mutable_argument_place(arg))
+                .zip(&function.params)
+                .map(|(arg, (_, parameter_ty))| {
+                    matches!(parameter_ty, Type::Borrow { is_mut: true, .. })
+                        .then(|| self.mutable_argument_place(arg))
+                        .flatten()
+                })
                 .collect::<Vec<_>>();
             if writebacks
                 .iter()
@@ -1327,7 +1326,10 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         args: &[Expr],
     ) -> Vec<ComptimeWritePlace> {
         let mut inserted = Vec::new();
-        for ((parameter, _), arg) in params.iter().zip(args) {
+        for ((parameter, parameter_ty), arg) in params.iter().zip(args) {
+            if !matches!(parameter_ty, Type::Borrow { is_mut: true, .. }) {
+                continue;
+            }
             let source = match arg {
                 Expr::Borrow(borrow) => self.direct_place(&borrow.expr),
                 _ => self.direct_place(arg),
@@ -1492,20 +1494,36 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
             Pattern::Literal(Expr::Identifier(id)) if id.name.as_ref() == "false" => {
                 Some(matches!(value, Value::Bool(false)))
             }
-            Pattern::Literal(Expr::Number(number)) => match value {
-                Value::Int(value) => number
-                    .value
-                    .parse::<i64>()
-                    .ok()
-                    .map(|other| value == &other),
-                Value::Number(value) => number
-                    .value
-                    .parse::<f64>()
-                    .ok()
-                    .map(|other| value == &other),
+            Pattern::Literal(Expr::Number(number)) => match (value, Self::number_literal(number)) {
+                (Value::Int(value), Some(Value::Int(other))) => Some(value == &other),
+                (Value::Number(value), Some(Value::Number(other))) => Some(value == &other),
+                (Value::Int(_), Some(Value::Number(_)))
+                | (Value::Number(_), Some(Value::Int(_))) => Some(false),
+                (_, None) => None,
                 _ => Some(false),
             },
             Pattern::Literal(_) | Pattern::EnumVariant(..) => Some(false),
+        }
+    }
+
+    /// Preserve the syntax-level numeric type while constructing the interpreter value. The
+    /// spelling `7f64` has no decimal point, so parsing its text as an integer first silently
+    /// changes both the operation selected below and the value written back into HIR.
+    fn number_literal(number: &NumberExpr) -> Option<Value> {
+        let is_float = number.ty.as_ref().is_some_and(ElementType::is_float)
+            || (number.ty.is_none()
+                && (number.value.contains('.')
+                    || number.value.contains('e')
+                    || number.value.contains('E')));
+        if is_float {
+            number.value.parse::<f64>().ok().map(Value::Number)
+        } else {
+            number
+                .value
+                .parse::<i64>()
+                .map(Value::Int)
+                .or_else(|_| number.value.parse::<f64>().map(Value::Number))
+                .ok()
         }
     }
 
@@ -1821,13 +1839,9 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                     ..Default::default()
                 }
             }
-            Expr::Number(number) => number
-                .value
-                .parse::<i64>()
-                .map(Value::Int)
-                .or_else(|_| number.value.parse::<f64>().map(Value::Number))
+            Expr::Number(number) => Self::number_literal(number)
                 .map(ComptimeEvalOutcome::known)
-                .unwrap_or_else(|_| ComptimeEvalOutcome::unsupported()),
+                .unwrap_or_else(ComptimeEvalOutcome::unsupported),
             Expr::EnumVariant(variant) => {
                 let values = variant
                     .payload

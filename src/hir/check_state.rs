@@ -411,10 +411,6 @@ impl ComptimeEvalContext {
         true
     }
 
-    pub(crate) fn call_depth(&self) -> u32 {
-        self.analysis_call_depth
-    }
-
     pub(crate) fn call_depth_exceeded(&self) -> bool {
         self.call_depth_exceeded
     }

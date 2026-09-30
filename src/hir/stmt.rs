@@ -39,11 +39,10 @@ pub(crate) enum EvalFlow {
 }
 
 impl<'a> TypeChecker<'a> {
-    /// Run the new interpreter beside the legacy comptime evaluator during migration.
+    /// Run the comptime interpreter and return the observation that decides folding.
     ///
-    /// Its observation is intentionally not a fold decision yet: owner families enter the new
-    /// interpreter one at a time, and the control checker keeps the legacy result authoritative
-    /// until the parity gate in the migration plan is met.
+    /// The control checker uses its concrete result when it is supported and has no escaping
+    /// effects; otherwise it reports the refusal reason instead of retaining run-time code.
     pub(crate) fn observe_comptime_block(
         &self,
         stmts: &[Statement],
