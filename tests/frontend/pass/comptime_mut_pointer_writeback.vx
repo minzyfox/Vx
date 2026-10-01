@@ -23,5 +23,6 @@ fn main() -> i32 {
 }
 
 // CHECK-LABEL: func.func @main() -> i32
-// CHECK: %[[VALUE:.*]] = arith.constant 9 : i32
+// CHECK: call @vx_init_signals() : () -> ()
+// CHECK-NEXT: %[[VALUE:.*]] = arith.constant 9 : i32
 // CHECK-NEXT: return %[[VALUE]] : i32

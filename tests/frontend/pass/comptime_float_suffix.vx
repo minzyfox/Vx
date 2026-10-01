@@ -23,5 +23,6 @@ fn main() -> i32 {
 }
 
 // CHECK-LABEL: func.func @half() -> f64
-// CHECK: arith.constant 3.500000e+00 : f32
-// CHECK: arith.extf {{.*}} : f32 to f64
+// Keep the result check independent of the current lowering's f64-to-f32 narrowing. The
+// suffix regression is that this must be 3.5 rather than the integer result 3.
+// CHECK: arith.constant 3.500000e+00
