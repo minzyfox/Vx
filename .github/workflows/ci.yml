@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ ci-reorder ]
   pull_request:
     branches: [ main ]
 
@@ -77,13 +77,6 @@ jobs:
           pipx install mdformat
           mdformat --check docs/ README.md
 
-      - name: Install Enzyme
-        run: |
-          chmod +x scripts/provision/install_enzyme.sh
-          ./scripts/provision/install_enzyme.sh
-          ENZYME_LIB=$(find "$(pwd)/.cargo/enzyme" -name 'LLVMEnzyme*.so' | head -n 1)
-          echo "ENZYME_LIB=$ENZYME_LIB" >> "$GITHUB_ENV"
-
       # Clippy has gated commits through scripts/pre-commit.sh for a long time but never gated
       # CI, so a lint only failed for whoever had the hook installed. Same flags as the hook, so
       # the two cannot disagree about what is clean.
@@ -92,6 +85,13 @@ jobs:
       # member crates are compiled by CI and linted by nothing.
       - name: Check Lints (cargo clippy)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Install Enzyme
+        run: |
+          chmod +x scripts/provision/install_enzyme.sh
+          ./scripts/provision/install_enzyme.sh
+          ENZYME_LIB=$(find "$(pwd)/.cargo/enzyme" -name 'LLVMEnzyme*.so' | head -n 1)
+          echo "ENZYME_LIB=$ENZYME_LIB" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --workspace --verbose
