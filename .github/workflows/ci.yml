@@ -86,10 +86,21 @@ jobs:
       - name: Check Lints (cargo clippy)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Cache Enzyme
+        id: enzyme-cache
+        uses: actions/cache@v4
+        with:
+          path: .cargo/enzyme
+          key: enzyme-${{ runner.os }}-llvm22-${{ hashFiles('scripts/provision/install_enzyme.sh') }}
+
       - name: Install Enzyme
+        if: steps.enzyme-cache.outputs.cache-hit != 'true'
         run: |
           chmod +x scripts/provision/install_enzyme.sh
           ./scripts/provision/install_enzyme.sh
+
+      - name: Locate Enzyme
+        run: |
           ENZYME_LIB=$(find "$(pwd)/.cargo/enzyme" -name 'LLVMEnzyme*.so' | head -n 1)
           echo "ENZYME_LIB=$ENZYME_LIB" >> "$GITHUB_ENV"
 
