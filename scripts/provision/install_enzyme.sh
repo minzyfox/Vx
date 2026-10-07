@@ -6,6 +6,8 @@ set -e
 
 # Configuration
 ENZYME_VERSION="v0.0.263"
+# Source builds for LLVM > 20 use a released Enzyme tag, not the moving default branch.
+ENZYME_SOURCE_TAG="v0.0.302"
 DEST_DIR="$(pwd)/.cargo/enzyme"
 mkdir -p "$DEST_DIR"
 
@@ -61,7 +63,7 @@ if [ "$LLVM_MAJOR" -gt 20 ]; then
     
     ENZYME_SRC="/tmp/enzyme_src_$$"
     rm -rf "$ENZYME_SRC"
-    git clone --depth 1 https://github.com/EnzymeAD/Enzyme.git "$ENZYME_SRC"
+    git clone --depth 1 --branch "$ENZYME_SOURCE_TAG" https://github.com/EnzymeAD/Enzyme.git "$ENZYME_SRC"
     
     mkdir -p "$ENZYME_SRC/build_dir"
     cd "$ENZYME_SRC/build_dir"
