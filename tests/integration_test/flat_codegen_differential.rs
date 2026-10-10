@@ -1406,7 +1406,8 @@ fn assert_enum_layout_declines(src: &str) {
 
 #[test]
 fn flat_declines_an_enum_with_an_unsupported_nested_payload() {
-    // Only lower code: skipping Inner when sizing Outer would make its store overflow.
+    // Lower the code but don't run it: without the fix, the store of `Inner` would write
+    // past the end of `Outer`.
     assert_enum_layout_declines(
         "enum Inner { Value(i64), Empty }\n\
          enum Outer { Number(i32), Nested(Inner) }\n\
