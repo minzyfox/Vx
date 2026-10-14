@@ -1914,7 +1914,7 @@ impl CompilerDriver {
             .iter()
             .map(|(_, w)| w.local_inline_blocks.as_slice())
             .collect();
-        let agg_layouts: Vec<_> = entries
+        let agg_layouts: Vec<crate::layout::GeneratedAggregateLayout> = entries
             .iter()
             .flat_map(|(_, w)| w.local_agg_layouts.iter().cloned())
             .collect();

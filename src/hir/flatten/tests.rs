@@ -71,6 +71,181 @@ fn lower_with_registry(src: &str, fn_name: &str) -> (bool, LocalWorkerState) {
 }
 
 #[test]
+fn generated_struct_layout_records_nested_values_and_pointer_targets() {
+    let (did, worker) = lower_with_registry(
+        "struct Inner { value: i64 }\n\
+         struct Holder<T> { flag: i8, value: T, pointer: *const Inner }\n\
+         fn inspect(value: Holder<Inner>) -> void {}",
+        "inspect",
+    );
+    assert!(
+        did,
+        "the function with a generic struct parameter must lower"
+    );
+    let inner = worker
+        .global
+        .registry
+        .layout_gid_by_base_name("Inner")
+        .unwrap();
+    let inner_ty = Type::Struct("Inner".into(), Some(inner));
+    let layout = worker
+        .local_agg_layouts
+        .iter()
+        .find(|l| l.type_id == struct_instance_gid("Holder", std::slice::from_ref(&inner_ty)))
+        .expect("the worker contains the Holder layout");
+    assert_eq!(
+        layout,
+        &crate::layout::GeneratedAggregateLayout {
+            type_id: layout.type_id,
+            name: "Holder".into(),
+            size_bytes: 24,
+            align_bytes: 8,
+            logical_fields: vec![
+                crate::layout::GeneratedFieldLayout {
+                    layout: crate::layout::FieldLayout {
+                        name: "flag".into(),
+                        offset: 0,
+                        size: 1,
+                        ty: FieldTy::Scalar(ElementType::I8)
+                    },
+                    storage_index: 0,
+                    aggregate_id: None,
+                    pointer_target_id: None,
+                },
+                crate::layout::GeneratedFieldLayout {
+                    layout: crate::layout::FieldLayout {
+                        name: "value".into(),
+                        offset: 8,
+                        size: 8,
+                        ty: FieldTy::Nominal(inner)
+                    },
+                    storage_index: 1,
+                    aggregate_id: Some(inner),
+                    pointer_target_id: None,
+                },
+                crate::layout::GeneratedFieldLayout {
+                    layout: crate::layout::FieldLayout {
+                        name: "pointer".into(),
+                        offset: 16,
+                        size: 8,
+                        ty: FieldTy::Opaque
+                    },
+                    storage_index: 2,
+                    aggregate_id: None,
+                    pointer_target_id: Some(inner),
+                },
+            ],
+            storage_fields: ["i8", "!llvm.struct<(i64)>", "!llvm.ptr"]
+                .into_iter()
+                .map(|ty| crate::layout::GeneratedStorageField {
+                    mlir_type: ty.into(),
+                    is_padding: false
+                })
+                .collect(),
+            variant_payloads: vec![],
+        },
+        "the worker must retain the struct's complete generated layout"
+    );
+}
+
+#[test]
+fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
+    let (did, worker) = lower_with_registry(
+        "enum Number<T> { Small(T), Large(u64), Empty }\n\
+         fn inspect(value: Number<i8>) -> void {}",
+        "inspect",
+    );
+    assert!(did, "the function with an enum parameter must lower");
+    let gid = enum_instance_gid("Number", &[Type::Scalar(ElementType::I8)]);
+    let layout = worker
+        .local_agg_layouts
+        .iter()
+        .find(|l| l.type_id == gid)
+        .expect("the worker contains the Number layout");
+    let payload = |ty| crate::layout::GeneratedPayloadLayout {
+        ty: Type::Scalar(ty),
+        aggregate_id: None,
+        pointer_target_id: None,
+    };
+    assert_eq!(
+        layout,
+        &crate::layout::GeneratedAggregateLayout {
+            type_id: gid,
+            name: "Number".into(),
+            size_bytes: 16,
+            align_bytes: 8,
+            logical_fields: vec![
+                crate::layout::GeneratedFieldLayout {
+                    layout: crate::layout::FieldLayout {
+                        name: "tag".into(),
+                        offset: 0,
+                        size: 4,
+                        ty: FieldTy::Scalar(ElementType::I32)
+                    },
+                    storage_index: 0,
+                    aggregate_id: None,
+                    pointer_target_id: None,
+                },
+                crate::layout::GeneratedFieldLayout {
+                    layout: crate::layout::FieldLayout {
+                        name: "payload_0".into(),
+                        offset: 8,
+                        size: 8,
+                        ty: FieldTy::Scalar(ElementType::U64)
+                    },
+                    storage_index: 1,
+                    aggregate_id: None,
+                    pointer_target_id: None,
+                },
+            ],
+            storage_fields: ["i32", "i64"]
+                .into_iter()
+                .map(|ty| crate::layout::GeneratedStorageField {
+                    mlir_type: ty.into(),
+                    is_padding: false
+                })
+                .collect(),
+            variant_payloads: vec![
+                vec![payload(ElementType::I8)],
+                vec![payload(ElementType::U64)],
+                vec![]
+            ],
+        },
+        "a shared i64 slot must retain the actual i8 and u64 variant types"
+    );
+}
+
+#[test]
+fn generated_enum_layout_keeps_each_variants_pointer_target() {
+    let (did, worker) = lower_with_registry(
+        "struct Left { value: i32 }\n\
+         struct Right { value: i64 }\n\
+         enum Address { First(*const Left), Second(*const Right) }\n\
+         fn inspect(value: Address) -> void {}",
+        "inspect",
+    );
+    assert!(did, "the function with a pointer payload must lower");
+    let registry = &worker.global.registry;
+    let left = registry.layout_gid_by_base_name("Left").unwrap();
+    let right = registry.layout_gid_by_base_name("Right").unwrap();
+    let layout = worker
+        .local_agg_layouts
+        .iter()
+        .find(|l| l.type_id == enum_instance_gid("Address", &[]))
+        .expect("the worker contains the Address layout");
+    let payload = |name: &str, gid| crate::layout::GeneratedPayloadLayout {
+        ty: Type::Pointer(Box::new(Type::Struct(name.into(), Some(gid))), None, false),
+        aggregate_id: None,
+        pointer_target_id: Some(gid),
+    };
+    assert_eq!(
+        layout.variant_payloads,
+        vec![vec![payload("Left", left)], vec![payload("Right", right)]],
+        "variants sharing a pointer slot must retain distinct pointer targets"
+    );
+}
+
+#[test]
 fn the_control_flow_scan_sees_nested_and_trailing_positions() {
     // Each shape here hid a value-`if` from an earlier version of the scan; the register
     // path then let a branch's rebind escape its block. The scan is pinned directly, since

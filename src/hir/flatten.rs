@@ -407,12 +407,8 @@ struct Lowerer<'r> {
     owned_tensors: std::collections::HashSet<Symbol>,
     /// Locals whose element pointer the function takes: a view through it can share their memory.
     pointer_taken: std::collections::HashSet<Symbol>,
-    /// Synthetic aggregate layouts for monomorphized data-carrying enum instances (`Option<i32>` ->
-    /// `{ i32 tag, i32 payload }`), keyed by a per-instance GID: `(gid, field offsets, field MLIR
-    /// types)`. Such a layout is instance-dependent (the by-value payload varies with `T`), so it
-    /// isn't in the frozen registry; synthesized here as an enum is constructed/matched and committed
-    /// so codegen can address it (the tagged-union analogue of `tensor_types`). (#242)
-    agg_layouts: Vec<(TypeId, Vec<u64>, Vec<String>)>,
+    /// Generated struct and enum layouts, transferred to the worker without discarding metadata.
+    agg_layouts: Vec<crate::layout::GeneratedAggregateLayout>,
     /// This function's inline `mlir!` blocks, handed to the worker as `local_inline_blocks`.
     inline_blocks: Vec<InlineBlock>,
     /// A generic struct whose layout depends on its arguments (`Array<T, const N> { val: T }`):
@@ -2309,7 +2305,7 @@ impl<'r> Lowerer<'r> {
     /// loaded payload field before running the arm body — the same tag-dispatch + `extractvalue` the
     /// AST codegen emits, but through the flat aggregate machinery. (#242)
     fn lower_data_match(&mut self, m: &crate::syntax::MatchExpr, enum_name: &str) -> Lowered<()> {
-        let (gid, offsets, payload_types) =
+        let (gid, offsets) =
             self.enum_instance_layout(enum_name)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
@@ -2327,14 +2323,13 @@ impl<'r> Lowerer<'r> {
                 what: "an enum with no registered data",
             })?
             .clone();
-        // The instance's arguments, so a variant's declared payload can be read at the type
-        // this instance gives it. The layout's own types describe the slot, which is sized
-        // for the widest variant and named after none of them (Vx#570).
-        let (_, inst_args) = parse_enum_instance(enum_name);
-        let mut subst = HashMap::new();
-        for (g, a) in data.generics.iter().zip(inst_args.iter()) {
-            subst.insert(g.clone(), a.clone());
-        }
+        let variant_payloads = self
+            .agg_layouts
+            .iter()
+            .find(|layout| layout.type_id == gid)
+            .expect("a generated enum layout exists after successful layout resolution")
+            .variant_payloads
+            .clone();
         let merge = self.new_block();
         // Each arm is a block: its pattern's names and its `let`s end with it.
         let depth = self.block_frames.len();
@@ -2388,20 +2383,13 @@ impl<'r> Lowerer<'r> {
                                     what: "an enum payload offset that is not laid out",
                                 })?;
                                 // This variant's payload type, not the slot's.
-                                let vtys: Vec<Type> = data
-                                    .variants
+                                let payload = variant_payloads
                                     .get(ordinal as usize)
-                                    .map(|(_, p)| p.iter().map(|t| t.substitute(&subst)).collect())
-                                    .unwrap_or_default();
-                                let lty = lowered_ty(
-                                    vtys.get(i).or_else(|| payload_types.get(i)).ok_or(
-                                        Decline::TypeNotModelled {
-                                            what: "an enum payload type that is not laid out",
-                                        },
-                                    )?,
-                                    self.registry,
-                                )
-                                .ok_or(
+                                    .and_then(|types| types.get(i))
+                                    .ok_or(Decline::TypeNotModelled {
+                                        what: "an enum payload type that is not laid out",
+                                    })?;
+                                let lty = lowered_ty(&payload.ty, self.registry).ok_or(
                                     Decline::TypeNotModelled {
                                         what: "an enum payload type that is not modelled",
                                     },
@@ -2414,6 +2402,7 @@ impl<'r> Lowerer<'r> {
                                     poff,
                                 );
                                 self.note_shadow(pname);
+                                self.ast_types.insert(pname.clone(), payload.ty.clone());
                                 self.bind_local(pname.clone(), pval);
                             }
                         }
@@ -2861,7 +2850,7 @@ impl<'r> Lowerer<'r> {
                 })
             }
         };
-        let (enum_gid, offsets, payload_types) =
+        let (enum_gid, offsets) =
             self.enum_instance_layout_of(base, args)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
@@ -2882,6 +2871,16 @@ impl<'r> Lowerer<'r> {
             .ok_or(Decline::TypeNotModelled {
                 what: "an option-like enum with no payload variant",
             })? as u64;
+        let payload_type = self
+            .agg_layouts
+            .iter()
+            .find(|layout| layout.type_id == enum_gid)
+            .and_then(|layout| layout.variant_payloads.get(some_ord as usize))
+            .and_then(|payloads| payloads.first())
+            .map(|payload| payload.ty.clone())
+            .ok_or(Decline::TypeNotModelled {
+                what: "an enum payload type that is not laid out",
+            })?;
 
         // A loop over a variable advances that variable, so what it has not handed out is
         // still there for its drop after the loop. Any other iterator gets a slot of its own.
@@ -2965,13 +2964,7 @@ impl<'r> Lowerer<'r> {
 
         self.emit_effect(Opcode::BlockStart, Register(0), Register(0), body_b as u64);
         // Bind the loop variable to the payload.
-        let lty = lowered_ty(
-            payload_types.first().ok_or(Decline::TypeNotModelled {
-                what: "an enum payload type that is not laid out",
-            })?,
-            self.registry,
-        )
-        .ok_or(Decline::TypeNotModelled {
+        let lty = lowered_ty(&payload_type, self.registry).ok_or(Decline::TypeNotModelled {
             what: "an enum payload type that is not modelled",
         })?;
         let x = self.emit_typed(
@@ -3257,7 +3250,7 @@ impl<'r> Lowerer<'r> {
             .ok_or(Decline::TypeNotModelled {
                 what: "a variant not in the enum",
             })? as u64;
-        let (gid, offsets, _) =
+        let (gid, offsets) =
             self.enum_instance_layout(&ev.enum_name)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
@@ -3315,7 +3308,7 @@ impl<'r> Lowerer<'r> {
                 .get(n.as_ref())
                 .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()));
             if is_data {
-                let (gid, _, _) = self.enum_instance_layout_of(n.as_ref(), &[])?;
+                let (gid, _) = self.enum_instance_layout_of(n.as_ref(), &[])?;
                 return Some(LoweredTy::Aggregate(gid));
             }
         }
@@ -3327,7 +3320,7 @@ impl<'r> Lowerer<'r> {
                     .get(n.as_ref())
                     .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()));
                 if is_data {
-                    let (gid, _, _) = self.enum_instance_layout_of(n.as_ref(), args)?;
+                    let (gid, _) = self.enum_instance_layout_of(n.as_ref(), args)?;
                     return Some(LoweredTy::Aggregate(gid));
                 }
                 // A generic struct whose layout depends on its arguments: the base layout is a
@@ -3396,11 +3389,68 @@ impl<'r> Lowerer<'r> {
             .or_else(|| self.registry.layouts.get(gid))
     }
 
+    /// Recover an aggregate ID without resolving a pointer target's layout.
+    fn known_aggregate_id(&self, ty: &Type) -> Option<TypeId> {
+        let (base, args) = match ty {
+            Type::GenericInstance(base, args) => (base.as_ref(), args.as_slice()),
+            other => (other, &[][..]),
+        };
+        let (Type::Struct(name, id) | Type::Enum(name, id)) = base else {
+            return None;
+        };
+        if let Some(data) = self.registry.enum_data.get(name.as_ref()) {
+            return data
+                .variants
+                .iter()
+                .any(|(_, p)| !p.is_empty())
+                .then(|| enum_instance_gid(name.as_ref(), args));
+        }
+        if let Some(LoweredTy::Aggregate(gid)) = lowered_ty(ty, self.registry) {
+            return Some(gid);
+        }
+        // An incomplete struct layout still has a declaration ID. Its pointer does not
+        // need the target's size, and its metadata must not depend on resolution order.
+        let mut nominal = *id;
+        if nominal.is_none() {
+            for def in self
+                .registry
+                .layouts
+                .values()
+                .filter(|d| d.name == name.as_ref())
+            {
+                if nominal.is_some_and(|gid| gid != def.id) {
+                    return None;
+                }
+                nominal = Some(def.id);
+            }
+        }
+        let nominal = nominal.filter(|gid| self.registry.structs.contains_key(gid))?;
+        if matches!(ty, Type::GenericInstance(..)) {
+            Some(struct_instance_gid(name.as_ref(), args))
+        } else {
+            Some(nominal)
+        }
+    }
+
+    fn payload_metadata(&self, ty: Type) -> crate::layout::GeneratedPayloadLayout {
+        let (aggregate_id, pointer_target_id) = match &ty {
+            Type::Pointer(inner, ..) | Type::Borrow { inner, .. } | Type::Ref(inner, ..) => {
+                (None, self.known_aggregate_id(inner))
+            }
+            _ => (self.known_aggregate_id(&ty), None),
+        };
+        crate::layout::GeneratedPayloadLayout {
+            ty,
+            aggregate_id,
+            pointer_target_id,
+        }
+    }
+
     /// Synthesize (once) and record the layout of a generic struct instance whose base layout
     /// is a stub -- a by-value generic field makes the size depend on the arguments. The
     /// declared fields are substituted with the instance's arguments and laid out with natural
-    /// alignment, the way the registry lays out a concrete struct; scalar and pointer fields
-    /// only. Declines a name two modules declare, so a wrong layout is never chosen.
+    /// alignment. Supported fields include scalars, pointers, and aggregates with known storage.
+    /// Declines a name two modules declare, so a wrong layout is never chosen.
     fn struct_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<TypeId> {
         let gid = struct_instance_gid(base, args);
         if self.instance_layouts.contains_key(&gid) {
@@ -3421,8 +3471,7 @@ impl<'r> Lowerer<'r> {
             mapping.insert(g.clone(), a.clone());
         }
         let mut fields = Vec::with_capacity(decl.fields.len());
-        let mut offsets = Vec::with_capacity(decl.fields.len());
-        let mut field_tys = Vec::with_capacity(decl.fields.len());
+        let mut storage_fields = Vec::with_capacity(decl.fields.len());
         let (mut off, mut align) = (0u64, 1u64);
         let decl_fields = decl.fields.clone();
         for (name, ty) in &decl_fields {
@@ -3440,19 +3489,12 @@ impl<'r> Lowerer<'r> {
                     else {
                         return None;
                     };
-                    let (inner, offsets, payload) =
-                        self.enum_instance_layout_of(inner_name.as_ref(), a)?;
-                    let (mut end, mut al) = (4u64, 4u64);
-                    for (o, pt) in offsets.iter().skip(1).zip(&payload) {
-                        let (psz, pal, _) = self.payload_field(pt)?;
-                        end = o + psz;
-                        al = al.max(pal);
-                    }
-                    let tys = &self.agg_layouts.iter().find(|(g, _, _)| *g == inner)?.2;
+                    let (inner, _) = self.enum_instance_layout_of(inner_name.as_ref(), a)?;
+                    let layout = self.agg_layouts.iter().find(|l| l.type_id == inner)?;
                     (
-                        crate::layout::align_up(end as usize, al as usize) as u64,
-                        al,
-                        format!("!llvm.struct<({})>", tys.join(", ")),
+                        layout.size_bytes,
+                        layout.align_bytes,
+                        crate::codegen::flat::generated_storage_type(layout),
                         FieldTy::Nominal(inner),
                     )
                 }
@@ -3461,12 +3503,11 @@ impl<'r> Lowerer<'r> {
                         return None;
                     };
                     let inner = self.struct_instance_layout_of(inner_name.as_ref(), a)?;
-                    let def = self.instance_layouts.get(&inner)?;
-                    let tys = &self.agg_layouts.iter().find(|(g, _, _)| *g == inner)?.2;
+                    let layout = self.agg_layouts.iter().find(|l| l.type_id == inner)?;
                     (
-                        def.size_bytes as u64,
-                        def.align_bytes as u64,
-                        format!("!llvm.struct<({})>", tys.join(", ")),
+                        layout.size_bytes,
+                        layout.align_bytes,
+                        crate::codegen::flat::generated_storage_type(layout),
                         FieldTy::Nominal(inner),
                     )
                 }
@@ -3486,31 +3527,38 @@ impl<'r> Lowerer<'r> {
                 }
             };
             off = crate::layout::align_up(off as usize, al as usize) as u64;
-            fields.push(crate::layout::FieldLayout {
-                name: name.clone(),
-                offset: off as usize,
-                size: sz as usize,
-                ty: kind,
+            let metadata = self.payload_metadata(fty);
+            fields.push(crate::layout::GeneratedFieldLayout {
+                layout: crate::layout::FieldLayout {
+                    name: name.clone(),
+                    offset: off as usize,
+                    size: sz as usize,
+                    ty: kind,
+                },
+                storage_index: storage_fields.len(),
+                aggregate_id: metadata.aggregate_id,
+                pointer_target_id: metadata.pointer_target_id,
             });
-            offsets.push(off);
-            field_tys.push(mlir);
+            storage_fields.push(crate::layout::GeneratedStorageField {
+                mlir_type: mlir,
+                is_padding: false,
+            });
             off += sz;
             align = align.max(al);
         }
         let size = crate::layout::align_up(off as usize, align as usize);
-        self.instance_layouts.insert(
-            gid,
-            crate::registry::TypeDefinition {
-                id: gid,
+        if !self.agg_layouts.iter().any(|l| l.type_id == gid) {
+            let layout = crate::layout::GeneratedAggregateLayout {
+                type_id: gid,
                 name: base.to_string(),
-                size_bytes: size,
-                align_bytes: align as usize,
-                fields,
-                by_value_dependencies: Vec::new(),
-            },
-        );
-        if !self.agg_layouts.iter().any(|(g, _, _)| *g == gid) {
-            self.agg_layouts.push((gid, offsets, field_tys));
+                size_bytes: size as u64,
+                align_bytes: align,
+                logical_fields: fields,
+                storage_fields,
+                variant_payloads: Vec::new(),
+            };
+            self.instance_layouts.insert(gid, layout.type_definition());
+            self.agg_layouts.push(layout);
         }
         Some(gid)
     }
@@ -3531,13 +3579,11 @@ impl<'r> Lowerer<'r> {
             && self.struct_instance_layout_of(n.as_ref(), a).is_some()
     }
 
-    /// Synthesize (once) and record the aggregate layout of a monomorphized data-carrying enum
-    /// instance (`"Option<i32>"` -> `{ i32 tag @0, i32 payload @4 }`), returning its per-instance GID
-    /// and the field byte offsets. The payload is the first non-empty variant's payload types
-    /// (`Option`'s `Some(T)`) substituted with the instance args, laid after the `i32` tag with
-    /// natural alignment — matching the AST codegen's `{ i32, <payload> }`. `None` for a payload-free
-    /// enum (a bare `i32` discriminant, not an aggregate) or an unmodelled payload type. (#242)
-    fn enum_instance_layout(&mut self, enum_name: &str) -> Option<(TypeId, Vec<u64>, Vec<Type>)> {
+    /// Record a concrete enum's storage layout and return its ID and logical offsets.
+    /// Each payload position uses the widest supported variant at that position.
+    /// Actual variant types remain separate in the generated layout record.
+    /// Returns `None` for an unsupported payload type.
+    fn enum_instance_layout(&mut self, enum_name: &str) -> Option<(TypeId, Vec<u64>)> {
         let (base, args) = parse_enum_instance(enum_name);
         self.enum_instance_layout_of(&base, &args)
     }
@@ -3591,23 +3637,22 @@ impl<'r> Lowerer<'r> {
                     return None;
                 };
                 let gid = self.struct_instance_layout_of(name.as_ref(), args)?;
-                let def = self.instance_layouts.get(&gid)?;
-                let tys = &self.agg_layouts.iter().find(|(g, _, _)| *g == gid)?.2;
+                let layout = self.agg_layouts.iter().find(|l| l.type_id == gid)?;
                 Some((
-                    def.size_bytes as u64,
-                    def.align_bytes as u64,
-                    format!("!llvm.struct<({})>", tys.join(", ")),
+                    layout.size_bytes,
+                    layout.align_bytes,
+                    crate::codegen::flat::generated_storage_type(layout),
                 ))
             }
             _ => None,
         }
     }
 
-    fn enum_instance_layout_of(
-        &mut self,
-        base: &str,
-        args: &[Type],
-    ) -> Option<(TypeId, Vec<u64>, Vec<Type>)> {
+    fn enum_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<(TypeId, Vec<u64>)> {
+        let gid = enum_instance_gid(base, args);
+        if let Some(layout) = self.agg_layouts.iter().find(|l| l.type_id == gid) {
+            return Some((gid, layout.logical_offsets()));
+        }
         let data = self.registry.enum_data.get(base)?;
         let mut mapping = HashMap::new();
         for (g, a) in data.generics.iter().zip(args) {
@@ -3640,27 +3685,88 @@ impl<'r> Lowerer<'r> {
             }
             payload.push(widest?.2);
         }
-        let mut offsets = vec![0u64];
-        let mut field_tys = vec!["i32".to_string()]; // the discriminant tag
+        let mut storage_fields = vec![crate::layout::GeneratedStorageField {
+            mlir_type: "i32".to_string(),
+            is_padding: false,
+        }];
+        let mut fields = vec![crate::layout::GeneratedFieldLayout {
+            layout: crate::layout::FieldLayout {
+                name: "tag".into(),
+                offset: 0,
+                size: 4,
+                ty: FieldTy::Scalar(ElementType::I32),
+            },
+            storage_index: 0,
+            aggregate_id: None,
+            pointer_target_id: None,
+        }];
+        let mut align = 4u64;
         let mut off = 4u64;
         for pt in &payload {
             let (sz, al, mlir) = self.payload_field(pt)?;
             off = crate::layout::align_up(off as usize, al as usize) as u64;
-            offsets.push(off);
             // A payload slot holds bits, so it is declared as an integer of the right
             // width rather than as whichever variant's type happened to be widest. The
             // struct is loaded and passed whole, and a float field does not carry integer
             // bits through that: 7 stored as an `i32` and copied through an `f32` field is
             // a denormal, which the copy is free to flush to zero (Vx#570). A pointer
             // keeps its own type, which is what carries it.
-            field_tys.push(mlir);
+            let metadata = self.payload_metadata(pt.clone());
+            let kind = match &metadata.ty {
+                Type::Scalar(e) => FieldTy::Scalar(e.clone()),
+                _ => metadata
+                    .aggregate_id
+                    .map(FieldTy::Nominal)
+                    .unwrap_or_else(|| {
+                        if mlir == "i32" {
+                            FieldTy::Scalar(ElementType::I32)
+                        } else {
+                            FieldTy::Opaque
+                        }
+                    }),
+            };
+            fields.push(crate::layout::GeneratedFieldLayout {
+                layout: crate::layout::FieldLayout {
+                    name: format!("payload_{}", fields.len() - 1).into(),
+                    offset: off as usize,
+                    size: sz as usize,
+                    ty: kind,
+                },
+                storage_index: storage_fields.len(),
+                aggregate_id: metadata.aggregate_id,
+                pointer_target_id: metadata.pointer_target_id,
+            });
+            storage_fields.push(crate::layout::GeneratedStorageField {
+                mlir_type: mlir,
+                is_padding: false,
+            });
             off += sz;
+            align = align.max(al);
         }
-        let gid = enum_instance_gid(base, args);
-        if !self.agg_layouts.iter().any(|(g, _, _)| *g == gid) {
-            self.agg_layouts.push((gid, offsets.clone(), field_tys));
+        if !self.agg_layouts.iter().any(|l| l.type_id == gid) {
+            let variant_payloads = data
+                .variants
+                .iter()
+                .map(|(_, types)| {
+                    types
+                        .iter()
+                        .map(|ty| self.payload_metadata(ty.substitute(&mapping)))
+                        .collect()
+                })
+                .collect();
+            self.agg_layouts
+                .push(crate::layout::GeneratedAggregateLayout {
+                    type_id: gid,
+                    name: base.to_string(),
+                    size_bytes: crate::layout::align_up(off as usize, align as usize) as u64,
+                    align_bytes: align,
+                    logical_fields: fields,
+                    storage_fields,
+                    variant_payloads,
+                });
         }
-        Some((gid, offsets, payload))
+        let layout = self.agg_layouts.iter().find(|l| l.type_id == gid)?;
+        Some((gid, layout.logical_offsets()))
     }
 
     fn lower_struct_init(&mut self, si: &crate::syntax::StructInitExpr) -> Lowered<Val> {

@@ -228,7 +228,7 @@ fn flat_llvm(src: &str) -> Option<String> {
         .iter()
         .map(|w| w.local_inline_blocks.as_slice())
         .collect();
-    let agg_layouts: Vec<_> = lowered
+    let agg_layouts: Vec<vxc::layout::GeneratedAggregateLayout> = lowered
         .iter()
         .flat_map(|w| w.local_agg_layouts.iter().cloned())
         .collect();
@@ -329,7 +329,7 @@ fn flat_module_mlir(src: &str) -> Option<String> {
         .iter()
         .map(|w| w.local_inline_blocks.as_slice())
         .collect();
-    let agg_layouts: Vec<_> = lowered
+    let agg_layouts: Vec<vxc::layout::GeneratedAggregateLayout> = lowered
         .iter()
         .flat_map(|w| w.local_agg_layouts.iter().cloned())
         .collect();
