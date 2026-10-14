@@ -27,6 +27,87 @@ use crate::gid::TypeId;
 use crate::symbol::Symbol;
 use crate::syntax::{ElementType, EnumDecl, StructDecl, Type};
 
+/// A generated aggregate layout passed from a function's lowerer to code generation.
+/// Storage fields can differ from the values each enum variant puts in them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedAggregateLayout {
+    pub type_id: TypeId,
+    pub name: String,
+    pub size_bytes: u64,
+    pub align_bytes: u64,
+    pub logical_fields: Vec<GeneratedFieldLayout>,
+    pub storage_fields: Vec<GeneratedStorageField>,
+    /// Actual payload types and metadata in declaration order for each enum variant.
+    /// Struct layouts have no variants.
+    pub variant_payloads: Vec<Vec<GeneratedPayloadLayout>>,
+}
+
+/// One logical field and its physical storage index.
+/// Enum fields describe shared storage slots. Actual values belong to `variant_payloads`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedFieldLayout {
+    pub layout: FieldLayout,
+    pub storage_index: usize,
+    pub aggregate_id: Option<TypeId>,
+    pub pointer_target_id: Option<TypeId>,
+}
+
+/// One physical field in the generated LLVM struct, including explicit padding when needed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedStorageField {
+    pub mlir_type: String,
+    pub is_padding: bool,
+}
+
+impl GeneratedAggregateLayout {
+    pub fn logical_offsets(&self) -> Vec<u64> {
+        self.logical_fields
+            .iter()
+            .map(|f| f.layout.offset as u64)
+            .collect()
+    }
+
+    pub fn type_layout(&self) -> TypeLayout {
+        TypeLayout {
+            size: self.size_bytes as usize,
+            align: self.align_bytes as usize,
+            fields: self
+                .logical_fields
+                .iter()
+                .map(|f| f.layout.clone())
+                .collect(),
+        }
+    }
+
+    /// Derive the lowerer's nominal layout view from the shared record.
+    pub fn type_definition(&self) -> crate::registry::TypeDefinition {
+        let layout = self.type_layout();
+        crate::registry::TypeDefinition {
+            id: self.type_id,
+            name: self.name.clone(),
+            size_bytes: layout.size,
+            align_bytes: layout.align,
+            fields: layout.fields,
+            by_value_dependencies: self
+                .logical_fields
+                .iter()
+                .filter_map(|f| match f.layout.ty {
+                    FieldTy::Nominal(id) => Some(id),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// An enum payload's actual type, independent of its shared storage field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedPayloadLayout {
+    pub ty: Type,
+    pub aggregate_id: Option<TypeId>,
+    pub pointer_target_id: Option<TypeId>,
+}
+
 /// The type of a struct field, enough to recover its value type at a field access. A pointer/ref
 /// field is `Opaque`: modelled for size/offset but not decomposed into a loadable scalar.
 #[derive(Debug, Clone, PartialEq, Eq)]

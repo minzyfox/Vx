@@ -1983,7 +1983,7 @@ fn codegen_mlir_phase(
         .iter()
         .flat_map(|(w, _)| w.local_tensor_types.iter().cloned())
         .collect();
-    let agg_layouts: Vec<_> = workers
+    let agg_layouts: Vec<crate::layout::GeneratedAggregateLayout> = workers
         .iter()
         .flat_map(|(w, _)| w.local_agg_layouts.iter().cloned())
         .collect();

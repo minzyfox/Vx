@@ -638,6 +638,8 @@ pub fn build_callee_map(
 pub struct AggLayout {
     pub struct_ty: String,
     pub offsets: Vec<u64>,
+    /// The physical storage index for each logical field.
+    pub field_indices: Vec<usize>,
     /// Each field's MLIR type (`"i32"`, `"!llvm.ptr"`, …) in declaration order, index-aligned with
     /// `offsets`. A field op loads/stores at `field_tys[field_idx]`.
     pub field_tys: Vec<String>,
@@ -652,6 +654,53 @@ pub struct AggLayout {
     /// a field loads the whole `!llvm.struct` value (tracked in `agg_val_of`), a `FieldStore` stores it,
     /// and taking its address (`&self.iter` for a method receiver) GEPs to it as an aggregate slot. (#242)
     pub field_agg: Vec<Option<TypeId>>,
+}
+
+/// Convert physical storage descriptions to an LLVM struct type.
+pub(crate) fn generated_storage_type(layout: &crate::layout::GeneratedAggregateLayout) -> String {
+    let types: Vec<&str> = layout
+        .storage_fields
+        .iter()
+        .map(|f| f.mlir_type.as_str())
+        .collect();
+    format!("!llvm.struct<({})>", types.join(", "))
+}
+
+impl AggLayout {
+    /// Derive the emitter's storage view from the shared generated layout.
+    fn from_generated(layout: &crate::layout::GeneratedAggregateLayout) -> Self {
+        let field_tys = layout
+            .logical_fields
+            .iter()
+            .map(|field| {
+                let storage = layout
+                    .storage_fields
+                    .get(field.storage_index)
+                    .expect("a logical field must have a physical storage field");
+                assert!(
+                    !storage.is_padding,
+                    "a logical field cannot use a padding field"
+                );
+                storage.mlir_type.clone()
+            })
+            .collect();
+        Self {
+            struct_ty: generated_storage_type(layout),
+            offsets: layout
+                .logical_fields
+                .iter()
+                .map(|f| f.layout.offset as u64)
+                .collect(),
+            field_indices: layout
+                .logical_fields
+                .iter()
+                .map(|f| f.storage_index)
+                .collect(),
+            field_tys,
+            field_pointee: vec![None; layout.logical_fields.len()],
+            field_agg: vec![None; layout.logical_fields.len()],
+        }
+    }
 }
 
 /// GID → aggregate layout, for the structs a stream constructs/reads. Structs whose fields are all
@@ -694,6 +743,7 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
                 AggLayout {
                     struct_ty: "!llvm.struct<()>".to_string(),
                     offsets: Vec::new(),
+                    field_indices: Vec::new(),
                     field_tys: Vec::new(),
                     field_pointee: Vec::new(),
                     field_agg: Vec::new(),
@@ -783,6 +833,7 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
             *gid,
             AggLayout {
                 struct_ty: format!("!llvm.struct<({})>", field_tys.join(", ")),
+                field_indices: (0..offsets.len()).collect(),
                 offsets,
                 field_tys,
                 field_pointee,
@@ -1176,7 +1227,7 @@ pub fn emit_module_mlir(
     tensor_types: &[(TypeId, ElementType, Vec<String>)],
     string_tables: &[&[String]],
     inline_tables: &[&[crate::hir::flatten::InlineBlock]],
-    agg_layouts: &[(TypeId, Vec<u64>, Vec<String>)],
+    agg_layouts: &[crate::layout::GeneratedAggregateLayout],
     alias_tables: &[&[(usize, usize, Vec<usize>)]],
     subspaces: &[SubspaceInfo],
     topo_archs: &[(i64, String)],
@@ -1196,19 +1247,12 @@ pub fn emit_module_mlir(
             .entry(*gid)
             .or_insert_with(|| (elem.clone(), shape.clone()));
     }
-    // Synthesized data-carrying enum-instance layouts (`Option<i32>` -> `{ i32, i32 }`): fold each into
-    // the aggregate map so a `FieldStore`/`FieldLoad`/`Alloca` on its GID resolves like any struct.
-    // Instance-dependent, so they aren't in the frozen registry (the lowerer synthesized them). (#242)
-    for (gid, offsets, field_tys) in agg_layouts {
-        ctx.aggs.entry(*gid).or_insert_with(|| AggLayout {
-            struct_ty: format!("!llvm.struct<({})>", field_tys.join(", ")),
-            offsets: offsets.clone(),
-            field_tys: field_tys.clone(),
-            // A synthesized enum instance carries no pointer-to-aggregate fields (its payload is a
-            // scalar/pointer-to-scalar), so no chained field access resolves through it.
-            field_pointee: vec![None; field_tys.len()],
-            field_agg: vec![None; field_tys.len()],
-        });
+    // Generated struct and enum instance layouts are local to the lowerer, outside the frozen registry.
+    // Install their storage shapes so aggregate allocation and field access can find them.
+    for layout in agg_layouts {
+        ctx.aggs
+            .entry(layout.type_id)
+            .or_insert_with(|| AggLayout::from_generated(layout));
     }
     // Rebuild the callee map now that the synthesized enum-instance layouts are in `aggs`: a callee
     // returning `Option<i32>` (a data enum) resolves its `ret_agg` only once its layout is present,
@@ -2395,6 +2439,13 @@ mod tests {
     /// real MLIR context — proving the module emitter (calls included) produces valid MLIR end to
     /// end. Mirrors the pipeline's registry build so callees resolve through `fn_sigs`.
     fn emit_module_and_verify(src: &str) -> String {
+        emit_module_with_layouts_and_verify(src, |_| {})
+    }
+
+    fn emit_module_with_layouts_and_verify(
+        src: &str,
+        change_layouts: impl FnOnce(&mut Vec<crate::layout::GeneratedAggregateLayout>),
+    ) -> String {
         let mut lexer = crate::lexer::Lexer::new(src);
         let tokens = lexer.tokenize();
         let mut parser = crate::parser::Parser::new(&tokens, src);
@@ -2448,10 +2499,11 @@ mod tests {
             .iter()
             .map(|w| w.local_inline_blocks.as_slice())
             .collect();
-        let agg_layouts: Vec<_> = lowered
+        let mut agg_layouts: Vec<crate::layout::GeneratedAggregateLayout> = lowered
             .iter()
             .flat_map(|w| w.local_agg_layouts.iter().cloned())
             .collect();
+        change_layouts(&mut agg_layouts);
         let alias_tables: Vec<&[(usize, usize, Vec<usize>)]> = lowered
             .iter()
             .map(|w| w.local_place_alias_stores.as_slice())
@@ -2485,6 +2537,124 @@ mod tests {
             "emitted MLIR failed to verify:\n{mlir}"
         );
         mlir
+    }
+
+    fn add_explicit_padding(layouts: &mut Vec<crate::layout::GeneratedAggregateLayout>) {
+        for layout in layouts {
+            if layout.name == "Pair" {
+                layout.storage_fields.insert(
+                    1,
+                    crate::layout::GeneratedStorageField {
+                        mlir_type: "!llvm.array<3 x i8>".into(),
+                        is_padding: true,
+                    },
+                );
+                layout.logical_fields[1].storage_index = 2;
+            }
+        }
+    }
+
+    #[test]
+    fn generated_layout_views_separate_padding_from_logical_fields() {
+        let _ = emit_module_with_layouts_and_verify(
+            "struct Pair<T> { flag: i8, value: T }\n\
+             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return p.value; }",
+            |layouts| {
+                add_explicit_padding(layouts);
+                let layout = layouts
+                    .iter()
+                    .find(|l| l.name == "Pair")
+                    .expect("Pair layout exists");
+                let lowerer = layout.type_definition();
+                assert_eq!(
+                    (lowerer.size_bytes, lowerer.align_bytes, lowerer.fields),
+                    (
+                        8,
+                        4,
+                        vec![
+                            crate::layout::FieldLayout {
+                                name: "flag".into(),
+                                offset: 0,
+                                size: 1,
+                                ty: crate::layout::FieldTy::Scalar(ElementType::I8)
+                            },
+                            crate::layout::FieldLayout {
+                                name: "value".into(),
+                                offset: 4,
+                                size: 4,
+                                ty: crate::layout::FieldTy::Scalar(ElementType::I32)
+                            },
+                        ]
+                    ),
+                    "the lowerer view must contain only the two logical fields"
+                );
+                let emitter = AggLayout::from_generated(layout);
+                assert_eq!(
+                    (
+                        emitter.struct_ty,
+                        emitter.offsets,
+                        emitter.field_indices,
+                        emitter.field_tys
+                    ),
+                    (
+                        "!llvm.struct<(i8, !llvm.array<3 x i8>, i32)>".into(),
+                        vec![0, 4],
+                        vec![0, 2],
+                        vec!["i8".into(), "i32".into()]
+                    ),
+                    "the emitter view must keep padding and the explicit field mapping"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn generated_layout_field_store_uses_the_physical_field_index() {
+        let mlir = emit_module_with_layouts_and_verify(
+            "struct Pair<T> { flag: i8, value: T }\n\
+             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return 0; }",
+            add_explicit_padding,
+        );
+        assert!(
+            mlir.lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("llvm.store")),
+            "the value store must address physical field 2:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn generated_layout_field_load_uses_the_physical_field_index() {
+        let mlir = emit_module_with_layouts_and_verify(
+            "struct Pair<T> { flag: i8, value: T }\n\
+             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return p.value; }",
+            add_explicit_padding,
+        );
+        assert!(
+            mlir.lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("llvm.load")),
+            "the value load must address physical field 2:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn generated_layout_field_address_uses_the_physical_field_index() {
+        let mlir = emit_module_with_layouts_and_verify(
+            "struct Pair<T> { flag: i8, value: T }\n\
+             fn read(value: &i32) -> i32 { return *value; }\n\
+             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return read(&p.value); }",
+            add_explicit_padding,
+        );
+        assert!(
+            mlir.lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("func.call @read")),
+            "the borrowed value must address physical field 2:\n{mlir}"
+        );
     }
 
     #[test]
