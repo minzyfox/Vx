@@ -71,14 +71,103 @@ pub fn ptr_gid() -> TypeId {
     TypeId::new(0, sym, 0, 0)
 }
 
-/// The stable per-instance GID of a monomorphized data-carrying enum (`Option<i32>`): module 0 +
-/// a content hash of the base name and mangled type arguments, so `Option<i32>` and `Option<i64>` are
-/// distinct aggregates and the same instance hashes identically in a signature and a body. Distinct
-/// from any struct GID (those carry a real module hash), so it never collides with a registry layout.
-/// (#242)
+// Function symbols omit some placement details that generated layout metadata must retain.
+fn aggregate_type_key(ty: &Type) -> String {
+    use crate::syntax::types::{Mangle, Placement, Topology};
+
+    fn index_key(expr: &Expr) -> String {
+        match expr {
+            Expr::Number(number) => number
+                .value
+                .as_ref()
+                .parse::<i128>()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| number.value.to_string()),
+            _ => format!("{expr:?}"),
+        }
+    }
+
+    fn topology_key(topology: &Topology) -> String {
+        match topology {
+            Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
+                format!("{:?}({:?})", topology.kind(), index_key(index))
+            }
+            Topology::Slice(base, start, end) => format!(
+                "slice({:?},{:?},{:?})",
+                topology_key(base),
+                index_key(start),
+                index_key(end)
+            ),
+            _ => format!("{:?}", topology.kind()),
+        }
+    }
+
+    let placement_key = |placement: &Option<Placement>| {
+        placement
+            .as_ref()
+            .map(|p| (topology_key(&p.topology), format!("{:?}", p.space)))
+    };
+    match ty {
+        Type::Tensor(elem, dims, placement) => {
+            let dimensions: Vec<_> = dims
+                .iter()
+                .map(|dim| match dim {
+                    Dim::Dyn => "?".into(),
+                    Dim::Static(expr) => crate::syntax::types::const_value_text(expr)
+                        .unwrap_or_else(|| format!("{expr:?}")),
+                })
+                .collect();
+            format!(
+                "tensor({elem:?},{dimensions:?},{:?})",
+                placement_key(placement)
+            )
+        }
+        Type::Pointer(inner, placement, mutable) => format!(
+            "pointer({:?},{:?},{mutable})",
+            aggregate_type_key(inner),
+            placement_key(placement)
+        ),
+        Type::Borrow {
+            inner,
+            mem_space,
+            is_mut,
+            ..
+        } => format!(
+            "borrow({:?},{mem_space:?},{is_mut})",
+            aggregate_type_key(inner)
+        ),
+        Type::Ref(inner, space) => format!("ref({:?},{space:?})", aggregate_type_key(inner)),
+        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner)),
+        Type::Pinned(inner, topology) => format!(
+            "pinned({:?},{:?})",
+            aggregate_type_key(inner),
+            topology_key(topology)
+        ),
+        Type::GenericInstance(base, args) => format!(
+            "instance({:?},{:?})",
+            aggregate_type_key(base),
+            args.iter().map(aggregate_type_key).collect::<Vec<_>>()
+        ),
+        Type::Function(params, result, unsafe_fn) => format!(
+            "function({:?},{:?},{unsafe_fn})",
+            params.iter().map(aggregate_type_key).collect::<Vec<_>>(),
+            aggregate_type_key(result)
+        ),
+        Type::Closure(params, result) => format!(
+            "closure({:?},{:?})",
+            params.iter().map(aggregate_type_key).collect::<Vec<_>>(),
+            aggregate_type_key(result)
+        ),
+        _ => ty.mangle(),
+    }
+}
+
+/// The stable GID of a concrete data-carrying enum (`Option<i32>`).
+/// The hash includes the base name, type arguments, and placement.
+/// Signatures and bodies use the same ID for an instance.
+/// Generated enum IDs use module 0, separate from registry structs.
 pub fn enum_instance_gid(base: &str, args: &[Type]) -> TypeId {
-    use crate::syntax::types::Mangle;
-    let mangled: Vec<String> = args.iter().map(|a| a.mangle()).collect();
+    let mangled: Vec<String> = args.iter().map(aggregate_type_key).collect();
     let sym = crate::hash::DefPath::Named(&format!("$enum::{base}<{}>", mangled.join(",")))
         .compute_symbol_hash();
     TypeId::new(0, sym, 0, 0)
@@ -126,19 +215,18 @@ pub struct InlineBlock {
 
 /// The stable per-instance GID of a monomorphized generic struct whose layout depends on its
 /// arguments (`Array<f32, 10>`): module 0 + a content hash of the base name and each argument's
-/// identity. A `const` argument contributes its value, so the same instance named from a
-/// signature and from a construction hashes the same; the Debug rendering `mangle` uses for a
-/// `Const` carries a span and would not.
+/// identity. Numeric constants contribute their evaluated values, matching payload metadata.
 pub fn struct_instance_gid(base: &str, args: &[Type]) -> TypeId {
-    use crate::syntax::types::Mangle;
     let keys: Vec<String> = args
         .iter()
         .map(|a| match a {
-            Type::Const(e) => match e.as_ref() {
-                Expr::Number(n) => n.value.as_ref().to_string(),
-                other => format!("{other:?}"),
-            },
-            other => other.mangle(),
+            Type::Const(e) => {
+                crate::syntax::types::const_value_text(e).unwrap_or_else(|| match e.as_ref() {
+                    Expr::Number(number) => number.value.to_string(),
+                    other => format!("{other:?}"),
+                })
+            }
+            other => aggregate_type_key(other),
         })
         .collect();
     let sym = crate::hash::DefPath::Named(&format!("$struct::{base}<{}>", keys.join(",")))
@@ -3467,6 +3555,19 @@ impl<'r> Lowerer<'r> {
                         None,
                         crate::syntax::Span::default(),
                     ));
+                }
+            }
+            Type::Tensor(_, dims, _) => {
+                for dim in dims {
+                    if let Dim::Static(expr) = dim {
+                        if let Some(value) = crate::syntax::types::const_value_text(expr) {
+                            *expr = Expr::Number(crate::syntax::NumberExpr::new(
+                                value,
+                                None,
+                                crate::syntax::Span::default(),
+                            ));
+                        }
+                    }
                 }
             }
             _ => {}

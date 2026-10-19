@@ -1520,12 +1520,21 @@ fn parallel_driver_falls_back_for_an_unsupported_enum_layout() {
 }
 
 fn assert_enum_variant_metadata_runs(jobs: Option<usize>) {
+    assert_generated_aggregate_runs(
+        "enum_variants_keep_their_own_field_metadata.vx",
+        &["17", "25", "17", "25", "29"],
+        jobs,
+    );
+}
+
+fn assert_generated_aggregate_runs(fixture: &str, expected: &[&str], jobs: Option<usize>) {
     let dir = tempfile::tempdir().expect("create fixture directory");
     let path = dir.path().join("enum_metadata.vx");
-    let source = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/backend/pass/enum_variants_keep_their_own_field_metadata.vx"
-    ))
+    let source = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/backend/pass")
+            .join(fixture),
+    )
     .expect("read fixture");
     std::fs::write(&path, source).expect("write fixture");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vxc"));
@@ -1554,10 +1563,10 @@ fn assert_enum_variant_metadata_runs(jobs: Option<usize>) {
     let actual: Vec<_> = values.split_whitespace().collect();
     assert_eq!(
         actual.len(),
-        5,
-        "five payload values with jobs={jobs:?}: {stdout}"
+        expected.len(),
+        "printed values from {fixture} with jobs={jobs:?}: {stdout}"
     );
-    for (i, expected) in ["17", "25", "17", "25", "29"].iter().enumerate() {
+    for (i, expected) in expected.iter().enumerate() {
         assert_eq!(actual[i], *expected, "payload value {i} with jobs={jobs:?}");
     }
 }
@@ -1574,6 +1583,42 @@ fn enum_variant_metadata_survives_parallel_compilation() {
         return;
     }
     assert_enum_variant_metadata_runs(Some(2));
+}
+
+#[test]
+fn aggregate_identity_keeps_tensor_placements_separate() {
+    assert_generated_aggregate_runs("enum_pointer_tensor_placements.vx", &["3"], None);
+}
+
+#[test]
+fn aggregate_identity_keeps_tensor_placements_separate_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs("enum_pointer_tensor_placements.vx", &["3"], Some(2));
+}
+
+#[test]
+fn aggregate_identity_preserves_a_nested_struct_with_a_leading_zero_constant() {
+    assert_generated_aggregate_runs(
+        "nested_struct_with_a_leading_zero_constant.vx",
+        &["17"],
+        None,
+    );
+}
+
+#[test]
+fn aggregate_identity_preserves_a_nested_struct_with_a_leading_zero_constant_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs(
+        "nested_struct_with_a_leading_zero_constant.vx",
+        &["17"],
+        Some(2),
+    );
 }
 
 #[test]

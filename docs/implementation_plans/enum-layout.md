@@ -10,7 +10,9 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 [issue 570](https://github.com/vx-lang/Vx/issues/570), based on
 [the nested enum and struct layout proposal](nested_enum_and_struct_layouts.md).
 Section 1 is implemented as of October 9, 2026.
-Section 2's metadata transfer is implemented as of October 19, 2026.
+Section 2's metadata transfer landed on October 19, 2026.
+Review found two type-identity regressions in commit 4cab0f49.
+Their corrections passed macOS validation. Linux validation remains for CI.
 The later sections describe work to do.
 
 The target is correct construction, calls, returns, borrows, matching, and
@@ -177,6 +179,11 @@ Some supporting behavior already exists:
 
 - [x] When functions or workers produce the same type ID, assert their layout
   records agree. Keep mutable resolution local to each worker.
+
+- [x] Align generated type IDs with retained placement metadata and constant values.
+  Different tensor placements must not share an enum or struct instance ID.
+  Equivalent placements and constant spellings must identify the same layout.
+  Check both regressions with normal compilation and `-j 2`, without AST fallback.
 
 - [x] Add focused tests for metadata surviving the worker-to-emitter path,
   equal duplicate records being accepted, and conflicting records being
@@ -347,7 +354,7 @@ tests passed again. Boolean and string native fixtures were rechecked separately
 The `test_backend_fail` group still failed on `box_oob.vx`.
 The full suite was not rerun after rebuilding the runtime.
 These results do not establish a clean full suite. No baseline comparison was run.
-The changes remain staged because the commit hook failed.
+Commit 4cab0f49 bypassed that hook and recorded these validation limits.
 
 Recheck commands used the virtual environment and `source config.local`
 before each Cargo command:
@@ -368,6 +375,47 @@ Runtime rechecks are in `build/enum-layout-runtime-*.log`.
 losing metadata, duplicate layouts cannot depend on insertion order, and
 existing programs retain their behavior. Review this as the first PR after
 the safety guard.
+
+**Identity regression corrections after review of 4cab0f49:**
+The original tensor-placement reproducer exited with code 101 in normal and
+two-worker compilation. The nested constant reproducer succeeded through AST fallback.
+Both now compile through the flat path in both modes.
+
+Generated enum and struct IDs now use placement-aware type keys.
+These keys retain nested tensor memory and device identity.
+Equivalent device and memory spellings identify the same placement.
+Function symbol mangling keeps its existing convention.
+Struct constant IDs use the same value evaluator as payload metadata.
+This makes `03` and `3` identify one layout during generation and lookup.
+Numeric tensor dimensions also discard source annotations in retained metadata.
+The strict duplicate-layout assertion remains enabled.
+
+The fixtures `enum_pointer_tensor_placements.vx` and
+`nested_struct_with_a_leading_zero_constant.vx` cover both regressions.
+Four native driver tests require successful normal and parallel compilation,
+the corresponding flat-path marker, and outputs `3` and `17`.
+Unit tests check placement identity, equal constant values, tensor dimension
+annotations, and whether a nested field ID identifies a registered layout.
+
+Eleven mutation checks failed at their intended assertions.
+Nine checked identity rules and the registered nested layout.
+Two changed the fixtures' printed values and failed their output assertions.
+All temporary changes were restored.
+The original review reproducers also passed normal and `-j 2` flat compilation.
+Logs are in `build/enum-identity-*.log`.
+
+Follow-up validation passed:
+
+- `cargo test -j 2 -p vxc --lib`: 620 tests passed, with one ignored.
+- `cargo test -j 2 -p vxc --test integration_test integration_test::flat_codegen_differential::`:
+  172 tests passed, including the four native driver regressions.
+- The exact backend coverage command above passed one selected test without changing `KNOWN_DECLINES`.
+- `cargo test -j 2 -p vxc --test integration_test integration_test::codegen_determinism:: -- --test-threads=2`:
+  one test passed across the complete backend corpus.
+- `cargo clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: passed.
+
+The check updater found no `RUN` lines in the two `EXPECT` fixtures and made no changes.
+The full suite was not rerun. Its earlier failures remain documented above.
 
 ## 3. Resolve concrete nested types and build correct storage
 

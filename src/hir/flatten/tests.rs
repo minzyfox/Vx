@@ -149,6 +149,135 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
 }
 
 #[test]
+fn aggregate_identity_preserves_tensor_placement() {
+    use crate::syntax::{MemorySpace, Placement, Topology};
+    let pointer = |placement| {
+        Type::Pointer(
+            Box::new(Type::Tensor(
+                ElementType::F32,
+                vec![Dim::Static(Expr::Number(NumberExpr::new(
+                    "4".into(),
+                    None,
+                    crate::syntax::Span::default(),
+                )))],
+                placement,
+            )),
+            None,
+            false,
+        )
+    };
+    let host = pointer(None);
+    let gpu = pointer(Some(Placement::at(MemorySpace::GpuHbm)));
+    let same_gpu = pointer(Some(Placement::on(Topology::gpu(0))));
+    let other_gpu = pointer(Some(Placement::on(Topology::gpu(1))));
+    for (name, identity) in [
+        ("enum", enum_instance_gid as fn(&str, &[Type]) -> TypeId),
+        ("struct", struct_instance_gid as fn(&str, &[Type]) -> TypeId),
+    ] {
+        let id = |ty| identity("Holder", std::slice::from_ref(ty));
+        assert_ne!(id(&host), id(&gpu), "{name} distinguishes tensor memories");
+        assert_eq!(
+            id(&gpu),
+            id(&same_gpu),
+            "{name} recognizes the same placement"
+        );
+        assert_ne!(
+            id(&gpu),
+            id(&other_gpu),
+            "{name} distinguishes device indices"
+        );
+    }
+}
+
+#[test]
+fn aggregate_identity_uses_constant_values() {
+    let constant = |text: &str| {
+        Type::Const(Box::new(Expr::Number(NumberExpr::new(
+            text.into(),
+            None,
+            crate::syntax::Span::default(),
+        ))))
+    };
+    let leading_zero = [Type::Scalar(ElementType::I32), constant("03")];
+    let ordinary = [Type::Scalar(ElementType::I32), constant("3")];
+    let different = [Type::Scalar(ElementType::I32), constant("4")];
+    assert_eq!(
+        struct_instance_gid("Sized", &leading_zero),
+        struct_instance_gid("Sized", &ordinary),
+        "equal constants identify the same struct layout"
+    );
+    assert_ne!(
+        struct_instance_gid("Sized", &ordinary),
+        struct_instance_gid("Sized", &different),
+        "different constants identify different struct layouts"
+    );
+}
+
+#[test]
+fn aggregate_identity_keeps_nested_field_layouts_registered() {
+    let source =
+        include_str!("../../../tests/backend/pass/nested_struct_with_a_leading_zero_constant.vx");
+    let (ok, worker) = lower_with_registry(source, "main");
+    assert!(ok, "the function with a nested struct lowers");
+    let holder = worker
+        .local_agg_layouts
+        .iter()
+        .find(|layout| layout.name == "Holder")
+        .expect("Holder layout");
+    let inner = holder.logical_fields[0]
+        .aggregate_id
+        .expect("nested struct ID");
+    assert!(
+        worker
+            .local_agg_layouts
+            .iter()
+            .any(|layout| layout.type_id == inner)
+            || worker.global.registry.layouts.contains_key(&inner),
+        "the nested field's aggregate ID identifies a registered layout"
+    );
+}
+
+#[test]
+fn aggregate_identity_ignores_tensor_dimension_source_annotations() {
+    let (ok, worker) = lower_with_registry(
+        "enum Opt<T> { Some(T), None } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok, "the setup function lowers");
+    let pointer = |value: &str, column, annotation| {
+        Type::Pointer(
+            Box::new(Type::Tensor(
+                ElementType::F32,
+                vec![Dim::Static(Expr::Number(NumberExpr::new(
+                    value.into(),
+                    annotation,
+                    crate::syntax::Span {
+                        line: 3,
+                        column,
+                        length: value.len(),
+                    },
+                )))],
+                None,
+            )),
+            None,
+            false,
+        )
+    };
+    let mut first = Lowerer::new(&worker.global.registry);
+    let mut second = Lowerer::new(&worker.global.registry);
+    assert!(first
+        .enum_instance_layout_of("Opt", &[pointer("04", 7, None)])
+        .is_some());
+    assert!(second
+        .enum_instance_layout_of("Opt", &[pointer("4", 19, Some(ElementType::I32))])
+        .is_some());
+    assert_eq!(
+        first.agg_layouts, second.agg_layouts,
+        "equal tensor dimensions retain equal metadata across source locations"
+    );
+}
+
+#[test]
 fn enum_layouts_ignore_constant_argument_source_locations() {
     let (ok, worker) = lower_with_registry(
         "struct Grid<const N: i32> { value: i32 }\n\
