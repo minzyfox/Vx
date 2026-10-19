@@ -1097,7 +1097,7 @@ impl Type {
 
 /// The value of a const generic argument written with numbers and `+ - * /`, as text: `3.14`,
 /// `-2`, or `3` for `1 + 2`. `None` for anything else.
-fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
+pub(crate) fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
     use crate::syntax::expr::{BinaryOp, UnaryOp};
     use crate::syntax::Expr;
     #[derive(Clone, Copy)]

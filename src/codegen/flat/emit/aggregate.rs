@@ -148,7 +148,31 @@ impl FnEmit<'_> {
         // A pointer field pointing to a modelled aggregate (`VecIter`'s `vec : *const Vec<T>`)
         // tags its loaded value with the pointee GID, so a chained field access through it
         // (`(*self.vec).len`) GEPs the pointee. (#242)
-        let pointee = agg.field_pointee.get(field_idx).copied().flatten();
+        let payload = if ins.operand2.0 == 0 {
+            None
+        } else {
+            Some(
+                agg.variant_payloads
+                    .get((ins.operand2.0 - 1) as usize)
+                    .and_then(|payloads| field_idx.checked_sub(1).and_then(|i| payloads.get(i)))
+                    .ok_or(crate::emitter_gap!())?,
+            )
+        };
+        let pointee = match payload {
+            Some(payload) => payload.pointer_target_id,
+            None => agg.field_pointee.get(field_idx).copied().flatten(),
+        };
+        let nested = match payload {
+            Some(payload) => payload.aggregate_id,
+            None => agg.field_agg.get(field_idx).copied().flatten(),
+        };
+        let pointer = match payload {
+            Some(payload) => matches!(
+                payload.ty,
+                Type::Pointer(..) | Type::Borrow { .. } | Type::Ref(..)
+            ),
+            None => fty == "!llvm.ptr",
+        };
         let slot = self
             .names
             .get(ins.operand1.0 as usize)
@@ -162,28 +186,32 @@ impl FnEmit<'_> {
         // Read back at the type this instruction says it produces, for the same reason the
         // store writes at the value's: an enum payload slot holds whichever variant was
         // built, not the one the layout is named after.
-        let result_agg = self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .and_then(|g| self.ctx.aggs.get(g))
+        let result_agg = nested
+            .or_else(|| self.types.get(ins.type_idx.0 as usize).copied())
+            .and_then(|g| self.ctx.aggs.get(&g))
             .map(|a| a.struct_ty.clone());
         let result_is_tensor = self
             .types
             .get(ins.type_idx.0 as usize)
             .is_some_and(|g| self.ctx.tensors.contains_key(g));
-        let load_ty = match self
-            .types
-            .get(ins.type_idx.0 as usize)
-            .copied()
-            .and_then(elem_of_gid)
-        {
-            Some(e)
-                if is_scalar_field(&fty)
-                    || (fty.starts_with("!llvm.struct") && !result_is_tensor) =>
+        let load_ty = if pointer {
+            "!llvm.ptr".to_string()
+        } else {
+            match self
+                .types
+                .get(ins.type_idx.0 as usize)
+                .copied()
+                .and_then(elem_of_gid)
             {
-                crate::mlir_ty::mlir_scalar(&e).unwrap_or(&fty).to_string()
+                Some(e)
+                    if payload.is_some()
+                        || is_scalar_field(&fty)
+                        || (fty.starts_with("!llvm.struct") && !result_is_tensor) =>
+                {
+                    crate::mlir_ty::mlir_scalar(&e).unwrap_or(&fty).to_string()
+                }
+                _ => result_agg.unwrap_or_else(|| fty.clone()),
             }
-            _ => result_agg.unwrap_or_else(|| fty.clone()),
         };
         self.body += &format!("  {n} = llvm.load {p} : !llvm.ptr -> {load_ty}\n");
         self.names[idx] = n;
@@ -199,18 +227,17 @@ impl FnEmit<'_> {
             self.mem_of[idx] = Some(memty);
             return Ok(());
         }
-        if fty == "!llvm.ptr" {
+        if pointer {
             self.ptr_of[idx] = true;
             self.agg_of[idx] = pointee;
-        } else if let Some(nested_gid) = agg.field_agg.get(field_idx).copied().flatten() {
+        } else if let Some(nested_gid) = nested {
             // A by-value nested-aggregate field load yields the whole `!llvm.struct` value,
             // tracked as an aggregate value so it can be re-stored / passed by value. (#242)
             self.agg_val_of[idx] = Some(nested_gid);
         } else if let Some(g) =
             gid_res.filter(|g| fty.starts_with("!llvm.struct") && self.ctx.aggs.contains_key(g))
         {
-            // A synthesized layout (a generic struct instance) records no nested aggregates, so
-            // the result's own type says which aggregate the field holds.
+            // The result type can identify an aggregate when field metadata is unavailable.
             self.agg_val_of[idx] = Some(g);
         } else {
             // The instruction's own type keeps the field's signedness, which its MLIR spelling

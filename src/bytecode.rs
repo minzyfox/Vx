@@ -87,6 +87,8 @@ pub enum Opcode {
     /// Load a struct field: `operand1` is the aggregate's slot handle (from `Alloca`), `imm` the
     /// field's byte offset (from the registry layout), and `type_idx` the field's type. The result
     /// is the loaded field value — the field-addressed counterpart of `SlotLoad`.
+    /// For an enum payload, `operand2` holds the variant ordinal plus one, rather than a register.
+    /// Zero selects ordinary field metadata, including enum tags.
     FieldLoad = 22,
     /// Store into a struct field (no result): `operand1` is the aggregate's slot handle, `operand2`
     /// the value to store, and `imm` the field's byte offset. Used to initialize a struct field by

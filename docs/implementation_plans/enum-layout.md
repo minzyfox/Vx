@@ -6,12 +6,12 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # Nested enum layout TODO plan
 
-**Status:** in progress, October 13, 2026. Implementation tasks for
+**Status:** in progress, October 19, 2026. Implementation tasks for
 [issue 570](https://github.com/vx-lang/Vx/issues/570), based on
 [the nested enum and struct layout proposal](nested_enum_and_struct_layouts.md).
-Section 1 is implemented as of October 9, 2026. Section 2's first three tasks
-are implemented as of October 13, 2026. Its remaining tasks and the later
-sections describe work to do.
+Section 1 is implemented as of October 9, 2026.
+Section 2's metadata transfer is implemented as of October 19, 2026.
+The later sections describe work to do.
 
 The target is correct construction, calls, returns, borrows, matching, and
 drops for `Result<u64, Error>`, where `Error` contains `Option<i32>`.
@@ -110,21 +110,28 @@ for type inference inside each arm. Pointer target IDs do not depend on the
 order in which a worker resolves layouts. Producers, both compiler drivers,
 the emitter argument, and direct test callers use the named record.
 
-The second implementation step remains outstanding. The emitter still fills
-generated layouts' `field_agg` and `field_pointee` entries with `None`.
-It accepts the first record for each type ID without checking whether later
-records agree. Emitter metadata-transfer and duplicate-layout tests remain
-to do.
+**Second implementation step, October 19, 2026:** the emitter preserves
+nested aggregate and pointer target IDs from generated records. Enum payload
+loads identify their active variant separately from the shared storage slot.
+Match bindings retain their actual types and signedness. Iterator payload
+loads carry the same variant identity.
+
+The emitter compares complete generated records when workers supply the same
+type ID. Equal records are accepted. Conflicting records trigger an assertion.
+It rebuilds the nominal lookup before rebuilding callee signatures.
+Workers fill missing declaration IDs in payload types before recording layouts.
+This makes records agree when one function supplies an attached ID and another
+does not. Pointer targets and concrete generic arguments use the same rule.
+Layout resolution remains local to each worker, and storage shapes stay unchanged.
 
 Some supporting behavior already exists:
 
 - `lower_data_match` uses each variant's actual payload type for bindings,
-  rather than the shared storage slot's type. Emission still needs each
+  rather than the shared storage slot's type. Emission now uses each
   variant's recorded aggregate and pointer target IDs.
 
 - `emit_module_mlir` installs generated layouts before computing function
-  signatures and rebuilds the callee map afterward. It does not rebuild the
-  nominal lookup after installing those layouts.
+  signatures. It rebuilds the nominal lookup and then the callee map.
 
 - Commit a7bf5f09 (October 10, 2026, PR #1533) added generic structs containing
   `Option<T>`. The emitter obtains a nested aggregate ID from the field load's
@@ -148,7 +155,7 @@ Some supporting behavior already exists:
   separate from logical field metadata behind an explicit conversion to the
   emitter's representation.
 
-- [ ] Keep each variant's actual payload types separate from the types used to
+- [x] Keep each variant's actual payload types separate from the types used to
   store the shared payload slots. Preserve the existing variant-specific match
   binding types. Keep nested aggregate and pointer target IDs specific to each
   variant's concrete payload types. Preserve those IDs through emission.
@@ -162,16 +169,16 @@ Some supporting behavior already exists:
   Update direct callers in `tests/integration_test/flat_codegen_differential.rs`
   and code generation unit tests as well.
 
-- [ ] In `emit_module_mlir`, install complete generated layouts and rebuild
+- [x] In `emit_module_mlir`, install complete generated layouts and rebuild
   the required nominal lookup before computing callee and function signatures.
   Preserve the existing layout installation and callee-map rebuild order.
   Preserve nested aggregate and pointer target metadata instead of filling it
   with `None`.
 
-- [ ] When functions or workers produce the same type ID, assert their layout
+- [x] When functions or workers produce the same type ID, assert their layout
   records agree. Keep mutable resolution local to each worker.
 
-- [ ] Add focused tests for metadata surviving the worker-to-emitter path,
+- [x] Add focused tests for metadata surviving the worker-to-emitter path,
   equal duplicate records being accepted, and conflicting records being
   rejected. Check variant-specific metadata when variants share a storage slot.
   Check existing normal and parallel compilation behavior.
@@ -231,7 +238,131 @@ The full `cargo test` run reported five integration test failures:
 - `compile_test::test_backend_fail`: `box_oob.vx` did not produce its expected
   `Caught SIGSEGV` diagnostic.
 
-These failures remain unresolved. They were not checked against the baseline.
+These failures were not checked against the baseline during the first step.
+
+**Validation of the second implementation step on macOS, October 19, 2026:**
+96 lowering tests, 33 emitter tests, and 168 differential tests passed.
+The lowering, emitter, and differential commands above were rerun.
+The exact backend coverage gate passed one selected test without changing
+`KNOWN_DECLINES`.
+
+Seven new emitter tests check field metadata, variant-specific aggregate and
+pointer IDs, duplicate agreement, and lookup rebuilding before callee signatures.
+The signature test begins with an unresolved imported return type.
+A lowerer regression compares complete records with and without attached
+nominal IDs, including pointer targets and generic struct arguments.
+
+The new `enum_variants_keep_their_own_field_metadata.vx` fixture prints
+`17 25 17 25 29`. Two integration tests require these values and the flat-path
+marker through normal and two-worker compilation. Both compile and link a
+native executable. Each printed value has its own assertion.
+The generic struct stores `7` by value and points to a separate object containing `29`.
+This distinguishes the pointer target from the stored object.
+
+Review found two further metadata checks. Numeric constant arguments now use
+the same value evaluator as type identity, without source spans or inferred types.
+A lowerer regression compares equal constants at different source locations.
+It also checks that different constants keep different payload types.
+Tensor cleanup ignores a `FieldLoad` variant ordinal when it counts register uses.
+A regression checks both the ordinal collision and a real use of the tensor register.
+Five review checks failed at their intended assertions before restoring the code.
+They retained source annotations, collapsed different constants, miscounted register uses
+in both directions, and read the stored object instead of the pointer target.
+
+Review validation passed these commands:
+
+- `cargo test -j 2 -p vxc --lib`: 616 tests passed, with one ignored.
+- `cargo test -j 2 -p vxc --test integration_test integration_test::flat_codegen_differential::`:
+  168 tests passed.
+- `cargo test -j 2 -p vxc --test integration_test enum_variant_metadata_survives`:
+  both native compilation tests passed after the final rebuild.
+- `cargo clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: passed.
+
+The exact backend coverage command above passed one selected test again.
+The check updater found no `RUN` lines in the `EXPECT` fixture and made no changes.
+The full suite was not rerun during these review fixes.
+
+Eighteen separate mutations failed at their intended assertions.
+They removed field and variant IDs, copied IDs between variants, bypassed
+duplicate agreement, rejected equal records, and changed lookup rebuilding.
+Three mutations disabled declaration-ID normalization for plain structs,
+pointer targets, and generic arguments. The corresponding record comparisons failed.
+Five separate fixture mutations changed each printed value and failed its
+corresponding output assertion. All mutations were removed.
+
+The MLIR check updater ran on the new fixture. It found no `RUN` lines because
+the fixture uses `EXPECT`, and it made no changes. The emitter tests parse and
+verify generated MLIR.
+
+The compiler determinism test passed one selected test across the backend corpus.
+Eight existing fixtures passed native execution with normal compilation and
+`-j 2`: `generic_struct_with_an_option_field.vx`,
+`narrow_enum_payload_in_an_expression.vx`,
+`enum_variants_with_different_number_types.vx`,
+`enum_mixing_a_number_and_a_struct_payload.vx`, `enum_drops_its_payload.vx`,
+`struct_with_a_generic_struct_field.vx`,
+`vec_of_a_struct_with_a_generic_struct_field.vx`, and
+`return_a_match_that_makes_a_struct_or_enum.vx`.
+Each used `VX_FLAT_DBG=1 target/debug/vxc tests/backend/pass/<fixture> --run`,
+with `-j 2` added for parallel compilation. Checks required the correct compiler
+path marker and FileCheck or `EXPECT` values.
+
+Clippy, `cargo fmt --all --check`, and `git diff --check` passed.
+The additional commands were:
+
+```sh
+source venv/bin/activate
+export CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2
+source config.local
+cargo test -j 2 --test integration_test \
+  integration_test::codegen_determinism::the_same_program_always_compiles_to_the_same_mlir \
+  -- --exact
+source config.local
+cargo clippy -j 2 --workspace --all-targets --all-features -- -D warnings
+deactivate
+```
+
+Logs are in `build/enum-layout-final-*.log` and
+`build/enum-layout-mutation-*.log`. Linux validation remains for CI.
+
+The repository's commit hook passed formatting, generated-page checks, Clippy,
+and all 614 active compiler library tests. The full integration suite reported
+344 passes and seven failures, so the hook prevented the commit:
+
+- `ane_device_test::the_dispatcher_reports_the_device_coreml_chose`: the
+  dispatcher could not find the CoreML model on its search path.
+- `compile_test::test_backend`, `compile_test::test_frontend_pass`,
+  `emit_obj_produces_objects::the_backend_corpus_emits_object_files`, and
+  `flat_corpus_sweep::flat_path_answers_match_the_backend_expectations`:
+  boolean and string fixtures could not link runtime symbols.
+- `compile_test::test_backend_fail`: `box_oob.vx` read a distant address
+  without producing its expected `Caught SIGSEGV` diagnostic.
+- `compile_test::test_optimizations`: `topology_dispatch.vx` expected debug
+  module attributes that the compiler did not generate.
+
+The runtime source defines `print_bool`, but the existing dynamic library did
+not export it. `cargo build -j 2` rebuilt that library after sourcing `config.local`.
+The complete `test_frontend_pass` group then passed. Both enum metadata driver
+tests passed again. Boolean and string native fixtures were rechecked separately.
+The `test_backend_fail` group still failed on `box_oob.vx`.
+The full suite was not rerun after rebuilding the runtime.
+These results do not establish a clean full suite. No baseline comparison was run.
+The changes remain staged because the commit hook failed.
+
+Recheck commands used the virtual environment and `source config.local`
+before each Cargo command:
+
+```sh
+cargo build -j 2
+cargo test -j 2 --test integration_test \
+  integration_test::compile_test::test_frontend_pass -- --exact --test-threads=2
+cargo test -j 2 --test integration_test \
+  integration_test::compile_test::test_backend_fail -- --exact --test-threads=2
+cargo test -j 2 --test integration_test enum_variant_metadata -- --test-threads=2
+```
+
+The full-suite log is `build/enum-layout-commit.log`.
+Runtime rechecks are in `build/enum-layout-runtime-*.log`.
 
 **Done when:** the named record reaches every emitter entry point without
 losing metadata, duplicate layouts cannot depend on insertion order, and
@@ -240,9 +371,10 @@ the safety guard.
 
 ## 3. Resolve concrete nested types and build correct storage
 
-- [ ] Add one concrete layout resolver beside the lowerer's instance tables;
-  put reusable size and alignment calculations in `src/layout.rs`. Reuse
-  complete registry layouts without changing the serialized registry format.
+- [ ] Add one concrete layout resolver beside the lowerer's instance tables.
+  Reuse the registry's concrete generic struct layouts from PR #1904.
+  Put reusable size and alignment calculations in `src/layout.rs`.
+  Reuse complete registry layouts without changing the serialized registry format.
 - [ ] Make `lower_ty_synth`, `payload_field`, `struct_instance_layout_of`, and
   `enum_instance_layout_of` use this resolver. Support a non-generic struct
   with an incomplete registry layout, an enum inside a struct, and an enum
@@ -296,9 +428,9 @@ enable each new shape together with tests that exercise it.
 - [ ] Check chained field access and borrowed method receivers against the
   nested value's own layout. Pass nested values as parameters and return both
   whole results and extracted `Error` and `Option<i32>` values.
-- [ ] Handle a match whose arms all return an aggregate using the existing
-  unreachable-block path when its merge block is provably unreachable. Avoid
-  inventing a zero aggregate for the current non-scalar default return decline.
+- [ ] Verify nested aggregate returns through matches whose arms all return.
+  PR #1528 supports this shape with a trap if no arm returns a value.
+  Check the nested acceptance cases against that implementation.
   Preserve reachable match expressions unless an acceptance case needs a fix.
 - [ ] Audit generated drop calls: inspect only the active variant, preserve
   the checker's move rules, and drop a moved owning payload exactly once.

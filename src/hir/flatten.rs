@@ -2397,7 +2397,10 @@ impl<'r> Lowerer<'r> {
                                 let pval = self.emit_typed(
                                     Opcode::FieldLoad,
                                     slot,
-                                    Register(0),
+                                    Register(
+                                        u32::try_from(ordinal + 1)
+                                            .expect("enum variant fits in u32"),
+                                    ),
                                     lty,
                                     poff,
                                 );
@@ -2970,7 +2973,7 @@ impl<'r> Lowerer<'r> {
         let x = self.emit_typed(
             Opcode::FieldLoad,
             opt_slot.reg,
-            Register(0),
+            Register(u32::try_from(some_ord + 1).expect("enum variant fits in u32")),
             lty,
             *offsets.get(1).ok_or(Decline::TypeNotModelled {
                 what: "an enum payload offset that is not laid out",
@@ -3432,7 +3435,46 @@ impl<'r> Lowerer<'r> {
         }
     }
 
-    fn payload_metadata(&self, ty: Type) -> crate::layout::GeneratedPayloadLayout {
+    // Metadata must ignore declaration-ID omissions and numeric constant source annotations.
+    fn normalize_payload_type(&self, ty: &mut Type) {
+        match ty {
+            Type::Struct(name, id) | Type::Enum(name, id) => {
+                if id.is_none() {
+                    *id = self.registry.resolve_unique_nominal(name);
+                }
+            }
+            Type::Pointer(inner, ..)
+            | Type::Borrow { inner, .. }
+            | Type::Ref(inner, ..)
+            | Type::Verified(inner)
+            | Type::Pinned(inner, ..) => self.normalize_payload_type(inner),
+            Type::GenericInstance(base, args) => {
+                self.normalize_payload_type(base);
+                for arg in args {
+                    self.normalize_payload_type(arg);
+                }
+            }
+            Type::Function(params, result, _) | Type::Closure(params, result) => {
+                for param in params {
+                    self.normalize_payload_type(param);
+                }
+                self.normalize_payload_type(result);
+            }
+            Type::Const(expr) => {
+                if let Some(value) = crate::syntax::types::const_value_text(expr) {
+                    **expr = Expr::Number(crate::syntax::NumberExpr::new(
+                        value,
+                        None,
+                        crate::syntax::Span::default(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn payload_metadata(&self, mut ty: Type) -> crate::layout::GeneratedPayloadLayout {
+        self.normalize_payload_type(&mut ty);
         let (aggregate_id, pointer_target_id) = match &ty {
             Type::Pointer(inner, ..) | Type::Borrow { inner, .. } | Type::Ref(inner, ..) => {
                 (None, self.known_aggregate_id(inner))
@@ -5182,7 +5224,7 @@ impl<'r> Lowerer<'r> {
         }
         for (i, ins) in self.code.iter().enumerate().skip(r.0 as usize + 1) {
             let uses = ins.operand1 == r
-                || ins.operand2 == r
+                || (ins.opcode != Opcode::FieldLoad && ins.operand2 == r)
                 || (ins.opcode == Opcode::MatmulInto && ins.imm == r.0 as u64);
             if !uses {
                 continue;

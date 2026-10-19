@@ -149,6 +149,138 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
 }
 
 #[test]
+fn enum_layouts_ignore_constant_argument_source_locations() {
+    let (ok, worker) = lower_with_registry(
+        "struct Grid<const N: i32> { value: i32 }\n\
+         enum Opt<T> { Some(T), None }\n\
+         fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok, "the setup function lowers");
+    let payload_type = |value: &str, column, annotation| {
+        Type::Pointer(
+            Box::new(Type::GenericInstance(
+                Box::new(Type::Struct("Grid".into(), None)),
+                vec![Type::Const(Box::new(Expr::Number(
+                    crate::syntax::NumberExpr::new(
+                        value.into(),
+                        annotation,
+                        crate::syntax::Span {
+                            line: 3,
+                            column,
+                            length: 1,
+                        },
+                    ),
+                )))],
+            )),
+            None,
+            false,
+        )
+    };
+    let mut layouts = Vec::new();
+    for ty in [
+        payload_type("3", 7, None),
+        payload_type("3", 19, Some(ElementType::I32)),
+        payload_type("4", 7, None),
+    ] {
+        let mut lowerer = Lowerer::new(&worker.global.registry);
+        assert!(lowerer.enum_instance_layout_of("Opt", &[ty]).is_some());
+        assert_eq!(lowerer.agg_layouts.len(), 1, "one enum layout");
+        layouts.push(lowerer.agg_layouts.remove(0));
+    }
+    assert_eq!(
+        layouts[0], layouts[1],
+        "equal constant arguments share a layout across source locations"
+    );
+    assert_ne!(
+        layouts[0].variant_payloads[0][0].ty, layouts[2].variant_payloads[0][0].ty,
+        "different constant arguments retain different payload types"
+    );
+}
+
+#[test]
+fn enum_variant_metadata_does_not_keep_a_tensor_temporary_alive() {
+    let (_, worker) = lower_with_registry("fn inspect() -> void {}", "inspect");
+    for real_use in [false, true] {
+        let mut lowerer = Lowerer::new(&worker.global.registry);
+        lowerer.emit_effect(Opcode::Nop, Register(0), Register(0), 0);
+        let tensor = lowerer.emit_typed(
+            Opcode::TensorAlloc,
+            Register(0),
+            Register(0),
+            LoweredTy::Tensor {
+                elem: ElementType::F32,
+                shape: vec!["4".into()],
+            },
+            0,
+        );
+        // The variant ordinal has the same number as the temporary's register.
+        lowerer.emit_typed(
+            Opcode::FieldLoad,
+            if real_use { tensor.reg } else { Register(0) },
+            Register(1),
+            LoweredTy::Scalar(ElementType::I32),
+            8,
+        );
+        lowerer.drop_temps_here(None);
+        let drops: Vec<_> = lowerer
+            .code
+            .iter()
+            .filter(|ins| ins.opcode == Opcode::TensorDrop)
+            .map(|ins| ins.operand1)
+            .collect();
+        let expected = if real_use { vec![] } else { vec![tensor.reg] };
+        assert_eq!(drops, expected, "tensor cleanup with real use: {real_use}");
+    }
+}
+
+#[test]
+fn generated_enum_layouts_agree_with_or_without_attached_type_ids() {
+    let (did, worker) = lower_with_registry(
+        "struct Item { value: i32 }\n\
+         struct Holder<T> { value: T }\n\
+         enum Opt<T> { Some(T), None }\n\
+         fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(did, "the setup function lowers");
+    let registry = &worker.global.registry;
+    let item = registry.resolve_unique_nominal(&"Item".into()).unwrap();
+    let holder = registry.resolve_unique_nominal(&"Holder".into()).unwrap();
+    let missing = Type::Struct("Item".into(), None);
+    let attached = Type::Struct("Item".into(), Some(item));
+    for (name, first, second) in [
+        ("plain struct", missing.clone(), attached.clone()),
+        (
+            "pointer target",
+            Type::Pointer(Box::new(missing.clone()), None, false),
+            Type::Pointer(Box::new(attached.clone()), None, false),
+        ),
+        (
+            "generic struct arguments",
+            Type::GenericInstance(Box::new(Type::Struct("Holder".into(), None)), vec![missing]),
+            Type::GenericInstance(
+                Box::new(Type::Struct("Holder".into(), Some(holder))),
+                vec![attached],
+            ),
+        ),
+    ] {
+        let mut first_worker = Lowerer::new(registry);
+        let mut second_worker = Lowerer::new(registry);
+        assert!(first_worker
+            .enum_instance_layout_of("Opt", &[first])
+            .is_some());
+        assert!(second_worker
+            .enum_instance_layout_of("Opt", &[second])
+            .is_some());
+        assert_eq!(
+            first_worker.agg_layouts, second_worker.agg_layouts,
+            "canonical layout for {name}"
+        );
+    }
+}
+
+#[test]
 fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
     let (did, worker) = lower_with_registry(
         "enum Number<T> { Small(T), Large(u64), Empty }\n\

@@ -1519,6 +1519,63 @@ fn parallel_driver_falls_back_for_an_unsupported_enum_layout() {
     assert_enum_layout_falls_back(Some(2));
 }
 
+fn assert_enum_variant_metadata_runs(jobs: Option<usize>) {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let path = dir.path().join("enum_metadata.vx");
+    let source = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/backend/pass/enum_variants_keep_their_own_field_metadata.vx"
+    ))
+    .expect("read fixture");
+    std::fs::write(&path, source).expect("write fixture");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vxc"));
+    command.arg(&path).arg("--run").env("VX_FLAT_DBG", "1");
+    if let Some(jobs) = jobs {
+        command.arg("-j").arg(jobs.to_string());
+    }
+    let output = command.output().expect("compile and run fixture");
+    let log = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "compilation with jobs={jobs:?}: {log}\n{stdout}"
+    );
+    let marker = if jobs.is_some() {
+        "[parallel-frontend] emitted module with -j 2"
+    } else {
+        "[flat-codegen] emitted module via the flat path"
+    };
+    assert!(log.contains(marker), "flat path with jobs={jobs:?}: {log}");
+    // Native compilation prints progress before the program's final output line.
+    let values = stdout
+        .lines()
+        .last()
+        .expect("program prints its payload values");
+    let actual: Vec<_> = values.split_whitespace().collect();
+    assert_eq!(
+        actual.len(),
+        5,
+        "five payload values with jobs={jobs:?}: {stdout}"
+    );
+    for (i, expected) in ["17", "25", "17", "25", "29"].iter().enumerate() {
+        assert_eq!(actual[i], *expected, "payload value {i} with jobs={jobs:?}");
+    }
+}
+
+#[test]
+fn enum_variant_metadata_survives_normal_compilation() {
+    assert_enum_variant_metadata_runs(None);
+}
+
+#[test]
+fn enum_variant_metadata_survives_parallel_compilation() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_enum_variant_metadata_runs(Some(2));
+}
+
 #[test]
 fn flat_runs_an_enum_with_absent_payload_positions() {
     // Empty has no payloads and Single has no second payload; neither prevents a layout.
