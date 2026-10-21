@@ -1608,6 +1608,28 @@ fn enum_variants_with_different_structs_run_in_parallel() {
 }
 
 #[test]
+fn generic_struct_with_nested_pointer_fields_runs() {
+    assert_generated_aggregate_runs(
+        "generic_struct_with_nested_pointer_fields.vx",
+        &["5", "1", "17", "31"],
+        None,
+    );
+}
+
+#[test]
+fn generic_struct_with_nested_pointer_fields_runs_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs(
+        "generic_struct_with_nested_pointer_fields.vx",
+        &["5", "1", "17", "31"],
+        Some(2),
+    );
+}
+
+#[test]
 fn generic_structs_with_borrowed_tensors_run() {
     assert_generated_aggregate_runs(
         "generic_structs_with_borrowed_tensors.vx",

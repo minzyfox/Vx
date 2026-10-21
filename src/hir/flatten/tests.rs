@@ -589,6 +589,91 @@ fn generic_struct_reuses_storage_from_an_argument_independent_base() {
     );
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn nested_generic_field_metadata_uses_its_storage_id(#[case] precomputed: bool) {
+    let outer = if precomputed {
+        "struct Outer { inner: Pair<i32> }"
+    } else {
+        ""
+    };
+    let source = format!("struct Node {{ value: i32 }} struct Buffer<T> {{ data: *const T, len: i32 }} struct Pair<T> {{ first: T, items: Buffer<T>, pointer: *const Node }} {outer} fn inspect(value: Pair<i32>) -> void {{}}");
+    let (ok, worker) = lower_with_registry(&source, "inspect");
+    assert!(ok, "the nested generic parameter lowers");
+    let registry = &worker.global.registry;
+    let parent = worker
+        .local_agg_layouts
+        .iter()
+        .find(|layout| layout.name == "Pair")
+        .expect("Pair layout");
+    let field = &parent.fields[1];
+    let FieldTy::Nominal(storage_id) = field.layout.ty else {
+        panic!("the nested field has nominal storage");
+    };
+    let base = registry.resolve_unique_nominal(&"Buffer".into()).unwrap();
+    assert_eq!(
+        storage_id == base,
+        precomputed,
+        "the test covers base storage and concrete generated storage"
+    );
+    assert_eq!(
+        field.aggregate_id,
+        Some(storage_id),
+        "nested field metadata must identify its resolved storage"
+    );
+    let storage_type = if let Some(layout) = worker
+        .local_agg_layouts
+        .iter()
+        .find(|layout| layout.type_id == storage_id)
+    {
+        crate::codegen::flat::generated_storage_type(layout)
+    } else {
+        crate::codegen::flat::agg_struct_ty_of(storage_id, registry, &mut Vec::new())
+            .expect("registry storage type")
+    };
+    assert_eq!(
+        field.mlir_type, storage_type,
+        "nested field LLVM storage must match the metadata target"
+    );
+    assert_eq!(
+        field.pointer_target_id, None,
+        "a nested value must not acquire pointer target metadata"
+    );
+    assert_eq!(
+        parent.fields[2].aggregate_id, None,
+        "a pointer field must not acquire a by-value aggregate ID"
+    );
+    let node = registry.resolve_unique_nominal(&"Node".into()).unwrap();
+    assert_eq!(
+        parent.fields[2].pointer_target_id,
+        Some(node),
+        "pointer fields retain their independent pointee ID"
+    );
+}
+
+#[test]
+fn payload_free_enum_fields_retain_scalar_metadata() {
+    let (ok, worker) = lower_with_registry(
+        "enum Color { Red, Blue } struct Holder<T> { value: T, color: Color } struct Outer { inner: Holder<i32> } fn inspect(value: Holder<i32>) -> void {}", "inspect",
+    );
+    assert!(ok);
+    let holder = worker
+        .local_agg_layouts
+        .iter()
+        .find(|layout| layout.name == "Holder")
+        .expect("Holder layout");
+    let field = &holder.fields[1];
+    assert_eq!(
+        field.aggregate_id, None,
+        "a payload-free enum tag must not become an aggregate value"
+    );
+    assert_eq!(
+        field.mlir_type, "i32",
+        "a payload-free enum retains integer storage"
+    );
+}
+
 #[test]
 fn enum_layouts_canonicalize_nominal_spellings() {
     let (ok, worker) = lower_with_registry(
@@ -913,6 +998,11 @@ fn aggregate_identity_keeps_nested_field_layouts_registered() {
         .find(|layout| layout.name == "Holder")
         .expect("Holder layout");
     let inner = holder.fields[0].aggregate_id.expect("nested struct ID");
+    assert_eq!(
+        holder.fields[0].layout.ty,
+        FieldTy::Nominal(inner),
+        "the nested constant-argument field uses one storage and metadata ID"
+    );
     assert!(
         worker
             .local_agg_layouts

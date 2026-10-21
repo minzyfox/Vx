@@ -3597,10 +3597,15 @@ impl<'r> Lowerer<'r> {
                 (field, mlir)
             };
             let metadata = self.payload_metadata(fty)?;
+            // A nested value uses the storage ID already resolved for this field.
+            let aggregate_id = match &field_layout.ty {
+                FieldTy::Nominal(id) if !self.registry.is_payload_free_enum(*id) => Some(*id),
+                _ => None,
+            };
             fields.push(crate::layout::GeneratedFieldLayout {
                 layout: field_layout,
                 mlir_type: mlir,
-                aggregate_id: metadata.aggregate_id,
+                aggregate_id,
                 pointer_target_id: metadata.pointer_target_id,
             });
         }
