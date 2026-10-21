@@ -16,8 +16,9 @@
 //
 //===----------------------------------------------------------------------===//
 use crate::bytecode::{
-    HirInstruction, Opcode, Register, TypeIdx, IMM_BLOCK_BOUND, IMM_BLOCK_INIT, IMM_BLOCK_STEP,
-    IMM_PARALLEL_BOUND, IMM_PARALLEL_INIT, IMM_PARALLEL_STEP, IMM_THREAD_INIT, IMM_THREAD_STEP,
+    EnumPayloadIndex, HirInstruction, Opcode, Register, TypeIdx, IMM_BLOCK_BOUND, IMM_BLOCK_INIT,
+    IMM_BLOCK_STEP, IMM_PARALLEL_BOUND, IMM_PARALLEL_INIT, IMM_PARALLEL_STEP, IMM_THREAD_INIT,
+    IMM_THREAD_STEP,
 };
 use crate::bytecode::{TENSOR_DROP_FIELD, TENSOR_DROP_FLAG};
 use crate::decline::{Decline, Lowered};
@@ -2379,9 +2380,6 @@ impl<'r> Lowerer<'r> {
                     if let Some(pats) = payload_pats {
                         for (i, pat) in pats.iter().enumerate() {
                             if let crate::syntax::Pattern::Identifier(pname) = pat {
-                                let poff = *offsets.get(i + 1).ok_or(Decline::TypeNotModelled {
-                                    what: "an enum payload offset that is not laid out",
-                                })?;
                                 // This variant's payload type, not the slot's.
                                 let payload_type = self.agg_layouts[layout_index]
                                     .variant_payloads
@@ -2397,14 +2395,17 @@ impl<'r> Lowerer<'r> {
                                     },
                                 )?;
                                 let pval = self.emit_typed(
-                                    Opcode::FieldLoad,
+                                    Opcode::EnumPayloadLoad,
                                     slot,
-                                    Register(
-                                        u32::try_from(ordinal + 1)
-                                            .expect("enum variant fits in u32"),
-                                    ),
+                                    Register(0),
                                     lty,
-                                    poff,
+                                    EnumPayloadIndex {
+                                        variant: u32::try_from(ordinal)
+                                            .expect("enum variant fits in u32"),
+                                        field: u32::try_from(i)
+                                            .expect("enum payload field fits in u32"),
+                                    }
+                                    .encode(),
                                 );
                                 self.note_shadow(pname);
                                 self.ast_types.insert(pname.clone(), payload_type);
@@ -2970,13 +2971,15 @@ impl<'r> Lowerer<'r> {
             what: "an enum payload type that is not modelled",
         })?;
         let x = self.emit_typed(
-            Opcode::FieldLoad,
+            Opcode::EnumPayloadLoad,
             opt_slot.reg,
-            Register(u32::try_from(some_ord + 1).expect("enum variant fits in u32")),
+            Register(0),
             lty,
-            *offsets.get(1).ok_or(Decline::TypeNotModelled {
-                what: "an enum payload offset that is not laid out",
-            })?,
+            EnumPayloadIndex {
+                variant: u32::try_from(some_ord).expect("enum variant fits in u32"),
+                field: 0,
+            }
+            .encode(),
         );
         self.bind_local(f.iter.as_str().into(), x);
         self.loop_stack.push((header, exit)); // continue -> header, break -> exit
@@ -5228,7 +5231,7 @@ impl<'r> Lowerer<'r> {
         }
         for (i, ins) in self.code.iter().enumerate().skip(r.0 as usize + 1) {
             let uses = ins.operand1 == r
-                || (ins.opcode != Opcode::FieldLoad && ins.operand2 == r)
+                || ins.operand2 == r
                 || (ins.opcode == Opcode::MatmulInto && ins.imm == r.0 as u64);
             if !uses {
                 continue;
@@ -6847,6 +6850,12 @@ pub fn verify_hir_stream(worker: &LocalWorkerState) {
                 n_types
             );
         }
+        if matches!(ins.opcode, Opcode::FieldLoad | Opcode::EnumPayloadLoad) {
+            assert_eq!(
+                ins.operand2.0, 0,
+                "HIR field load has an unexpected second operand at instruction {i}"
+            );
+        }
         match ins.opcode {
             // Binary: both operands read.
             Opcode::Add
@@ -6881,6 +6890,7 @@ pub fn verify_hir_stream(worker: &LocalWorkerState) {
             | Opcode::Not
             | Opcode::SlotLoad
             | Opcode::FieldLoad
+            | Opcode::EnumPayloadLoad
             | Opcode::TensorLoad
             | Opcode::TensorDataPtr
             | Opcode::Transfer

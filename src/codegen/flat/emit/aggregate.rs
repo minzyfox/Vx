@@ -113,9 +113,7 @@ impl FnEmit<'_> {
         Ok(())
     }
 
-    // Load a scalar struct field. `operand1` is the struct slot, `imm` the field's byte offset,
-    // and this instruction's own `type_idx` the field's scalar type. GEP to the field, then
-    // `llvm.load`.
+    // Load a field using its byte offset, or an enum payload using its variant and field indices.
     pub(crate) fn op_field_load(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
         let gid = (*self
             .agg_of
@@ -123,11 +121,18 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?)
         .ok_or(crate::emitter_gap!())?;
         let agg = self.ctx.aggs.get(&gid).ok_or(crate::emitter_gap!())?;
-        let field_idx = agg
-            .offsets
-            .iter()
-            .position(|&o| o == ins.imm)
-            .ok_or(crate::emitter_gap!())?;
+        let payload_index = (ins.opcode == Opcode::EnumPayloadLoad)
+            .then(|| crate::bytecode::EnumPayloadIndex::decode(ins.imm));
+        let field_idx = match payload_index {
+            Some(index) => (index.field as usize)
+                .checked_add(1)
+                .ok_or(crate::emitter_gap!())?,
+            None => agg
+                .offsets
+                .iter()
+                .position(|&o| o == ins.imm)
+                .ok_or(crate::emitter_gap!())?,
+        };
         // The field's declared MLIR type drives the load: a scalar field yields its element
         // (tracked in `etypes`), a pointer field (`Vec`'s `data`) an `!llvm.ptr` value
         // (tracked in `ptr_of`) — the type is taken from the layout, not the read register's
@@ -140,15 +145,14 @@ impl FnEmit<'_> {
         // A pointer field pointing to a modelled aggregate (`VecIter`'s `vec : *const Vec<T>`)
         // tags its loaded value with the pointee GID, so a chained field access through it
         // (`(*self.vec).len`) GEPs the pointee. (#242)
-        let payload = if ins.operand2.0 == 0 {
-            None
-        } else {
-            Some(
+        let payload = match payload_index {
+            None => None,
+            Some(index) => Some(
                 agg.variant_payloads
-                    .get((ins.operand2.0 - 1) as usize)
-                    .and_then(|payloads| field_idx.checked_sub(1).and_then(|i| payloads.get(i)))
+                    .get(index.variant as usize)
+                    .and_then(|payloads| payloads.get(index.field as usize))
                     .ok_or(crate::emitter_gap!())?,
-            )
+            ),
         };
         let pointee = match payload {
             Some(payload) => payload.pointer_target_id,

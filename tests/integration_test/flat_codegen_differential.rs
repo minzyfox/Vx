@@ -4101,3 +4101,23 @@ fn generic_functions_keep_tensor_pointer_placements(#[case] jobs: Option<usize>)
     }
     assert_generated_aggregate_runs(fixture, &["5", "7", "7", "5"], jobs);
 }
+
+#[rstest::rstest]
+#[case::normal(None)]
+#[case::parallel(Some(2))]
+fn enum_variants_with_two_payload_fields_run(#[case] jobs: Option<usize>) {
+    assert_generated_aggregate_runs(
+        "enum_variants_with_two_payload_fields.vx",
+        &["5", "17", "7", "25", "-1"],
+        jobs,
+    );
+}
+
+#[test]
+fn flat_lowers_iterator_with_payload_in_second_variant() {
+    let source = ITER_MINI.replace(
+        "enum Option<T> { Some(T), None }",
+        "enum Option<T> { None, Some(T) }",
+    );
+    assert_flat_exit(&format!("{source}\nfn main() -> i32 {{ let mut v = Vec<i32>::new(); v.push(10); v.push(20); v.push(30); let mut sum: i32 = 0; for value in v.iter() {{ sum = sum + value; }} return sum; }}"), 60);
+}

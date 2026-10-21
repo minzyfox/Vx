@@ -1105,10 +1105,12 @@ fn enum_layouts_ignore_constant_argument_source_locations() {
     );
 }
 
-#[test]
-fn enum_variant_metadata_does_not_keep_a_tensor_temporary_alive() {
+#[rstest::rstest]
+#[case::unused(false)]
+#[case::used(true)]
+fn enum_variant_metadata_does_not_keep_a_tensor_temporary_alive(#[case] real_use: bool) {
     let (_, worker) = lower_with_registry("fn inspect() -> void {}", "inspect");
-    for real_use in [false, true] {
+    {
         let mut lowerer = Lowerer::new(&worker.global.registry);
         lowerer.emit_effect(Opcode::Nop, Register(0), Register(0), 0);
         let tensor = lowerer.emit_typed(
@@ -1121,13 +1123,17 @@ fn enum_variant_metadata_does_not_keep_a_tensor_temporary_alive() {
             },
             0,
         );
-        // The variant ordinal has the same number as the temporary's register.
+        // The variant index equals the temporary's register, but it is an immediate.
         lowerer.emit_typed(
-            Opcode::FieldLoad,
+            Opcode::EnumPayloadLoad,
             if real_use { tensor.reg } else { Register(0) },
-            Register(1),
+            Register(0),
             LoweredTy::Scalar(ElementType::I32),
-            8,
+            EnumPayloadIndex {
+                variant: 1,
+                field: 0,
+            }
+            .encode(),
         );
         lowerer.drop_temps_here(None);
         let drops: Vec<_> = lowerer
@@ -3596,4 +3602,123 @@ fn unsafe_block_lowers_transparently() {
     assert!(w.local_hir_stream.iter().any(|i| i.opcode == Opcode::Mul));
     assert_eq!(w.local_hir_stream.last().unwrap().opcode, Opcode::Ret);
     verify_hir_stream(&w);
+}
+
+#[test]
+fn enum_payload_loads_keep_indices_out_of_register_operands() {
+    let (did_lower, worker) = lower_with_registry(
+        "enum Value { First(i32, i32), Second(i32, i32), Empty }
+         fn inspect(value: Value) -> i32 { match value {
+           Value::First(a, b) => { return a + b; },
+           Value::Second(a, b) => { return a - b; },
+           Value::Empty => { return 0; }
+         } }",
+        "inspect",
+    );
+    assert!(did_lower, "the enum match must lower");
+    let payloads: Vec<_> = worker
+        .local_hir_stream
+        .iter()
+        .filter(|ins| ins.opcode == Opcode::EnumPayloadLoad)
+        .map(|ins| (ins.operand2.0, ins.imm))
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![(0, 0), (0, 1 << 32), (0, 1), (0, (1 << 32) | 1)],
+        "payload indices belong in the immediate, with no second register"
+    );
+    let tags: Vec<_> = worker
+        .local_hir_stream
+        .iter()
+        .filter(|ins| ins.opcode == Opcode::FieldLoad)
+        .map(|ins| (ins.operand2.0, ins.imm))
+        .collect();
+    assert_eq!(
+        tags,
+        vec![(0, 0); 3],
+        "enum tags remain ordinary field loads"
+    );
+    verify_hir_stream(&worker);
+}
+
+#[rstest::rstest]
+#[case::field(Opcode::FieldLoad)]
+#[case::payload(Opcode::EnumPayloadLoad)]
+#[should_panic(expected = "HIR field load has an unexpected second operand")]
+fn field_loads_reject_a_second_register(#[case] opcode: Opcode) {
+    let mut worker = worker();
+    worker.local_hir_stream.push(HirInstruction::new(
+        Opcode::Nop,
+        Register(0),
+        Register(0),
+        TypeIdx(NO_TYPE),
+        0,
+    ));
+    worker.local_hir_stream.push(HirInstruction::new(
+        opcode,
+        Register(0),
+        Register(9),
+        TypeIdx(NO_TYPE),
+        0,
+    ));
+    verify_hir_stream(&worker);
+}
+
+#[test]
+fn iterator_payload_load_keeps_the_variant_in_the_immediate() {
+    let (_, original) = lower_with_registry(
+        "enum Option<T> { None, Some(T) }
+         struct Counter { current: i32 }
+         impl Counter { fn next(self: &mut Counter) -> Option<i32> { return Option<i32>::None; } }
+         fn inspect() -> i32 { return 0; }",
+        "inspect",
+    );
+    let mut registry = (*original.global.registry).clone();
+    // Install the concrete next signature, as the pipeline does after checking methods.
+    let next = registry
+        .methods
+        .values()
+        .next()
+        .expect("Counter has a next method")
+        .clone();
+    registry.fn_sigs.insert("Counter$next".into(), next);
+    let mut worker = LocalWorkerState::new(Arc::new(GlobalSession::with_registry(1, registry)));
+    let function = parse_fn("fn inspect(counter: Counter) -> i32 { let mut sum: i32 = 0; for value in counter { sum = sum + value; } return sum; }");
+    lower_function_to_hir(&function, &mut worker).expect("the iterator loop must lower");
+    let payloads: Vec<_> = worker
+        .local_hir_stream
+        .iter()
+        .filter(|ins| ins.opcode == Opcode::EnumPayloadLoad)
+        .map(|ins| (ins.operand2.0, ins.imm))
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![(0, 1)],
+        "iterator payload loads must select the second variant without a register operand"
+    );
+    verify_hir_stream(&worker);
+}
+
+#[test]
+fn enum_payload_immediate_is_not_a_register() {
+    let mut worker = worker();
+    worker.local_hir_stream.push(HirInstruction::new(
+        Opcode::Nop,
+        Register(0),
+        Register(0),
+        TypeIdx(NO_TYPE),
+        0,
+    ));
+    worker.local_hir_stream.push(HirInstruction::new(
+        Opcode::EnumPayloadLoad,
+        Register(0),
+        Register(0),
+        TypeIdx(NO_TYPE),
+        u64::MAX,
+    ));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify_hir_stream(&worker)))
+            .is_ok(),
+        "enum payload indices are immediate values, without register dominance requirements"
+    );
 }

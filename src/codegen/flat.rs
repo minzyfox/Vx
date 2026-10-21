@@ -2346,10 +2346,8 @@ impl<'a> FnEmit<'a> {
             // the field index comes from matching the offset against the layout, the value type from
             // the stored register's tracked type.
             Opcode::FieldStore => self.op_field_store(idx, ins),
-            // Load a scalar struct field. `operand1` is the struct slot, `imm` the field's byte offset,
-            // and this instruction's own `type_idx` the field's scalar type. GEP to the field, then
-            // `llvm.load`.
-            Opcode::FieldLoad => self.op_field_load(idx, ins),
+            // Load a field by byte offset, or an enum payload by its variant and field indices.
+            Opcode::FieldLoad | Opcode::EnumPayloadLoad => self.op_field_load(idx, ins),
             // The address of a by-value nested-aggregate field (`&outer.inner`): GEP to the field and
             // yield the pointer, tracked as an aggregate slot (its layout GID from `type_idx`), so a
             // chained field access or a method receiver addresses through it. (#242)
