@@ -1548,7 +1548,7 @@ impl<'a> TypeChecker<'a> {
         generic_func: &Function,
         mapping: &std::collections::HashMap<crate::symbol::Symbol, Type>,
         topo_mapping: &std::collections::HashMap<crate::symbol::Symbol, Topology>,
-    ) -> Function {
+    ) -> Option<Function> {
         let mut mangled_name = generic_func.name.to_string();
         // `T::Item` follows from `T`, so it adds nothing to the name.
         let mut sorted_keys: Vec<&crate::symbol::Symbol> = mapping
@@ -1558,15 +1558,36 @@ impl<'a> TypeChecker<'a> {
         sorted_keys.sort();
         for g_name in sorted_keys {
             if let Some(ty) = mapping.get(g_name) {
-                mangled_name.push_str(&format!("${}", ty.mangle()));
+                let Some(type_name) = crate::syntax::identity::specialization_type_name(ty) else {
+                    if !self.speculating {
+                        self.errors.push(format!(
+                            "Cannot specialize '{}': the placement index expression is unsupported.",
+                            generic_func.name
+                        ));
+                    }
+                    return None;
+                };
+                mangled_name.push_str(&format!("${type_name}"));
             }
         }
-        // Distinguish topology instantiations (`f$GPU` vs `f$NPU`).
+        // Device indices and slice bounds also distinguish topology instantiations.
         let mut topo_keys: Vec<&crate::symbol::Symbol> = topo_mapping.keys().collect();
         topo_keys.sort();
         for g_name in topo_keys {
             if let Some(top) = topo_mapping.get(g_name) {
-                mangled_name.push_str(&format!("${:?}", top.kind()));
+                let Some(key) = crate::syntax::identity::topology_key(top) else {
+                    if !self.speculating {
+                        self.errors.push(format!(
+                            "Cannot specialize '{}': the topology index expression is unsupported.",
+                            generic_func.name
+                        ));
+                    }
+                    return None;
+                };
+                mangled_name.push_str(&format!(
+                    "$topology${}",
+                    crate::syntax::identity::symbol_key(&key)
+                ));
             }
         }
 
@@ -1596,7 +1617,7 @@ impl<'a> TypeChecker<'a> {
             })
             .collect();
 
-        Function {
+        Some(Function {
             is_unsafe: generic_func.is_unsafe,
             is_pub: generic_func.is_pub,
             name: mangled_name.into(),
@@ -1619,7 +1640,7 @@ impl<'a> TypeChecker<'a> {
             where_transfers: Vec::new(),
             body: new_body,
             doc_comment: generic_func.doc_comment.clone(),
-        }
+        })
     }
 
     pub fn mangle_path(path: &str) -> String {
@@ -2234,6 +2255,210 @@ mod build_cost_tests {
             InternMode::Deferred,
             "one session's choice must not be visible from another -- that is the whole point of \
              moving it off a global"
+        );
+    }
+}
+
+#[cfg(test)]
+mod specialization_identity_tests {
+    use super::*;
+    use crate::syntax::{ElementType, MemorySpace, NumberExpr, Placement, Span};
+
+    fn tensor(placement: Option<Placement>) -> Type {
+        Type::Tensor(ElementType::F32, vec![], placement)
+    }
+    fn pointer(inner: Type) -> Type {
+        Type::Pointer(Box::new(inner), None, false)
+    }
+    fn gpu(index: usize) -> Type {
+        tensor(Some(Placement::on(Topology::gpu(index as i64))))
+    }
+    fn borrow(inner: Type, memory: Option<MemorySpace>, region: usize) -> Type {
+        Type::Borrow {
+            inner: Box::new(inner),
+            mem_space: memory,
+            is_mut: false,
+            region_id: region,
+        }
+    }
+    fn function(inner: Type, result: bool) -> Type {
+        let scalar = Type::Scalar(ElementType::I32);
+        if result {
+            Type::Function(vec![scalar], Box::new(inner), false)
+        } else {
+            Type::Function(vec![inner], Box::new(scalar), false)
+        }
+    }
+    fn instance(args: Vec<Type>) -> Type {
+        Type::GenericInstance(Box::new(Type::Struct("Pair".into(), None)), args)
+    }
+    fn template() -> (Vec<crate::syntax::Program>, Function) {
+        let source = "fn identity<T>(x: T) -> T { return x; }";
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let program = crate::parser::Parser::new(&tokens, source).parse().unwrap();
+        let function = program.functions[0].clone();
+        (vec![program], function)
+    }
+    fn names(a: Type, b: Type) -> (crate::symbol::Symbol, crate::symbol::Symbol) {
+        let (programs, template) = template();
+        let env = GlobalAstEnv::build(&programs);
+        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
+            crate::session::GlobalSession::new(1),
+        ));
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        let mut instantiate = |ty| {
+            checker
+                .instantiate_function(
+                    &template,
+                    &HashMap::from([("T".into(), ty)]),
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .name
+        };
+        (instantiate(a), instantiate(b))
+    }
+
+    fn slice(end: &str) -> Type {
+        let number = |value: &str| {
+            Box::new(Expr::Number(NumberExpr::new(
+                value.into(),
+                None,
+                Span::default(),
+            )))
+        };
+        tensor(Some(Placement::on(Topology::Slice(
+            Box::new(Topology::gpu(0)),
+            number("0"),
+            number(end),
+        ))))
+    }
+
+    #[rstest::rstest]
+    #[case::tensor_host_gpu(tensor(None), gpu(0))]
+    #[case::tensor_gpu_devices(gpu(0), gpu(1))]
+    #[case::slice_bounds(slice("2"), slice("3"))]
+    #[case::custom_devices(tensor(Some(Placement::on(Topology::Custom("A".into())))), tensor(Some(Placement::on(Topology::Custom("B".into())))))]
+    #[case::tensor_memory(
+        gpu(0),
+        tensor(Some(Placement::in_space(MemorySpace::CPUDRAM, Topology::gpu(0))))
+    )]
+    #[case::explicit_cpu(tensor(None), tensor(Some(Placement::on(Topology::CPU))))]
+    #[case::tensor_pointer(pointer(tensor(None)), pointer(gpu(0)))]
+    #[case::pointer_devices(
+        Type::Pointer(Box::new(tensor(None)), Some(Placement::on(Topology::gpu(0))), false),
+        Type::Pointer(Box::new(tensor(None)), Some(Placement::on(Topology::gpu(1))), false)
+    )]
+    #[case::borrow_memory(
+        borrow(tensor(None), None, 0),
+        borrow(tensor(None), Some(MemorySpace::GpuHbm), 0)
+    )]
+    #[case::reference_memory(
+        Type::Ref(Box::new(tensor(None)), MemorySpace::CPUDRAM),
+        Type::Ref(Box::new(tensor(None)), MemorySpace::GpuHbm)
+    )]
+    #[case::pinned_devices(
+        Type::Pinned(Box::new(tensor(None)), Topology::gpu(0)),
+        Type::Pinned(Box::new(tensor(None)), Topology::gpu(1))
+    )]
+    #[case::nested_arguments(instance(vec![gpu(0), tensor(None)]), instance(vec![tensor(None), gpu(0)]))]
+    #[case::function_argument(function(gpu(0), false), function(gpu(1), false))]
+    #[case::function_result(function(gpu(0), true), function(gpu(1), true))]
+    #[case::function_position(function(gpu(0), false), function(gpu(0), true))]
+    #[case::closure(Type::Closure(vec![gpu(0)], Box::new(tensor(None))), Type::Closure(vec![gpu(1)], Box::new(tensor(None))))]
+    #[case::verified(Type::Verified(Box::new(gpu(0))), Type::Verified(Box::new(gpu(1))))]
+    fn different_locations_get_different_specializations(#[case] a: Type, #[case] b: Type) {
+        let (a, b) = names(a, b);
+        assert_ne!(
+            a, b,
+            "different locations must select different function bodies"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::placement_spelling(gpu(0), tensor(Some(Placement::at(MemorySpace::GpuHbm))))]
+    #[case::borrow_regions(borrow(gpu(0), None, 1), borrow(gpu(0), None, 9))]
+    #[case::source_annotations(gpu(0), tensor(Some(Placement::on(Topology::GPU(Box::new(Expr::Number(NumberExpr::new("0".into(), Some(ElementType::I32), Span { line: 42, column: 7, length: 1, expansion: 0 }))))))))]
+    fn equivalent_locations_reuse_a_specialization(#[case] a: Type, #[case] b: Type) {
+        let (a, b) = names(a, b);
+        assert_eq!(
+            a, b,
+            "source spelling and local regions must not select another body"
+        );
+    }
+
+    #[test]
+    fn unplaced_scalar_specialization_keeps_its_name() {
+        let (name, _) = names(
+            Type::Scalar(ElementType::I32),
+            Type::Scalar(ElementType::I32),
+        );
+        assert_eq!(name.as_ref(), "identity$i32");
+    }
+
+    #[test]
+    fn topology_arguments_keep_device_indices() {
+        let (programs, template) = template();
+        let env = GlobalAstEnv::build(&programs);
+        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
+            crate::session::GlobalSession::new(1),
+        ));
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        let mut instantiate = |index| {
+            checker
+                .instantiate_function(
+                    &template,
+                    &HashMap::new(),
+                    &HashMap::from([("P".into(), Topology::gpu(index))]),
+                )
+                .unwrap()
+                .name
+        };
+        assert_ne!(
+            instantiate(0),
+            instantiate(1),
+            "topology arguments must distinguish devices"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::type_argument(false)]
+    #[case::topology_argument(true)]
+    fn unsupported_placement_indices_report_an_error(#[case] topology_argument: bool) {
+        let (programs, template) = template();
+        let env = GlobalAstEnv::build(&programs);
+        let mut worker = crate::session::LocalWorkerState::new(std::sync::Arc::new(
+            crate::session::GlobalSession::new(1),
+        ));
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        let topology = Topology::GPU(Box::new(Expr::FunctionCall(
+            crate::syntax::FunctionCallExpr::new("pick".into(), None, vec![], Span::default()),
+        )));
+        let (mapping, topologies, message) = if topology_argument {
+            (
+                HashMap::new(),
+                HashMap::from([("P".into(), topology)]),
+                "the topology index expression is unsupported",
+            )
+        } else {
+            (
+                HashMap::from([("T".into(), tensor(Some(Placement::on(topology))))]),
+                HashMap::new(),
+                "the placement index expression is unsupported",
+            )
+        };
+        let result = checker.instantiate_function(&template, &mapping, &topologies);
+        assert_eq!(
+            (
+                result.is_none(),
+                checker
+                    .errors
+                    .iter()
+                    .any(|d| d.to_string().contains(message))
+            ),
+            (true, true),
+            "unsupported indices must decline with a diagnostic"
         );
     }
 }

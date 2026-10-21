@@ -4050,3 +4050,54 @@ fn a_generic_over_two_tensor_shapes_gets_two_monomorphs() {
         "expected 1.0 + 7.0 through two distinct monomorphs, got:\n{out}"
     );
 }
+
+// Native output alone cannot detect merging two identity functions with pointer arguments.
+// Also inspect the generated definitions and the targets their calls select.
+#[rstest::rstest]
+#[case::normal(None)]
+#[case::parallel(Some(2))]
+fn generic_functions_keep_tensor_pointer_placements(#[case] jobs: Option<usize>) {
+    let fixture = "generic_function_with_tensor_pointer_placements.vx";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/backend/pass")
+        .join(fixture);
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vxc"));
+    command
+        .arg(&path)
+        .arg("--emit-mlir")
+        .env("VX_FLAT_DBG", "1");
+    if let Some(jobs) = jobs {
+        command.arg("-j").arg(jobs.to_string());
+    }
+    let output = command
+        .output()
+        .expect("compile tensor pointer specializations");
+    let log = String::from_utf8_lossy(&output.stderr);
+    let mlir = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "compilation with jobs={jobs:?}: {log}\n{mlir}"
+    );
+    for function in ["host_first", "gpu_first"] {
+        let symbols = |operation: &str| -> std::collections::BTreeSet<String> {
+            mlir.lines()
+                .filter(|line| line.contains(operation))
+                .filter_map(|line| line.split('@').nth(1))
+                .map(|tail| tail.split('(').next().unwrap().trim_matches('"').to_owned())
+                .filter(|name| name.starts_with(&format!("{function}$")))
+                .collect()
+        };
+        let definitions = symbols("func.func");
+        let calls = symbols("call @");
+        assert_eq!(
+            definitions.len(),
+            2,
+            "{function} must define two placement specializations: {mlir}"
+        );
+        assert_eq!(
+            calls, definitions,
+            "{function} calls must select both placement specializations: {mlir}"
+        );
+    }
+    assert_generated_aggregate_runs(fixture, &["5", "7", "7", "5"], jobs);
+}

@@ -10,6 +10,10 @@
 
 use crate::gid::TypeId;
 use crate::symbol::Symbol;
+use crate::syntax::identity::{
+    const_key as aggregate_const_key, placement_key as aggregate_placement_key,
+    topology_key as aggregate_topology_key,
+};
 use crate::syntax::{Dim, Expr, NumberExpr, Type};
 use rustc_hash::FxHashMap;
 
@@ -226,75 +230,6 @@ impl AggregateIdentities {
         }
         Some(())
     }
-}
-
-// Function symbols omit some placement details that generated layout metadata must retain.
-fn aggregate_const_key(expr: &Expr) -> Option<String> {
-    if let Some(value) = crate::syntax::types::const_value_text(expr) {
-        return Some(format!("number({value:?})"));
-    }
-    Some(match expr {
-        Expr::Identifier(id) => format!("name({:?})", id.name),
-        Expr::StringLiteral(value) => format!("string({:?})", value.value),
-        Expr::BinaryOp(expr) => format!(
-            "binary({:?},{:?},{:?})",
-            expr.op,
-            aggregate_const_key(&expr.lhs)?,
-            aggregate_const_key(&expr.rhs)?
-        ),
-        Expr::UnaryOp(expr) => format!(
-            "unary({:?},{:?})",
-            expr.op,
-            aggregate_const_key(&expr.expr)?
-        ),
-        Expr::RelationalOp(expr) => format!(
-            "compare({:?},{:?},{:?})",
-            expr.op,
-            aggregate_const_key(&expr.lhs)?,
-            aggregate_const_key(&expr.rhs)?
-        ),
-        Expr::LogicalOp(expr) => format!(
-            "logical({:?},{:?},{:?})",
-            expr.op,
-            aggregate_const_key(&expr.lhs)?,
-            aggregate_const_key(&expr.rhs)?
-        ),
-        Expr::MemberAccess(expr) => format!(
-            "member({:?},{:?})",
-            aggregate_const_key(&expr.base)?,
-            expr.member
-        ),
-        Expr::IndexAccess(expr) => format!(
-            "index({:?},{:?})",
-            aggregate_const_key(&expr.base)?,
-            aggregate_const_key(&expr.index)?
-        ),
-        // Unsupported expressions must decline instead of depending on source annotations.
-        _ => return None,
-    })
-}
-
-fn aggregate_topology_key(topology: &crate::syntax::Topology) -> Option<String> {
-    use crate::syntax::Topology;
-    Some(match topology {
-        Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
-            format!("{:?}({:?})", topology.kind(), aggregate_const_key(index)?)
-        }
-        Topology::Slice(base, start, end) => format!(
-            "slice({:?},{:?},{:?})",
-            aggregate_topology_key(base)?,
-            aggregate_const_key(start)?,
-            aggregate_const_key(end)?
-        ),
-        _ => format!("{:?}", topology.kind()),
-    })
-}
-
-fn aggregate_placement_key(placement: &Option<crate::syntax::Placement>) -> Option<String> {
-    Some(match placement {
-        Some(p) => format!("({:?},{:?})", aggregate_topology_key(&p.topology)?, p.space),
-        None => "None".into(),
-    })
 }
 
 fn aggregate_type_key(ty: &Type, identities: &AggregateIdentities) -> Option<String> {
