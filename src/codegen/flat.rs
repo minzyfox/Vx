@@ -47,6 +47,10 @@ pub enum ModuleEmitError {
         first: Box<crate::layout::GeneratedAggregateLayout>,
         second: Box<crate::layout::GeneratedAggregateLayout>,
     },
+    RegistryLayoutConflict {
+        registry: Box<crate::registry::TypeDefinition>,
+        generated: Box<crate::layout::GeneratedAggregateLayout>,
+    },
 }
 
 impl From<Decline> for ModuleEmitError {
@@ -64,6 +68,15 @@ impl std::fmt::Display for ModuleEmitError {
                 "Internal compiler error: generated layouts disagree for type {:?}.\n\
                  First layout:\n{first:#?}\nSecond layout:\n{second:#?}",
                 first.type_id
+            ),
+            Self::RegistryLayoutConflict {
+                registry,
+                generated,
+            } => write!(
+                f,
+                "Internal compiler error: registry and generated layouts disagree for type {:?}.\n\
+                 Registry layout:\n{registry:#?}\nGenerated layout:\n{generated:#?}",
+                generated.type_id
             ),
         }
     }
@@ -1167,25 +1180,92 @@ pub fn subspaces_from_env(env: &crate::hir::GlobalAstEnv) -> Vec<SubspaceInfo> {
 }
 
 impl EmitCtx {
+    fn registry_layout_agrees(
+        registry: &ImmutableGlobalRegistry,
+        definition: &crate::registry::TypeDefinition,
+        generated: &crate::layout::GeneratedAggregateLayout,
+    ) -> bool {
+        use crate::layout::FieldTy;
+        definition.id == generated.type_id
+            && definition.size_bytes as u64 == generated.size_bytes
+            && definition.align_bytes as u64 == generated.align_bytes
+            && definition.fields.len() == generated.fields.len()
+            && generated.variant_payloads.is_empty()
+            && definition
+                .fields
+                .iter()
+                .zip(&generated.fields)
+                .enumerate()
+                .all(|(index, (expected, actual))| {
+                    let aggregate = match &expected.ty {
+                        FieldTy::Nominal(id) if !registry.is_payload_free_enum(*id) => Some(*id),
+                        _ => None,
+                    };
+                    // Enum instances use generated IDs, so their declaration IDs cannot identify pointer targets here.
+                    let known_pointee = registry
+                        .structs
+                        .get(&definition.id)
+                        .and_then(|declaration| declaration.fields.get(index))
+                        .and_then(|(_, ty)| match ty {
+                            Type::Pointer(inner, ..)
+                            | Type::Borrow { inner, .. }
+                            | Type::Ref(inner, ..) => match inner.as_ref() {
+                                Type::Struct(name, id) | Type::Enum(name, id) => registry
+                                    .aggregate_identities()
+                                    .resolve(name, *id)
+                                    .map(|(_, id)| id)
+                                    .filter(|id| registry.structs.contains_key(id)),
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+                    expected == &actual.layout
+                        && registry_field_storage_type(&expected.ty, registry, &mut Vec::new())
+                            .is_ok_and(|ty| ty == actual.mlir_type)
+                        && actual.aggregate_id == aggregate
+                        && if matches!(expected.ty, FieldTy::Opaque) {
+                            known_pointee.is_none() || actual.pointer_target_id == known_pointee
+                        } else {
+                            actual.pointer_target_id.is_none()
+                        }
+                })
+    }
+
     fn install_generated_layouts(
         &mut self,
         registry: &ImmutableGlobalRegistry,
         layouts: &[crate::layout::GeneratedAggregateLayout],
         sched: crate::config::Schedule,
     ) -> Result<(), ModuleEmitError> {
-        let mut generated = HashMap::new();
+        let mut generated: HashMap<TypeId, &crate::layout::GeneratedAggregateLayout> =
+            HashMap::new();
+        // Validate every record before changing storage or metadata in the emitter context.
         for layout in layouts {
-            if let Some(previous) = generated.insert(layout.type_id, layout) {
+            if let Some(definition) = registry
+                .layouts
+                .get(&layout.type_id)
+                .filter(|def| def.align_bytes != 0)
+            {
+                if !Self::registry_layout_agrees(registry, definition, layout) {
+                    return Err(ModuleEmitError::RegistryLayoutConflict {
+                        registry: Box::new(definition.clone()),
+                        generated: Box::new(layout.clone()),
+                    });
+                }
+            }
+            if let Some(previous) = generated.get(&layout.type_id) {
                 if !previous.semantically_eq(layout, registry.aggregate_identities()) {
                     return Err(ModuleEmitError::ConflictingLayouts {
-                        first: Box::new(previous.clone()),
+                        first: Box::new((**previous).clone()),
                         second: Box::new(layout.clone()),
                     });
                 }
             } else {
-                self.aggs
-                    .insert(layout.type_id, AggLayout::from_generated(layout));
+                generated.insert(layout.type_id, layout);
             }
+        }
+        for (id, layout) in generated {
+            self.aggs.insert(id, AggLayout::from_generated(layout));
         }
         if !layouts.is_empty() {
             // Complete nominal layouts must be visible before resolving function signatures.
@@ -2890,6 +2970,283 @@ mod tests {
         assert!(
             message.contains(&format!("Second layout:\n{second:#?}")),
             "the message must include the second complete layout: {message}"
+        );
+    }
+
+    fn registry_overlap_fixture() -> (
+        ImmutableGlobalRegistry,
+        crate::layout::GeneratedAggregateLayout,
+    ) {
+        let source = "struct Node { value: i32 } struct Holder { number: i32, pointer: *const Node, nested: Node } fn make() -> Holder { return Holder { number: 5, pointer: 0 as *const Node, nested: Node { value: 3 } }; }";
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = crate::parser::Parser::new(&tokens, source);
+        let mut modules = vec![parser.parse().expect("program parses")];
+        modules[0].module_path = "crate::overlap".into();
+        let symbols = crate::resolver::build_symbol_map(&modules);
+        modules[0].resolve_names(&symbols, &[]);
+        let registry = crate::pipeline::build_frozen_registry(&modules).expect("registry builds");
+        let definition = registry
+            .layouts
+            .values()
+            .find(|d| d.name == "Holder")
+            .unwrap();
+        let ctx = EmitCtx::from_registry(&registry, crate::config::Schedule::Sequential);
+        let storage = &ctx.aggs[&definition.id];
+        let layout = crate::layout::GeneratedAggregateLayout {
+            type_id: definition.id,
+            name: definition.name.clone(),
+            size_bytes: definition.size_bytes as u64,
+            align_bytes: definition.align_bytes as u64,
+            fields: definition
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| crate::layout::GeneratedFieldLayout {
+                    layout: field.clone(),
+                    mlir_type: storage.field_tys[index].clone(),
+                    aggregate_id: storage.field_agg[index],
+                    pointer_target_id: storage.field_pointee[index],
+                })
+                .collect(),
+            variant_payloads: vec![],
+        };
+        (registry, layout)
+    }
+
+    #[rstest::rstest]
+    #[case("size")]
+    #[case("alignment")]
+    #[case("field_count")]
+    #[case("field_name")]
+    #[case("field_offset")]
+    #[case("field_size")]
+    #[case("field_kind")]
+    #[case("llvm_type")]
+    #[case("missing_aggregate")]
+    #[case("different_aggregate")]
+    #[case("unexpected_aggregate")]
+    #[case("missing_pointer_target")]
+    #[case("different_pointer_target")]
+    #[case("unexpected_pointer_target")]
+    #[case("variants")]
+    #[case("definition_id")]
+    #[case("unsupported_storage")]
+    #[case("attached_pointer_id")]
+    fn registry_overlap_conflicts_stop_installation(#[case] difference: &str) {
+        let (mut registry, mut layout) = registry_overlap_fixture();
+        match difference {
+            "size" => layout.size_bytes += 8,
+            "alignment" => layout.align_bytes *= 2,
+            "field_count" => {
+                layout.fields.pop();
+            }
+            "field_name" => layout.fields[0].layout.name = "other".into(),
+            "field_offset" => layout.fields[1].layout.offset += 8,
+            "field_size" => layout.fields[1].layout.size += 8,
+            "field_kind" => layout.fields[0].layout.ty = crate::layout::FieldTy::Opaque,
+            "llvm_type" => layout.fields[1].mlir_type = "i64".into(),
+            "missing_aggregate" => layout.fields[2].aggregate_id = None,
+            "different_aggregate" => layout.fields[2].aggregate_id = Some(layout.type_id),
+            "unexpected_aggregate" => layout.fields[0].aggregate_id = Some(layout.type_id),
+            "missing_pointer_target" => layout.fields[1].pointer_target_id = None,
+            "different_pointer_target" => layout.fields[1].pointer_target_id = Some(layout.type_id),
+            "unexpected_pointer_target" => {
+                layout.fields[0].pointer_target_id = Some(layout.type_id)
+            }
+            "variants" => layout.variant_payloads.push(vec![]),
+            "definition_id" => {
+                registry.layouts.get_mut(&layout.type_id).unwrap().id = TypeId::new(99, 1, 0, 0)
+            }
+            "attached_pointer_id" => {
+                let node = layout.fields[1].pointer_target_id.unwrap();
+                registry.structs.get_mut(&layout.type_id).unwrap().fields[1].1 = Type::Pointer(
+                    Box::new(Type::Struct("module::Node".into(), Some(node))),
+                    None,
+                    false,
+                );
+                layout.fields[1].pointer_target_id = Some(layout.type_id);
+            }
+            "unsupported_storage" => {
+                let field = &mut registry.layouts.get_mut(&layout.type_id).unwrap().fields[0];
+                field.ty = crate::layout::FieldTy::Scalar(ElementType::Generic("T".into()));
+                layout.fields[0].layout = field.clone();
+            }
+            _ => unreachable!(),
+        }
+        let mut ctx = EmitCtx::from_registry(&registry, crate::config::Schedule::Sequential);
+        let result = ctx.install_generated_layouts(
+            &registry,
+            &[layout],
+            crate::config::Schedule::Sequential,
+        );
+        assert!(
+            matches!(result, Err(ModuleEmitError::RegistryLayoutConflict { .. })),
+            "registry overlap must report a storage or metadata conflict: {difference}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("display_name")]
+    #[case("registry_stub")]
+    #[case("missing_registry_record")]
+    #[case("unknown_pointer_target")]
+    fn compatible_registry_overlap_allows_installation(#[case] condition: &str) {
+        let (mut registry, mut layout) = registry_overlap_fixture();
+        match condition {
+            "display_name" => layout.name = "module::Holder".into(),
+            "registry_stub" => {
+                let def = registry.layouts.get_mut(&layout.type_id).unwrap();
+                def.align_bytes = 0;
+                def.fields.clear();
+            }
+            "missing_registry_record" => layout.type_id = TypeId::new(99, 1, 0, 0),
+            "unknown_pointer_target" => {
+                registry.structs.remove(&layout.type_id);
+            }
+            _ => unreachable!(),
+        }
+        let mut ctx = EmitCtx::from_registry(&registry, crate::config::Schedule::Sequential);
+        let result = ctx.install_generated_layouts(
+            &registry,
+            std::slice::from_ref(&layout),
+            crate::config::Schedule::Sequential,
+        );
+        assert!(
+            result.is_ok(),
+            "compatible storage must permit generated metadata: {condition}: {result:?}"
+        );
+        assert_eq!(
+            ctx.aggs[&layout.type_id].field_pointee,
+            layout
+                .fields
+                .iter()
+                .map(|field| field.pointer_target_id)
+                .collect::<Vec<_>>(),
+            "accepted records install their pointer metadata: {condition}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn layout_conflicts_leave_the_emitter_context_unchanged(#[case] registry_conflict: bool) {
+        let (registry, layout) = registry_overlap_fixture();
+        let mut ctx = EmitCtx::from_registry(&registry, crate::config::Schedule::Sequential);
+        let snapshot = |ctx: &EmitCtx| {
+            (
+                ctx.aggs
+                    .iter()
+                    .map(|(id, record)| {
+                        (
+                            *id,
+                            (
+                                record.struct_ty.clone(),
+                                record.offsets.clone(),
+                                record.field_tys.clone(),
+                                record.field_agg.clone(),
+                                record.field_pointee.clone(),
+                                record.variant_payloads.clone(),
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+                ctx.agg_names.clone(),
+                ctx.callees
+                    .iter()
+                    .map(|(id, callee)| {
+                        (
+                            *id,
+                            (callee.name.clone(), callee.ret_agg, callee.ret_pointee),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
+        };
+        let before = snapshot(&ctx);
+        let mut first = layout.clone();
+        first.type_id = TypeId::new(99, 1, 0, 0);
+        let mut bad = if registry_conflict {
+            layout
+        } else {
+            first.clone()
+        };
+        bad.size_bytes += 8;
+        let result = ctx.install_generated_layouts(
+            &registry,
+            &[first, bad],
+            crate::config::Schedule::Sequential,
+        );
+        assert!(result.is_err(), "the batch contains a conflict");
+        assert_eq!(
+            snapshot(&ctx),
+            before,
+            "a failed batch must preserve all existing emitter storage and metadata"
+        );
+    }
+
+    #[test]
+    fn registry_overlap_error_retains_both_complete_records() {
+        let (registry, mut layout) = registry_overlap_fixture();
+        layout.size_bytes += 8;
+        let mut ctx = EmitCtx::from_registry(&registry, crate::config::Schedule::Sequential);
+        let result = ctx.install_generated_layouts(
+            &registry,
+            std::slice::from_ref(&layout),
+            crate::config::Schedule::Sequential,
+        );
+        let error = result.expect_err("a registry disagreement stops code generation");
+        let ModuleEmitError::RegistryLayoutConflict {
+            registry: original,
+            generated,
+        } = &error
+        else {
+            panic!("expected a registry overlap error");
+        };
+        assert_eq!(
+            format!("{original:#?}"),
+            format!("{:#?}", registry.layouts[&layout.type_id]),
+            "the diagnostic preserves the complete registry record"
+        );
+        assert_eq!(
+            **generated, layout,
+            "the diagnostic preserves the complete generated record"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Internal compiler error: registry and generated layouts disagree"),
+            "the diagnostic identifies the registry overlap error"
+        );
+        assert!(
+            message.contains(&format!("Registry layout:\n{original:#?}")),
+            "the diagnostic prints the complete registry record"
+        );
+        assert!(
+            message.contains(&format!("Generated layout:\n{generated:#?}")),
+            "the diagnostic prints the complete generated record"
+        );
+    }
+
+    #[test]
+    fn registry_overlap_rejects_pointer_sized_tensor_descriptors() {
+        let result = emit_module_with_layouts(
+            "struct Holder<T> { value: T, tensor: &Tensor<f32,[4]>, tail: i64 } \
+             struct Outer { inner: Holder<i32> } \
+             fn make(tensor: &Tensor<f32,[4]>) -> i32 { \
+               let holder = Holder<i32> { value: 5, tensor: tensor, tail: 41 }; return holder.value; }",
+            |layouts| {
+                let layout = layouts.iter_mut().find(|layout| layout.name == "Holder").expect("Holder layout");
+                // Reproduce the former descriptor-as-pointer record while keeping its registry ID.
+                layout.size_bytes = 24;
+                layout.fields[1].layout.size = 8;
+                layout.fields[1].layout.ty = crate::layout::FieldTy::Opaque;
+                layout.fields[1].mlir_type = "!llvm.ptr".into();
+                layout.fields[2].layout.offset = 16;
+            },
+        );
+        assert!(
+            matches!(result, Err(ModuleEmitError::RegistryLayoutConflict { .. })),
+            "a pointer-sized tensor descriptor must conflict with registry storage"
         );
     }
 
