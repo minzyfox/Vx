@@ -2308,11 +2308,19 @@ impl<'r> Lowerer<'r> {
     /// loaded payload field before running the arm body — the same tag-dispatch + `extractvalue` the
     /// AST codegen emits, but through the flat aggregate machinery. (#242)
     fn lower_data_match(&mut self, m: &crate::syntax::MatchExpr, enum_ty: &Type) -> Lowered<()> {
-        let (base, args) = nominal_name_and_args(enum_ty).ok_or(Decline::TypeNotModelled {
-            what: "a match subject with no concrete enum type",
-        })?;
+        let (nominal, args) = match enum_ty {
+            Type::GenericInstance(base, args) => (base.as_ref(), args.as_slice()),
+            other => (other, &[][..]),
+        };
+        let (base, declaration) = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(nominal.into())
+            .ok_or(Decline::TypeNotModelled {
+                what: "a match subject with no concrete enum type",
+            })?;
         let (gid, offsets) =
-            self.enum_instance_layout_of(&base, &args)
+            self.enum_instance_layout_of(declaration, args)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
                 })?;
@@ -3308,40 +3316,30 @@ impl<'r> Lowerer<'r> {
     /// call's return (`VecIter::next -> Option<i32>`), a `let` binding. Falls back to `lowered_ty`
     /// for everything else. (#242)
     fn lower_ty_synth(&mut self, ty: &Type) -> Option<LoweredTy> {
-        // A data-carrying enum with no generics (`Result { Ok(i32), Err(i32) }`) is the instance
-        // with no arguments: the same synthesized `{ tag, payload }` layout. A parameter spells
-        // it as a bare nominal, which is a `Struct` until resolution says otherwise.
-        if let Type::Enum(n, _) | Type::Struct(n, _) = ty {
-            let is_data = self
+        let (base, args) = match ty {
+            Type::GenericInstance(base, args) => (base.as_ref(), args.as_slice()),
+            _ => (ty, &[][..]),
+        };
+        if let Some((name, _)) = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(base.into())
+        {
+            if self
                 .registry
                 .enum_data
-                .get(n.as_ref())
-                .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()));
-            if is_data {
-                let (gid, _) = self.enum_instance_layout_of(n.as_ref(), &[])?;
+                .get(&name)
+                .is_some_and(|data| data.variants.iter().any(|(_, fields)| !fields.is_empty()))
+            {
+                let (gid, _) = self.enum_instance_layout_of(base, args)?;
                 return Some(LoweredTy::Aggregate(gid));
             }
-        }
-        if let Type::GenericInstance(base, args) = ty {
-            if let Type::Enum(n, _) | Type::Struct(n, _) = base.as_ref() {
-                let is_data = self
-                    .registry
-                    .enum_data
-                    .get(n.as_ref())
-                    .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()));
-                if is_data {
-                    let (gid, _) = self.enum_instance_layout_of(n.as_ref(), args)?;
-                    return Some(LoweredTy::Aggregate(gid));
-                }
-                // A generic struct whose layout depends on its arguments: the base layout is a
-                // stub, so the instance's is synthesized.
-                if matches!(base.as_ref(), Type::Struct(..))
-                    && self.registry.layout_gid_by_base_name(n.as_ref()).is_none()
-                {
-                    if let Some(gid) = self.struct_instance_layout_of(base.as_ref(), args) {
-                        return Some(LoweredTy::Aggregate(gid));
-                    }
-                }
+            if matches!(ty, Type::GenericInstance(..))
+                && matches!(base, Type::Struct(..))
+                && self.registry.nominal_layout_id(base).is_none()
+            {
+                let gid = self.struct_instance_layout_of(base, args)?;
+                return Some(LoweredTy::Aggregate(gid));
             }
         }
         lowered_ty(ty, self.registry)
@@ -3421,43 +3419,25 @@ impl<'r> Lowerer<'r> {
             Type::GenericInstance(base, args) => (base.as_ref(), args.as_slice()),
             other => (other, &[][..]),
         };
-        let (Type::Struct(name, id) | Type::Enum(name, id)) = base else {
-            return None;
-        };
+        let identities = self.registry.aggregate_identities();
+        let (name, declaration) = identities.resolve_base(base.into())?;
         if let Some(data) = self.registry.enum_data.get(name.as_ref()) {
             return data
                 .variants
                 .iter()
                 .any(|(_, p)| !p.is_empty())
-                .then(|| {
-                    enum_instance_gid(name.as_ref(), args, self.registry.aggregate_identities())
-                })
+                .then(|| enum_instance_gid(declaration, args, identities))
                 .flatten();
         }
-        if let Some(LoweredTy::Aggregate(gid)) = lowered_ty(ty, self.registry) {
-            return Some(gid);
+        self.registry.structs.get(&declaration)?;
+        if let Some(id) = self.registry.nominal_layout_id(base) {
+            return Some(id);
         }
-        // An incomplete struct layout still has a declaration ID. Its pointer does not
-        // need the target's size, and its metadata must not depend on resolution order.
-        let mut nominal = *id;
-        if nominal.is_none() {
-            for def in self
-                .registry
-                .layouts
-                .values()
-                .filter(|d| d.name == name.as_ref())
-            {
-                if nominal.is_some_and(|gid| gid != def.id) {
-                    return None;
-                }
-                nominal = Some(def.id);
-            }
-        }
-        let nominal = nominal.filter(|gid| self.registry.structs.contains_key(gid))?;
+        // Pointers need a declaration identity even when its storage is incomplete.
         if matches!(ty, Type::GenericInstance(..)) {
-            struct_instance_gid(base, args, self.registry.aggregate_identities())
+            struct_instance_gid(declaration, args, identities)
         } else {
-            Some(nominal)
+            Some(declaration)
         }
     }
 
@@ -3545,14 +3525,15 @@ impl<'r> Lowerer<'r> {
                     // An enum instance held by value, `Peek<T> { peeked : Option<T> }`. The type may
                     // spell the enum as a struct, so it is found by name.
                     Type::GenericInstance(b, a)
-                        if matches!(b.as_ref(), Type::Enum(n, _) | Type::Struct(n, _)
-                        if self.registry.enum_data.contains_key(n.as_ref())) =>
+                        if self
+                            .registry
+                            .aggregate_identities()
+                            .resolve_base(b.as_ref().into())
+                            .is_some_and(|(name, _)| {
+                                self.registry.enum_data.contains_key(&name)
+                            }) =>
                     {
-                        let (Type::Enum(inner_name, _) | Type::Struct(inner_name, _)) = b.as_ref()
-                        else {
-                            return None;
-                        };
-                        let (inner, _) = self.enum_instance_layout_of(inner_name.as_ref(), a)?;
+                        let (inner, _) = self.enum_instance_layout_of(b.as_ref(), a)?;
                         let layout = self.generated_layout(inner)?;
                         (
                             layout.size_bytes,
@@ -3572,8 +3553,8 @@ impl<'r> Lowerer<'r> {
                         )
                     }
                     // A plain struct held by value, `Holder<Noisy> { value : Noisy }`.
-                    Type::Struct(n, _) if self.nominal_struct_gid(n).is_some() => {
-                        let gid = self.nominal_struct_gid(n)?;
+                    Type::Struct(..) if self.nominal_struct_gid(&fty).is_some() => {
+                        let gid = self.nominal_struct_gid(&fty)?;
                         let (sz, al, mlir) = self.payload_field(&fty)?;
                         (sz, al, mlir, FieldTy::Nominal(gid))
                     }
@@ -3650,15 +3631,10 @@ impl<'r> Lowerer<'r> {
             && self.struct_instance_layout_of(b.as_ref(), a).is_some()
     }
 
-    /// The registry GID of a declared, non-generic struct named `name`; `None` for an enum, a
-    /// generic struct's stub, or a name nothing declares.
-    fn nominal_struct_gid(&self, name: &Symbol) -> Option<TypeId> {
-        if self.registry.enum_data.contains_key(name.as_ref()) {
-            return None;
-        }
-        let gid = self.struct_gid_by_name(name)?;
-        let def = self.registry.layouts.get(&gid)?;
-        (def.align_bytes != 0 && self.registry.structs.contains_key(&gid)).then_some(gid)
+    /// A complete declared struct layout, resolved by declaration identity.
+    fn nominal_struct_gid(&self, ty: &Type) -> Option<TypeId> {
+        let gid = self.registry.nominal_layout_id(ty)?;
+        self.registry.structs.contains_key(&gid).then_some(gid)
     }
 
     /// The size, alignment and MLIR type of a value held inside an enum's payload or a generic
@@ -3669,19 +3645,18 @@ impl<'r> Lowerer<'r> {
             return Some(field);
         }
         // An enum whose variants carry nothing, `Ordering`, is its `i32` tag.
-        if let Type::Struct(name, _) | Type::Enum(name, _) = ty {
-            if self
-                .registry
-                .enum_data
-                .get(name.as_ref())
-                .is_some_and(|d| d.variants.iter().all(|(_, p)| p.is_empty()))
-            {
-                return Some((4, 4, "i32".to_string()));
-            }
+        if self
+            .registry
+            .aggregate_identities()
+            .resolve_base(ty.into())
+            .and_then(|(name, _)| self.registry.enum_data.get(&name))
+            .is_some_and(|data| data.variants.iter().all(|(_, fields)| fields.is_empty()))
+        {
+            return Some((4, 4, "i32".to_string()));
         }
         match ty {
-            Type::Struct(name, _) => {
-                let gid = self.nominal_struct_gid(name)?;
+            Type::Struct(..) => {
+                let gid = self.nominal_struct_gid(ty)?;
                 let def = self.registry.layouts.get(&gid)?;
                 let mlir =
                     crate::codegen::flat::agg_struct_ty_of(gid, self.registry, &mut Vec::new())
@@ -3704,12 +3679,20 @@ impl<'r> Lowerer<'r> {
         }
     }
 
-    fn enum_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<(TypeId, Vec<u64>)> {
-        let gid = enum_instance_gid(base, args, self.registry.aggregate_identities())?;
+    fn enum_instance_layout_of<'a>(
+        &mut self,
+        base: impl Into<crate::layout::identity::AggregateBase<'a>>,
+        args: &[Type],
+    ) -> Option<(TypeId, Vec<u64>)> {
+        let (base, declaration) = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(base.into())?;
+        let gid = enum_instance_gid(declaration, args, self.registry.aggregate_identities())?;
         if let Some(layout) = self.generated_layout(gid) {
             return Some((gid, layout.field_offsets()));
         }
-        let data = self.registry.enum_data.get(base)?;
+        let data = self.registry.enum_data.get(&base)?;
         if data.generics.len() != args.len() {
             return None;
         }
@@ -5912,20 +5895,18 @@ fn lowered_ty(ty: &Type, registry: &ImmutableGlobalRegistry) -> Option<LoweredTy
     }
     match ty {
         // A payload-free (C-like) enum is a bare `i32` discriminant, not an aggregate (#227). The
-        // resolver may spell an enum type as `Type::Enum` or `Type::Struct`, so match on the name; a
-        // data-carrying enum is absent from `enum_variants` and falls through to the aggregate case.
-        Type::Enum(name, _) | Type::Struct(name, _)
-            if registry.enum_variants.contains_key(name) =>
+        // resolver may spell an enum as `Type::Enum` or `Type::Struct`. Resolve its declaration
+        // before consulting the enum table.
+        Type::Enum(..) | Type::Struct(..)
+            if registry
+                .aggregate_identities()
+                .resolve_base(ty.into())
+                .is_some_and(|(name, _)| registry.enum_variants.contains_key(&name)) =>
         {
             Some(LoweredTy::Scalar(ElementType::I32))
         }
-        Type::Struct(name, id) | Type::Enum(name, id) => {
-            // The attached GID when name resolution modelled it (non-stub), else by name — a
-            // monomorphized cross-module signature may carry an unresolved base (`Struct("Vec", None)`).
-            let gid = id
-                .filter(|g| registry.layouts.get(g).is_some_and(|d| d.align_bytes != 0))
-                .or_else(|| registry.layout_gid_by_base_name(name.as_ref()))?;
-            Some(LoweredTy::Aggregate(gid))
+        Type::Struct(..) | Type::Enum(..) => {
+            registry.nominal_layout_id(ty).map(LoweredTy::Aggregate)
         }
         // A monomorphized generic struct instance (`Vec<i32>`): its layout is the base nominal's when
         // that layout is *instance-independent* — every generic parameter appears only behind a
@@ -6710,13 +6691,16 @@ fn agg_gid_of_ty(ty: &Type, registry: &ImmutableGlobalRegistry) -> Option<TypeId
     // *synthesized* per-instance `{ tag, payload }` layout keyed by `enum_instance_gid`, not a registry
     // layout — resolve it directly so the pointer binds as an aggregate reference (`match *self`). (#242)
     if let Type::GenericInstance(base, args) = pointee {
-        if let Type::Enum(n, _) | Type::Struct(n, _) = base.as_ref() {
+        if let Some((name, declaration)) = registry
+            .aggregate_identities()
+            .resolve_base(base.as_ref().into())
+        {
             if registry
                 .enum_data
-                .get(n.as_ref())
+                .get(&name)
                 .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()))
             {
-                return enum_instance_gid(base.as_ref(), args, registry.aggregate_identities());
+                return enum_instance_gid(declaration, args, registry.aggregate_identities());
             }
         }
     }
@@ -6724,13 +6708,7 @@ fn agg_gid_of_ty(ty: &Type, registry: &ImmutableGlobalRegistry) -> Option<TypeId
         Type::GenericInstance(base, _) => base.as_ref(),
         other => other,
     };
-    let (name, gid_opt) = match nominal {
-        Type::Struct(n, id) | Type::Enum(n, id) => (n.as_ref(), *id),
-        _ => return None,
-    };
-    gid_opt
-        .filter(|id| registry.layouts.get(id).is_some_and(|d| d.align_bytes != 0))
-        .or_else(|| registry.layout_gid_by_base_name(name))
+    registry.nominal_layout_id(nominal)
 }
 
 /// Whether a parameter type is a pointer/borrow to a modelled aggregate (`self : &mut Vec<i32>`) —

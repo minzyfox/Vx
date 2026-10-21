@@ -324,6 +324,139 @@ fn aggregate_identity_preserves_declarations_in_bases_and_arguments() {
     }
 }
 
+#[rstest::rstest]
+#[case("Unique", Some(1), Some(1), Some(1))]
+#[case("Alias", Some(1), Some(1), Some(1))]
+#[case("Unique", None, Some(1), Some(1))]
+#[case("Unique", Some(99), None, None)]
+#[case("Shared", None, None, None)]
+#[case("Shared", Some(2), Some(2), Some(2))]
+#[case("Shared", Some(3), None, Some(3))]
+#[case("Incomplete", None, None, Some(4))]
+#[case("Missing", None, None, None)]
+fn nominal_lookup_resolves_declarations_before_storage(
+    #[case] name: &str,
+    #[case] attached: Option<u64>,
+    #[case] storage: Option<u64>,
+    #[case] declaration: Option<u64>,
+) {
+    let id = |n| TypeId::new(1, n, 0, 0);
+    let definitions = [
+        ("Unique", 1, 4),
+        ("Shared", 2, 8),
+        ("Shared", 3, 0),
+        ("Incomplete", 4, 0),
+    ]
+    .into_iter()
+    .map(|(name, n, align)| crate::registry::TypeDefinition {
+        id: id(n),
+        name: name.into(),
+        size_bytes: align,
+        align_bytes: align,
+        fields: vec![],
+        by_value_dependencies: vec![],
+    })
+    .collect();
+    let mut registry = ImmutableGlobalRegistry::build_and_validate(definitions).unwrap();
+    for n in 1..=4 {
+        registry.structs.insert(
+            id(n),
+            crate::registry::StructFields {
+                generics: vec![],
+                fields: vec![],
+            },
+        );
+    }
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = Type::Struct(name.into(), attached.map(id));
+    let expected_storage = storage.map(id);
+    assert_eq!(
+        (
+            registry.nominal_layout_id(&ty),
+            lowered_ty(&ty, &registry).map(|ty| match ty {
+                LoweredTy::Aggregate(id) => Some(id),
+                _ => None,
+            }),
+            agg_gid_of_ty(&ty, &registry),
+            lowerer.known_aggregate_id(&ty),
+            lowerer
+                .payload_field(&ty)
+                .map(|(size, align, _)| (size, align)),
+        ),
+        (
+            expected_storage,
+            expected_storage.map(Some),
+            expected_storage,
+            declaration.map(id),
+            storage.map(|n| if n == 1 { (4, 4) } else { (8, 8) }),
+        ),
+        "all typed lookups must use the same declaration before requiring storage"
+    );
+    if attached.is_none() {
+        assert_eq!(
+            registry.layout_gid_by_base_name(name),
+            expected_storage,
+            "bare-name storage lookup must use the same ambiguity rule"
+        );
+    }
+}
+
+#[rstest::rstest]
+#[case("Data", false, true)]
+#[case("Alias", false, true)]
+#[case("Data", true, false)]
+fn enum_lookup_uses_the_attached_declaration(
+    #[case] name: &str,
+    #[case] unknown: bool,
+    #[case] resolves: bool,
+    #[values(false, true)] struct_spelling: bool,
+) {
+    let source = "enum Data<T> { Some(T), None }";
+    let mut lexer = crate::lexer::Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = crate::parser::Parser::new(&tokens, source);
+    let mut module = parser.parse().unwrap();
+    module.module_path = "crate::lookup".into();
+    let registry = crate::pipeline::build_frozen_registry(&[module]).unwrap();
+    let declaration = registry
+        .layouts
+        .values()
+        .find(|def| def.name == "Data")
+        .unwrap()
+        .id;
+    let attached = Some(if unknown {
+        TypeId::new(99, 99, 0, 0)
+    } else {
+        declaration
+    });
+    let base = if struct_spelling {
+        Type::Struct(name.into(), attached)
+    } else {
+        Type::Enum(name.into(), attached)
+    };
+    let args = vec![Type::Scalar(ElementType::I32)];
+    let expected = resolves.then(|| {
+        super::enum_instance_gid(declaration, &args, registry.aggregate_identities()).unwrap()
+    });
+    let ty = Type::GenericInstance(Box::new(base.clone()), args.clone());
+    let mut lowerer = Lowerer::new(&registry);
+    assert_eq!(
+        (
+            lowerer.known_aggregate_id(&ty),
+            lowerer
+                .enum_instance_layout_of(&base, &args)
+                .map(|(id, _)| id),
+            lowerer.lower_ty_synth(&ty).map(|ty| match ty {
+                LoweredTy::Aggregate(id) => Some(id),
+                _ => None,
+            }),
+            agg_gid_of_ty(&ty, &registry),
+        ),
+        (expected, expected, expected.map(Some), expected),
+        "enum lookup must preserve attached IDs through layout synthesis"
+    );
+}
+
 #[test]
 fn generic_struct_layout_uses_its_attached_base_declaration() {
     let first = TypeId::new(10, 1, 0, 0);
