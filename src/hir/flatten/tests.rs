@@ -1374,7 +1374,7 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
                         name: "payload_0".into(),
                         offset: 8,
                         size: 8,
-                        ty: FieldTy::Scalar(ElementType::U64)
+                        ty: FieldTy::Opaque
                     },
                     mlir_type: "i64".into(),
                     aggregate_id: None,

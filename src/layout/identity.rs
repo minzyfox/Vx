@@ -11,8 +11,7 @@
 use crate::gid::TypeId;
 use crate::symbol::Symbol;
 use crate::syntax::identity::{
-    const_key as aggregate_const_key, placement_key as aggregate_placement_key,
-    topology_key as aggregate_topology_key,
+    write_const_key, write_placement_key, write_topology_key, SemanticKey,
 };
 use crate::syntax::{Dim, Expr, NumberExpr, Type};
 use rustc_hash::FxHashMap;
@@ -233,75 +232,147 @@ impl AggregateIdentities {
 }
 
 fn aggregate_type_key(ty: &Type, identities: &AggregateIdentities) -> Option<String> {
-    use crate::syntax::types::Mangle;
-    let keys = |args: &[Type]| {
-        args.iter()
-            .map(|ty| aggregate_type_key(ty, identities))
-            .collect::<Option<Vec<_>>>()
-    };
-    Some(match ty {
-        Type::Tensor(elem, dims, placement) => {
-            let dimensions = dims
-                .iter()
-                .map(|dim| match dim {
-                    Dim::Dyn => Some("?".into()),
-                    Dim::Static(expr) => aggregate_const_key(expr),
-                })
-                .collect::<Option<Vec<_>>>()?;
-            format!(
-                "tensor({elem:?},{dimensions:?},{:?})",
-                aggregate_placement_key(placement)?
-            )
-        }
-        Type::Pointer(inner, placement, mutable) => format!(
-            "pointer({:?},{:?},{mutable})",
-            aggregate_type_key(inner, identities)?,
-            aggregate_placement_key(placement)?
-        ),
-        Type::Borrow {
-            inner,
-            mem_space,
-            is_mut,
-            ..
-        } => format!(
-            "borrow({:?},{mem_space:?},{is_mut})",
-            aggregate_type_key(inner, identities)?
-        ),
-        Type::Ref(inner, space) => format!(
-            "ref({:?},{space:?})",
-            aggregate_type_key(inner, identities)?
-        ),
-        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner, identities)?),
-        Type::Pinned(inner, topology) => format!(
-            "pinned({:?},{:?})",
-            aggregate_type_key(inner, identities)?,
-            aggregate_topology_key(topology)?
-        ),
-        Type::GenericInstance(base, args) => format!(
-            "instance({:?},{:?})",
-            aggregate_type_key(base, identities)?,
-            keys(args)?
-        ),
-        Type::Function(params, result, unsafe_fn) => format!(
-            "function({:?},{:?},{unsafe_fn})",
-            keys(params)?,
-            aggregate_type_key(result, identities)?
-        ),
-        Type::Closure(params, result) => format!(
-            "closure({:?},{:?})",
-            keys(params)?,
-            aggregate_type_key(result, identities)?
-        ),
-        Type::Const(expr) => format!("constant({:?})", aggregate_const_key(expr)?),
-        Type::Struct(name, id) | Type::Enum(name, id) => {
-            if id.is_none() && crate::syntax::is_void_ty(ty) {
-                ty.mangle()
-            } else {
-                let (_, id) = identities.resolve(name, *id)?;
-                format!("nominal({id:?})")
+    fn write(ty: &Type, identities: &AggregateIdentities, key: &mut SemanticKey) -> Option<()> {
+        use crate::syntax::types::Mangle;
+        match ty {
+            Type::Tensor(elem, dims, placement) => {
+                key.begin("tensor");
+                key.atom("element", format_args!("{elem:?}"));
+                key.begin("dimensions");
+                for dim in dims {
+                    match dim {
+                        Dim::Dyn => key.atom("dynamic", ""),
+                        Dim::Static(expr) => write_const_key(expr, key)?,
+                    }
+                }
+                key.end();
+                write_placement_key(placement, key)?;
+                key.end();
             }
+            Type::Pointer(inner, placement, mutable) => {
+                key.begin("pointer");
+                key.atom("mutable", mutable);
+                write(inner, identities, key)?;
+                write_placement_key(placement, key)?;
+                key.end();
+            }
+            Type::Borrow {
+                inner,
+                mem_space,
+                is_mut,
+                ..
+            } => {
+                key.begin("borrow");
+                key.atom("mutable", is_mut);
+                key.atom("memory", format_args!("{mem_space:?}"));
+                write(inner, identities, key)?;
+                key.end();
+            }
+            Type::Ref(inner, space) => {
+                key.begin("ref");
+                key.atom("memory", format_args!("{space:?}"));
+                write(inner, identities, key)?;
+                key.end();
+            }
+            Type::Verified(inner) => {
+                key.begin("verified");
+                write(inner, identities, key)?;
+                key.end();
+            }
+            Type::Pinned(inner, topology) => {
+                key.begin("pinned");
+                write(inner, identities, key)?;
+                write_topology_key(topology, key)?;
+                key.end();
+            }
+            Type::GenericInstance(base, args) => {
+                key.begin("instance");
+                write(base, identities, key)?;
+                key.begin("arguments");
+                for arg in args {
+                    write(arg, identities, key)?;
+                }
+                key.end();
+                key.end();
+            }
+            Type::Function(params, result, unsafe_fn) => {
+                key.begin("function");
+                key.atom("unsafe", unsafe_fn);
+                key.begin("parameters");
+                for param in params {
+                    write(param, identities, key)?;
+                }
+                key.end();
+                write(result, identities, key)?;
+                key.end();
+            }
+            Type::Closure(params, result) => {
+                key.begin("closure");
+                key.begin("parameters");
+                for param in params {
+                    write(param, identities, key)?;
+                }
+                key.end();
+                write(result, identities, key)?;
+                key.end();
+            }
+            Type::Const(expr) => {
+                key.begin("constant");
+                write_const_key(expr, key)?;
+                key.end();
+            }
+            Type::Struct(name, id) | Type::Enum(name, id) => {
+                if id.is_none() && crate::syntax::is_void_ty(ty) {
+                    key.atom("builtin", ty.mangle());
+                } else {
+                    let (_, id) = identities.resolve(name, *id)?;
+                    key.atom("nominal", format_args!("{id:?}"));
+                }
+            }
+            Type::Module(..) | Type::Unknown => return None,
+            _ => key.atom("type", ty.mangle()),
         }
-        Type::Module(..) | Type::Unknown => return None,
-        _ => ty.mangle(),
-    })
+        Some(())
+    }
+    let mut key = SemanticKey::default();
+    write(ty, identities, &mut key)?;
+    Some(key.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[rstest::rstest]
+    #[case::pointers(false)]
+    #[case::generic_instances(true)]
+    fn nested_type_keys_have_linear_size_and_distinct_leaves(
+        #[case] generic: bool,
+        #[values(8, 20, 64)] depth: usize,
+    ) {
+        let declaration = TypeId::new(1, 1, 0, 0);
+        let identities = AggregateIdentities::new([(declaration, "Box".into())]);
+        let nested = |element| {
+            let mut ty = Type::Scalar(element);
+            for _ in 0..depth {
+                ty = if generic {
+                    Type::GenericInstance(
+                        Box::new(Type::Struct("Box".into(), Some(declaration))),
+                        vec![ty],
+                    )
+                } else {
+                    Type::Pointer(Box::new(ty), None, false)
+                };
+            }
+            identities.type_key(&ty).unwrap()
+        };
+        let first = nested(crate::syntax::ElementType::I32);
+        let second = nested(crate::syntax::ElementType::I64);
+        assert!(
+            first.len() <= 256 * (depth + 1),
+            "nested type key size must be linear: {} bytes at depth {depth}",
+            first.len()
+        );
+        assert_ne!(first, second, "nested type keys must retain the leaf type");
+    }
 }

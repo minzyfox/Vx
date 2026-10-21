@@ -2825,12 +2825,18 @@ mod tests {
         });
     }
 
-    #[test]
-    fn enum_layout_zero_sized_storage_agrees_with_llvm() {
+    #[rstest::rstest]
+    fn enum_layout_zero_sized_storage_agrees_with_llvm(#[values(1, 2, 4, 8, 16)] align: u64) {
+        let slot = crate::layout::EnumPayloadSlot {
+            offset: 0,
+            size: 0,
+            align,
+        };
+        let field = crate::layout::enum_slot_storage(&slot).unwrap();
         assert_eq!(
-            llvm_storage_layout("!llvm.struct<(i32, !llvm.struct<()>, i8)>", "e-i64:64"),
-            (8, 4, vec![0, 4, 4]),
-            "zero-sized fields retain their index and share an offset"
+            llvm_storage_layout(&format!("!llvm.struct<({field}, i8)>"), "e-i64:64"),
+            (align, align, vec![0, 0]),
+            "zero-sized integer carriers must retain alignment and field identity"
         );
     }
 

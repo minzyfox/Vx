@@ -4148,3 +4148,30 @@ fn enum_payloads_keep_size_and_alignment(#[case] jobs: Option<usize>, #[case] op
         optimization,
     );
 }
+
+#[rstest::rstest]
+#[case::normal(None, 0)]
+#[case::parallel(Some(2), 0)]
+#[case::optimized_normal(None, 2)]
+#[case::optimized_parallel(Some(2), 2)]
+fn enum_shared_storage_preserves_all_payload_bits(
+    #[case] jobs: Option<usize>,
+    #[case] optimization: u8,
+    #[values(
+        "enum_bool_and_byte_preserve_all_bits.vx",
+        "enum_padded_and_dense_preserve_all_bits.vx",
+        "enum_copies_preserve_numbers_and_pointers.vx"
+    )]
+    fixture: &str,
+) {
+    let expected: &[&str] = match fixture {
+        "enum_bool_and_byte_preserve_all_bits.vx" => {
+            &["254", "254", "254", "254", "13", "11", "1", "0"]
+        }
+        "enum_padded_and_dense_preserve_all_bits.vx" => {
+            &["1540", "1540", "1540", "1540", "22", "34"]
+        }
+        _ => &["4294967301", "1.5", "29"],
+    };
+    assert_generated_aggregate_runs_at_optimization(fixture, expected, jobs, optimization);
+}

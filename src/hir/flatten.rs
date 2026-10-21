@@ -3705,21 +3705,12 @@ impl<'r> Lowerer<'r> {
             let mut payloads = Vec::new();
             for ty in types {
                 let ty = ty.substitute(&mapping);
-                let (size, align, mlir) = self.payload_field(&ty)?;
-                payloads.push((size, align, ty, mlir));
+                let (size, align, _) = self.payload_field(&ty)?;
+                payloads.push((size, align));
             }
             variants.push(payloads);
         }
-        let requirements: Vec<_> = variants
-            .iter()
-            .map(|payloads| {
-                payloads
-                    .iter()
-                    .map(|(size, align, _, _)| (*size, *align))
-                    .collect()
-            })
-            .collect();
-        let storage = crate::layout::enum_storage_layout(&requirements)?;
+        let storage = crate::layout::enum_storage_layout(&variants)?;
         let mut fields = vec![crate::layout::GeneratedFieldLayout {
             layout: crate::layout::FieldLayout {
                 name: "tag".into(),
@@ -3732,51 +3723,18 @@ impl<'r> Lowerer<'r> {
             pointer_target_id: None,
         }];
         for (index, slot) in storage.slots.iter().enumerate() {
-            // Preserve existing storage when one payload supplies both capacity and alignment.
-            let representative = variants
-                .iter()
-                .filter_map(|v| v.get(index))
-                .find(|(size, align, _, _)| *size == slot.size && *align == slot.align);
-            let (mlir, kind, aggregate_id, pointer_target_id) =
-                if let Some((_, _, ty, mlir)) = representative {
-                    let metadata = self.payload_metadata(ty.clone())?;
-                    let kind = match &metadata.ty {
-                        Type::Scalar(e) => FieldTy::Scalar(e.clone()),
-                        _ => metadata
-                            .aggregate_id
-                            .map(FieldTy::Nominal)
-                            .unwrap_or_else(|| {
-                                if mlir == "i32" {
-                                    FieldTy::Scalar(ElementType::I32)
-                                } else {
-                                    FieldTy::Opaque
-                                }
-                            }),
-                    };
-                    (
-                        mlir.clone(),
-                        kind,
-                        metadata.aggregate_id,
-                        metadata.pointer_target_id,
-                    )
-                } else {
-                    (
-                        crate::layout::enum_slot_storage(slot)?,
-                        FieldTy::Opaque,
-                        None,
-                        None,
-                    )
-                };
+            // Payload types can contain padding or sub-byte fields. Copy every carrier byte instead.
+            let mlir = crate::layout::enum_slot_storage(slot)?;
             fields.push(crate::layout::GeneratedFieldLayout {
                 layout: crate::layout::FieldLayout {
                     name: format!("payload_{index}").into(),
                     offset: usize::try_from(slot.offset).ok()?,
                     size: usize::try_from(slot.size).ok()?,
-                    ty: kind,
+                    ty: FieldTy::Opaque,
                 },
                 mlir_type: mlir,
-                aggregate_id,
-                pointer_target_id,
+                aggregate_id: None,
+                pointer_target_id: None,
             });
         }
         if !self.agg_layout_indices.contains_key(&gid) {

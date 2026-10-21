@@ -95,7 +95,7 @@ impl<'a> VxMetadata<'a> {
 const VXLIB_MAGIC: &[u8; 4] = b"VXLB";
 /// Format tag folded into an FNV-1a stamp (`src/hash.rs`) written after the magic. A codec change
 /// bumps this string, so a stale artifact is *detected* (version mismatch on load) rather than misread.
-const VXLIB_FORMAT_TAG: &str = "vxlib-interface-v17";
+const VXLIB_FORMAT_TAG: &str = "vxlib-interface-v18";
 
 /// Append-only little-endian byte writer for the interface codec.
 struct Writer {
@@ -1260,7 +1260,7 @@ mod tests {
         let registry = ImmutableGlobalRegistry::build_and_validate(vec![]).unwrap();
         let mut bytes = serialize_registry_interface(&registry);
         bytes[4..12].copy_from_slice(
-            &crate::hash::compute_module_hash("vxlib-interface-v16").to_le_bytes(),
+            &crate::hash::compute_module_hash("vxlib-interface-v17").to_le_bytes(),
         );
         assert_eq!(
             deserialize_registry_interface(&bytes).err(),

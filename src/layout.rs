@@ -268,7 +268,10 @@ pub fn enum_slot_storage(slot: &EnumPayloadSlot) -> Option<String> {
         16 => "vector<2xi64>",
         _ => return None,
     };
-    if slot.size == 0 || !slot.size.is_multiple_of(slot.align) {
+    if slot.size == 0 {
+        return Some(format!("!llvm.array<0 x {anchor}>"));
+    }
+    if !slot.size.is_multiple_of(slot.align) {
         return None;
     }
     if slot.size == slot.align {
@@ -457,15 +460,7 @@ impl<'a> LayoutComputer<'a> {
             // "Closure1", None)`). An instance-dependent base (`Box<T> { value: T }`) has no layout
             // of its own, so the instance with these arguments gets one (`instance_of`). (#242)
             Type::GenericInstance(base, args) => {
-                let id = match base.as_ref() {
-                    Type::Struct(_, Some(id)) | Type::Enum(_, Some(id)) => *id,
-                    Type::Struct(name, None) | Type::Enum(name, None) => *self
-                        .structs
-                        .iter()
-                        .find(|(_, d)| d.name == *name)
-                        .map(|(g, _)| g)?,
-                    _ => return None,
-                };
+                let (_, id) = self.identities.resolve_base(base.as_ref().into())?;
                 if let Some(layout) = self.layout_of(id) {
                     return Some((layout.size, layout.align, FieldTy::Nominal(id)));
                 }
@@ -567,7 +562,6 @@ mod tests {
     #[case::zero_alignment(8, 0)]
     #[case::invalid_alignment(9, 3)]
     #[case::unverified_alignment(64, 32)]
-    #[case::zero_capacity(0, 1)]
     #[case::partial_alignment(12, 8)]
     #[case::too_small(4, 8)]
     fn enum_layout_invalid_storage_declines(#[case] size: u64, #[case] align: u64) {
@@ -985,6 +979,52 @@ mod tests {
         assert_eq!(l.fields[1].offset, 4);
         assert_eq!(l.fields[2].offset, 8);
         assert_eq!(l.fields[2].size, 1);
+    }
+
+    #[rstest::rstest]
+    fn generic_fields_resolve_attached_ids_before_names(#[values(false, true)] reverse: bool) {
+        let mut first = strukt("Shared", vec![("value", Type::Generic("T".into(), None))]);
+        first.generics.push(crate::syntax::GenericParam::Type {
+            name: "T".into(),
+            bounds: vec![],
+        });
+        let mut second = first.clone();
+        second
+            .fields
+            .push(("tail".into(), scalar(ElementType::I64)));
+        let entries = if reverse {
+            vec![(gid(2), &second), (gid(1), &first)]
+        } else {
+            vec![(gid(1), &first), (gid(2), &second)]
+        };
+        let mut computer = LayoutComputer::new(entries.into_iter().collect(), FxHashMap::default());
+        let instance = |name: &str, id| {
+            Type::GenericInstance(
+                Box::new(Type::Struct(name.into(), id)),
+                vec![scalar(ElementType::I32)],
+            )
+        };
+        assert!(
+            computer.field_info(&instance("Shared", None)).is_none(),
+            "ambiguous generic bases must decline"
+        );
+        assert!(
+            computer
+                .field_info(&instance("Shared", Some(gid(99))))
+                .is_none(),
+            "unknown attached generic bases must decline"
+        );
+        let first = computer
+            .field_info(&instance("Alias", Some(gid(1))))
+            .unwrap();
+        let second = computer
+            .field_info(&instance("Shared", Some(gid(2))))
+            .unwrap();
+        assert_eq!(
+            (first.0, first.1, second.0, second.1),
+            (4, 4, 16, 8),
+            "attached generic declarations must supply their own fields"
+        );
     }
 
     #[test]

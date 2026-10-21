@@ -2373,6 +2373,55 @@ mod gid_stream_tests {
         assert_eq!(mi.layout_of(only).unwrap().name, "Only");
     }
 
+    #[rstest::rstest]
+    fn generic_struct_layouts_keep_module_identity(
+        #[values(false, true)] reverse: bool,
+        #[values(false, true)] attached: bool,
+    ) {
+        use crate::syntax::Type;
+        let first = parse_and_resolve(
+            "crate::first",
+            "struct Shared<T> { value: T } struct First { nested: Shared<i32> }",
+        );
+        let second = parse_and_resolve(
+            "crate::second",
+            "struct Shared<T> { value: T, tail: i64 } struct Second { nested: Shared<i32> }",
+        );
+        let mut modules = vec![first, second];
+        if !attached {
+            for module in &mut modules {
+                let Type::GenericInstance(base, _) = &mut module.structs[1].fields[0].1 else {
+                    panic!("generic field");
+                };
+                let Type::Struct(_, id) = base.as_mut() else {
+                    panic!("nominal base");
+                };
+                *id = None;
+            }
+        }
+        if reverse {
+            modules.reverse();
+        }
+        let registry = build_frozen_registry(&modules).unwrap();
+        let layout = |name: &str| {
+            let definition = registry
+                .layouts
+                .values()
+                .find(|definition| definition.name == name)
+                .unwrap();
+            (definition.size_bytes, definition.align_bytes)
+        };
+        assert_eq!(
+            (layout("First"), layout("Second")),
+            if attached {
+                ((4, 4), (16, 8))
+            } else {
+                ((0, 0), (0, 0))
+            },
+            "module order must not choose a same-named generic declaration"
+        );
+    }
+
     /// End-to-end for the #219 dual-run gate: freeze the registry over a module with a concrete scalar
     /// `impl` method (the shape of `impl Math for f32 { fn exp(..) }` in the stdlib), then type-check a
     /// caller *against that registry*. The in-situ parity gate in `check_methodcall_expr` fires at the
