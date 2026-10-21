@@ -54,6 +54,35 @@ pub struct GeneratedFieldLayout {
 }
 
 impl GeneratedAggregateLayout {
+    /// Compare storage and payload meaning. The aggregate ID supersedes its display name.
+    /// Unsupported or unresolved payload types do not establish agreement.
+    pub fn semantically_eq(
+        &self,
+        other: &Self,
+        identities: &identity::AggregateIdentities,
+    ) -> bool {
+        self.type_id == other.type_id
+            && self.size_bytes == other.size_bytes
+            && self.align_bytes == other.align_bytes
+            && self.fields == other.fields
+            && self.variant_payloads.len() == other.variant_payloads.len()
+            && self
+                .variant_payloads
+                .iter()
+                .zip(&other.variant_payloads)
+                .all(|(left, right)| {
+                    left.len() == right.len()
+                        && left.iter().zip(right).all(|(left, right)| {
+                            left.aggregate_id == right.aggregate_id
+                                && left.pointer_target_id == right.pointer_target_id
+                                && matches!(
+                                    (identities.type_key(&left.ty), identities.type_key(&right.ty)),
+                                    (Some(left), Some(right)) if left == right
+                                )
+                        })
+                })
+    }
+
     pub fn field_offsets(&self) -> Vec<u64> {
         self.fields.iter().map(|f| f.layout.offset as u64).collect()
     }
@@ -402,6 +431,267 @@ impl<'a> LayoutComputer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comparison_record() -> (GeneratedAggregateLayout, identity::AggregateIdentities) {
+        let node = TypeId::new(10, 1, 0, 0);
+        let other = TypeId::new(20, 1, 0, 0);
+        let identities = identity::AggregateIdentities::new([
+            (node, "Node".into()),
+            (other, "Other".into()),
+            (TypeId::new(30, 1, 0, 0), "Ambiguous".into()),
+            (TypeId::new(40, 1, 0, 0), "Ambiguous".into()),
+        ]);
+        let record = GeneratedAggregateLayout {
+            type_id: TypeId::new(0, 100, 0, 0),
+            name: "Choice".into(),
+            size_bytes: 8,
+            align_bytes: 8,
+            fields: vec![GeneratedFieldLayout {
+                layout: FieldLayout {
+                    name: "value".into(),
+                    offset: 0,
+                    size: 8,
+                    ty: FieldTy::Opaque,
+                },
+                mlir_type: "!llvm.ptr".into(),
+                aggregate_id: None,
+                pointer_target_id: Some(node),
+            }],
+            variant_payloads: vec![vec![GeneratedPayloadLayout {
+                ty: Type::Borrow {
+                    inner: Box::new(Type::Struct("Node".into(), Some(node))),
+                    mem_space: None,
+                    is_mut: false,
+                    region_id: 17,
+                },
+                aggregate_id: None,
+                pointer_target_id: Some(node),
+            }]],
+        };
+        (record, identities)
+    }
+
+    fn source_number(column: usize) -> crate::syntax::Expr {
+        crate::syntax::Expr::Number(crate::syntax::NumberExpr::new(
+            "4".into(),
+            None,
+            crate::syntax::Span {
+                column,
+                ..Default::default()
+            },
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case("nominal_spelling")]
+    #[case("missing_id")]
+    #[case("nominal_kind")]
+    #[case("borrow_region")]
+    #[case("constant_source")]
+    #[case("tensor_source")]
+    #[case("device_source")]
+    #[case("display_name")]
+    fn layout_records_compare_types_semantically(#[case] difference: &str) {
+        use crate::syntax::{Dim, Placement, Topology};
+        let (mut first, identities) = comparison_record();
+        let mut second = first.clone();
+        match difference {
+            "nominal_spelling" | "missing_id" | "nominal_kind" => {
+                let Type::Borrow { inner, .. } = &mut second.variant_payloads[0][0].ty else {
+                    unreachable!()
+                };
+                **inner = match difference {
+                    "missing_id" => Type::Struct("Node".into(), None),
+                    "nominal_kind" => Type::Enum("Node".into(), Some(TypeId::new(10, 1, 0, 0))),
+                    _ => Type::Struct("module::Node".into(), Some(TypeId::new(10, 1, 0, 0))),
+                };
+            }
+            "borrow_region" => {
+                let Type::Borrow { region_id, .. } = &mut second.variant_payloads[0][0].ty else {
+                    unreachable!()
+                };
+                *region_id = 41;
+            }
+            "constant_source" | "tensor_source" | "device_source" => {
+                let ty = |column| match difference {
+                    "constant_source" => Type::Const(Box::new(source_number(column))),
+                    "tensor_source" => Type::Tensor(
+                        ElementType::F32,
+                        vec![Dim::Static(source_number(column))],
+                        None,
+                    ),
+                    _ => Type::Pointer(
+                        Box::new(Type::Scalar(ElementType::I32)),
+                        Some(Placement::on(Topology::GPU(Box::new(source_number(
+                            column,
+                        ))))),
+                        false,
+                    ),
+                };
+                first.variant_payloads[0][0].ty = ty(2);
+                second.variant_payloads[0][0].ty = ty(20);
+            }
+            "display_name" => second.name = "module::Choice".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            first.semantically_eq(&second, &identities),
+            "equivalent records must agree: {difference}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("type_id")]
+    #[case("size")]
+    #[case("alignment")]
+    #[case("field_count")]
+    #[case("field_name")]
+    #[case("field_offset")]
+    #[case("field_size")]
+    #[case("field_type")]
+    #[case("mlir_type")]
+    #[case("field_aggregate")]
+    #[case("field_pointer_target")]
+    #[case("variant_count")]
+    #[case("payload_count")]
+    #[case("payload_aggregate")]
+    #[case("payload_pointer_target")]
+    #[case("nominal_declaration")]
+    #[case("borrow_permission")]
+    #[case("borrow_memory")]
+    #[case("reference_kind")]
+    #[case("pointer_permission")]
+    #[case("tensor_element")]
+    #[case("tensor_dimension")]
+    #[case("tensor_memory")]
+    #[case("tensor_device")]
+    #[case("explicit_cpu")]
+    #[case("unknown_id")]
+    #[case("ambiguous_name")]
+    #[case("unsupported_expression")]
+    #[case("unknown_type")]
+    fn layout_records_require_known_semantic_agreement(#[case] difference: &str) {
+        use crate::syntax::{Dim, MemorySpace, Placement, Topology};
+        let (mut first, identities) = comparison_record();
+        let mut second = first.clone();
+        let other = TypeId::new(20, 1, 0, 0);
+        match difference {
+            "type_id" => second.type_id = other,
+            "size" => second.size_bytes += 8,
+            "alignment" => second.align_bytes *= 2,
+            "field_count" => second.fields.clear(),
+            "field_name" => second.fields[0].layout.name = "other".into(),
+            "field_offset" => second.fields[0].layout.offset += 8,
+            "field_size" => second.fields[0].layout.size += 8,
+            "field_type" => second.fields[0].layout.ty = FieldTy::Scalar(ElementType::I64),
+            "mlir_type" => second.fields[0].mlir_type = "i64".into(),
+            "field_aggregate" => second.fields[0].aggregate_id = Some(other),
+            "field_pointer_target" => second.fields[0].pointer_target_id = Some(other),
+            "variant_count" => second.variant_payloads.push(vec![]),
+            "payload_count" => second.variant_payloads[0].clear(),
+            "payload_aggregate" => second.variant_payloads[0][0].aggregate_id = Some(other),
+            "payload_pointer_target" => {
+                second.variant_payloads[0][0].pointer_target_id = Some(other)
+            }
+            "nominal_declaration" | "unknown_id" | "ambiguous_name" => {
+                let Type::Borrow { inner, .. } = &mut second.variant_payloads[0][0].ty else {
+                    unreachable!()
+                };
+                **inner = match difference {
+                    "unknown_id" => Type::Struct("Node".into(), Some(TypeId::new(99, 1, 0, 0))),
+                    "ambiguous_name" => Type::Struct("Ambiguous".into(), None),
+                    _ => Type::Struct("Node".into(), Some(other)),
+                };
+            }
+            "borrow_permission" => {
+                let Type::Borrow { is_mut, .. } = &mut second.variant_payloads[0][0].ty else {
+                    unreachable!()
+                };
+                *is_mut = true;
+            }
+            "borrow_memory" => {
+                let Type::Borrow { mem_space, .. } = &mut second.variant_payloads[0][0].ty else {
+                    unreachable!()
+                };
+                *mem_space = Some(MemorySpace::GpuHbm);
+            }
+            "reference_kind" => {
+                second.variant_payloads[0][0].ty = Type::Ref(
+                    Box::new(Type::Struct("Node".into(), Some(TypeId::new(10, 1, 0, 0)))),
+                    MemorySpace::CPUDRAM,
+                )
+            }
+            "pointer_permission" => {
+                first.variant_payloads[0][0].ty =
+                    Type::Pointer(Box::new(Type::Scalar(ElementType::I32)), None, false);
+                second.variant_payloads[0][0].ty =
+                    Type::Pointer(Box::new(Type::Scalar(ElementType::I32)), None, true);
+            }
+            "tensor_element" | "tensor_dimension" | "tensor_memory" | "tensor_device"
+            | "explicit_cpu" => {
+                let tensor = |elem, dim, placement| {
+                    Type::Tensor(
+                        elem,
+                        vec![Dim::Static(crate::syntax::Expr::Number(
+                            crate::syntax::NumberExpr::new(dim, None, Default::default()),
+                        ))],
+                        placement,
+                    )
+                };
+                first.variant_payloads[0][0].ty = tensor(ElementType::F32, "4".into(), None);
+                second.variant_payloads[0][0].ty = match difference {
+                    "tensor_element" => tensor(ElementType::I32, "4".into(), None),
+                    "tensor_dimension" => tensor(ElementType::F32, "8".into(), None),
+                    "tensor_memory" => tensor(
+                        ElementType::F32,
+                        "4".into(),
+                        Some(Placement::at(MemorySpace::GpuHbm)),
+                    ),
+                    "explicit_cpu" => tensor(
+                        ElementType::F32,
+                        "4".into(),
+                        Some(Placement::at(MemorySpace::CPUDRAM)),
+                    ),
+                    _ => {
+                        first.variant_payloads[0][0].ty = tensor(
+                            ElementType::F32,
+                            "4".into(),
+                            Some(Placement::on(Topology::gpu(0))),
+                        );
+                        tensor(
+                            ElementType::F32,
+                            "4".into(),
+                            Some(Placement::on(Topology::gpu(1))),
+                        )
+                    }
+                };
+            }
+            "unknown_type" | "unsupported_expression" => {
+                let ty = if difference == "unknown_type" {
+                    Type::Unknown
+                } else {
+                    Type::Const(Box::new(crate::syntax::Expr::FunctionCall(
+                        crate::syntax::FunctionCallExpr::new(
+                            "calculate".into(),
+                            None,
+                            vec![],
+                            Default::default(),
+                        ),
+                    )))
+                };
+                first.variant_payloads[0][0].ty = ty.clone();
+                second.variant_payloads[0][0].ty = ty;
+            }
+            _ => unreachable!(),
+        }
+        if matches!(difference, "unknown_id" | "ambiguous_name") {
+            first.variant_payloads[0][0].ty = second.variant_payloads[0][0].ty.clone();
+        }
+        assert!(
+            !first.semantically_eq(&second, &identities),
+            "records must not agree: {difference}"
+        );
+    }
 
     fn sym(s: &str) -> Symbol {
         s.into()

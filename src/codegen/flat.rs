@@ -1167,7 +1167,7 @@ impl EmitCtx {
         let mut generated = HashMap::new();
         for layout in layouts {
             if let Some(previous) = generated.insert(layout.type_id, layout) {
-                if previous != layout {
+                if !previous.semantically_eq(layout, registry.aggregate_identities()) {
                     return Err(ModuleEmitError::ConflictingLayouts {
                         first: Box::new(previous.clone()),
                         second: Box::new(layout.clone()),
@@ -2800,6 +2800,39 @@ mod tests {
             "enum Value { Number(i64), Empty }\n\
              fn main() -> i32 { let value = Value::Number(5); return 0; }",
             |layouts| layouts.push(layouts[0].clone()),
+        );
+    }
+
+    #[test]
+    fn equivalent_enum_layout_metadata_is_accepted() {
+        let result = emit_module_with_layouts(
+            "struct Node { value: i32 } enum Choice<T> { Some(T), None } \
+             fn read(x: Choice<&Node>) -> i32 { match x { \
+               Choice::Some(node) => { return node.value; }, Choice::None => { return 0; } } }",
+            |layouts| {
+                let original = layouts
+                    .iter()
+                    .find(|l| l.name == "Choice")
+                    .expect("Choice layout");
+                let mut equivalent = original.clone();
+                equivalent.name = "module::Choice".into();
+                let Type::Borrow {
+                    inner, region_id, ..
+                } = &mut equivalent.variant_payloads[0][0].ty
+                else {
+                    panic!("Choice retains its borrowed payload");
+                };
+                *region_id = 99;
+                let Type::Struct(_, Some(id)) = inner.as_ref() else {
+                    panic!("Node has an attached declaration ID");
+                };
+                **inner = Type::Enum("module::Node".into(), Some(*id));
+                layouts.push(equivalent);
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "semantically equivalent records must emit a module: {result:?}"
         );
     }
 

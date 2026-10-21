@@ -103,6 +103,11 @@ impl AggregateIdentities {
         self.declarations.is_empty()
     }
 
+    /// The same semantic type key serves generated IDs and layout agreement checks.
+    pub fn type_key(&self, ty: &Type) -> Option<String> {
+        aggregate_type_key(ty, self)
+    }
+
     /// Canonical metadata retains placement and access permissions but erases local borrow regions.
     pub fn normalize_type(&self, ty: &mut Type) -> Option<()> {
         fn normalize_constant(expr: &mut Expr) {
@@ -221,4 +226,147 @@ impl AggregateIdentities {
         }
         Some(())
     }
+}
+
+// Function symbols omit some placement details that generated layout metadata must retain.
+fn aggregate_const_key(expr: &Expr) -> Option<String> {
+    if let Some(value) = crate::syntax::types::const_value_text(expr) {
+        return Some(format!("number({value:?})"));
+    }
+    Some(match expr {
+        Expr::Identifier(id) => format!("name({:?})", id.name),
+        Expr::StringLiteral(value) => format!("string({:?})", value.value),
+        Expr::BinaryOp(expr) => format!(
+            "binary({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::UnaryOp(expr) => format!(
+            "unary({:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.expr)?
+        ),
+        Expr::RelationalOp(expr) => format!(
+            "compare({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::LogicalOp(expr) => format!(
+            "logical({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::MemberAccess(expr) => format!(
+            "member({:?},{:?})",
+            aggregate_const_key(&expr.base)?,
+            expr.member
+        ),
+        Expr::IndexAccess(expr) => format!(
+            "index({:?},{:?})",
+            aggregate_const_key(&expr.base)?,
+            aggregate_const_key(&expr.index)?
+        ),
+        // Unsupported expressions must decline instead of depending on source annotations.
+        _ => return None,
+    })
+}
+
+fn aggregate_topology_key(topology: &crate::syntax::Topology) -> Option<String> {
+    use crate::syntax::Topology;
+    Some(match topology {
+        Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
+            format!("{:?}({:?})", topology.kind(), aggregate_const_key(index)?)
+        }
+        Topology::Slice(base, start, end) => format!(
+            "slice({:?},{:?},{:?})",
+            aggregate_topology_key(base)?,
+            aggregate_const_key(start)?,
+            aggregate_const_key(end)?
+        ),
+        _ => format!("{:?}", topology.kind()),
+    })
+}
+
+fn aggregate_placement_key(placement: &Option<crate::syntax::Placement>) -> Option<String> {
+    Some(match placement {
+        Some(p) => format!("({:?},{:?})", aggregate_topology_key(&p.topology)?, p.space),
+        None => "None".into(),
+    })
+}
+
+fn aggregate_type_key(ty: &Type, identities: &AggregateIdentities) -> Option<String> {
+    use crate::syntax::types::Mangle;
+    let keys = |args: &[Type]| {
+        args.iter()
+            .map(|ty| aggregate_type_key(ty, identities))
+            .collect::<Option<Vec<_>>>()
+    };
+    Some(match ty {
+        Type::Tensor(elem, dims, placement) => {
+            let dimensions = dims
+                .iter()
+                .map(|dim| match dim {
+                    Dim::Dyn => Some("?".into()),
+                    Dim::Static(expr) => aggregate_const_key(expr),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            format!(
+                "tensor({elem:?},{dimensions:?},{:?})",
+                aggregate_placement_key(placement)?
+            )
+        }
+        Type::Pointer(inner, placement, mutable) => format!(
+            "pointer({:?},{:?},{mutable})",
+            aggregate_type_key(inner, identities)?,
+            aggregate_placement_key(placement)?
+        ),
+        Type::Borrow {
+            inner,
+            mem_space,
+            is_mut,
+            ..
+        } => format!(
+            "borrow({:?},{mem_space:?},{is_mut})",
+            aggregate_type_key(inner, identities)?
+        ),
+        Type::Ref(inner, space) => format!(
+            "ref({:?},{space:?})",
+            aggregate_type_key(inner, identities)?
+        ),
+        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner, identities)?),
+        Type::Pinned(inner, topology) => format!(
+            "pinned({:?},{:?})",
+            aggregate_type_key(inner, identities)?,
+            aggregate_topology_key(topology)?
+        ),
+        Type::GenericInstance(base, args) => format!(
+            "instance({:?},{:?})",
+            aggregate_type_key(base, identities)?,
+            keys(args)?
+        ),
+        Type::Function(params, result, unsafe_fn) => format!(
+            "function({:?},{:?},{unsafe_fn})",
+            keys(params)?,
+            aggregate_type_key(result, identities)?
+        ),
+        Type::Closure(params, result) => format!(
+            "closure({:?},{:?})",
+            keys(params)?,
+            aggregate_type_key(result, identities)?
+        ),
+        Type::Const(expr) => format!("constant({:?})", aggregate_const_key(expr)?),
+        Type::Struct(name, id) | Type::Enum(name, id) => {
+            if id.is_none() && crate::syntax::is_void_ty(ty) {
+                ty.mangle()
+            } else {
+                let (_, id) = identities.resolve(name, *id)?;
+                format!("nominal({id:?})")
+            }
+        }
+        Type::Module(..) | Type::Unknown => return None,
+        _ => ty.mangle(),
+    })
 }
