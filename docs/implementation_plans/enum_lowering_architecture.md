@@ -99,9 +99,9 @@ Signatures and bodies can therefore calculate the same instance ID independently
 Typed lookup follows these rules:
 
 1. An attached, known declaration ID is authoritative, including under an alias spelling.
-2. An unknown attached ID declines. It cannot select another declaration with the same name.
-3. A bare name must identify one declaration. An incomplete declaration still counts toward ambiguity.
-4. Value storage must be complete. A pointer target can retain its declaration ID without a complete layout.
+1. An unknown attached ID declines. It cannot select another declaration with the same name.
+1. A bare name must identify one declaration. An incomplete declaration still counts toward ambiguity.
+1. Value storage must be complete. A pointer target can retain its declaration ID without a complete layout.
 
 See [AggregateIdentities](../../src/layout/identity.rs#L43), [nominal_layout_id](../../src/registry.rs#L549), and [Lowerer::known_aggregate_id](../../src/hir/flatten.rs#L3217).
 Constructor syntax still identifies its base through the enum name and retains its arguments separately.
@@ -126,12 +126,12 @@ A different display name alone does not establish a conflict.
 [Lowerer::enum_instance_layout_of](../../src/hir/flatten.rs#L3482) performs these steps:
 
 1. Resolve the base declaration and calculate the concrete instance ID.
-2. Reuse a completed record from the current lowerer when available.
-3. Substitute concrete arguments into every variant's payload types.
-4. Resolve every present payload through [Lowerer::payload_field](../../src/hir/flatten.rs#L3443).
-5. Calculate shared slot requirements through [enum_storage_layout](../../src/layout.rs#L222).
-6. Select physical fields and retain each variant's actual payload metadata.
-7. Record the completed layout for transfer to the emitter.
+1. Reuse a completed record from the current lowerer when available.
+1. Substitute concrete arguments into every variant's payload types.
+1. Resolve every present payload through [Lowerer::payload_field](../../src/hir/flatten.rs#L3443).
+1. Calculate shared slot requirements through [enum_storage_layout](../../src/layout.rs#L222).
+1. Select physical fields and retain each variant's actual payload metadata.
+1. Record the completed layout for transfer to the emitter.
 
 **Decision: any unsupported present payload declines the complete layout.**
 A variant with no value at a position contributes no requirement.
@@ -277,9 +277,9 @@ See [sequential build_flat_module](../../src/driver.rs#L1668) and [parallel code
 [EmitCtx::install_generated_layouts](../../src/codegen/flat.rs#L1234) validates all records before changing the context:
 
 1. Compare a record with complete registry storage when their IDs overlap.
-2. Compare repeated generated records with the same ID using semantic equality.
-3. Reject conflicts with both complete records in the diagnostic.
-4. Install storage and metadata only after every comparison succeeds.
+1. Compare repeated generated records with the same ID using semantic equality.
+1. Reject conflicts with both complete records in the diagnostic.
+1. Install storage and metadata only after every comparison succeeds.
 
 [EmitCtx::registry_layout_agrees](../../src/codegen/flat.rs#L1183) checks physical fields, LLVM field types, sizes, alignment, and available aggregate and pointer metadata.
 An incomplete registry entry can gain generated storage.
