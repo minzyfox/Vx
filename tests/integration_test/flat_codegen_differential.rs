@@ -1608,6 +1608,28 @@ fn enum_variants_with_different_structs_run_in_parallel() {
 }
 
 #[test]
+fn generic_structs_with_borrowed_tensors_run() {
+    assert_generated_aggregate_runs(
+        "generic_structs_with_borrowed_tensors.vx",
+        &["5", "41", "7", "43"],
+        None,
+    );
+}
+
+#[test]
+fn generic_structs_with_borrowed_tensors_run_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs(
+        "generic_structs_with_borrowed_tensors.vx",
+        &["5", "41", "7", "43"],
+        Some(2),
+    );
+}
+
+#[test]
 fn enum_borrows_from_separate_functions_run() {
     assert_generated_aggregate_runs(
         "enum_borrows_from_separate_functions.vx",

@@ -889,7 +889,6 @@ pub(crate) fn agg_struct_ty_of(
     registry: &ImmutableGlobalRegistry,
     visiting: &mut Vec<TypeId>,
 ) -> Lowered<String> {
-    use crate::layout::FieldTy;
     if visiting.contains(&gid) {
         return Err(Decline::TypeNotModelled {
             what: "an aggregate whose layout is cyclic",
@@ -909,18 +908,28 @@ pub(crate) fn agg_struct_ty_of(
     visiting.push(gid);
     let mut field_tys = Vec::with_capacity(def.fields.len());
     for f in &def.fields {
-        let ft = match &f.ty {
-            FieldTy::Scalar(e) => mlir_scalar(e).ok_or(crate::emitter_gap!())?.to_string(),
-            FieldTy::Opaque => "!llvm.ptr".to_string(),
-            FieldTy::Tensor(_, rank) => memref_descriptor_ty(*rank),
-            FieldTy::Nominal(n) if registry.is_payload_free_enum(*n) => "i32".to_string(),
-            FieldTy::Nominal(n) => agg_struct_ty_of(*n, registry, visiting)?,
-            FieldTy::Vector(e, lanes) => mlir_vector(e, *lanes).ok_or(crate::emitter_gap!())?,
-        };
+        let ft = registry_field_storage_type(&f.ty, registry, visiting)?;
         field_tys.push(ft);
     }
     visiting.pop();
     Ok(format!("!llvm.struct<({})>", field_tys.join(", ")))
+}
+
+/// Recover a registry field's storage type without reinterpreting its declared source type.
+pub(crate) fn registry_field_storage_type(
+    field: &crate::layout::FieldTy,
+    registry: &ImmutableGlobalRegistry,
+    visiting: &mut Vec<TypeId>,
+) -> Lowered<String> {
+    use crate::layout::FieldTy;
+    Ok(match field {
+        FieldTy::Scalar(e) => mlir_scalar(e).ok_or(crate::emitter_gap!())?.to_string(),
+        FieldTy::Opaque => "!llvm.ptr".to_string(),
+        FieldTy::Tensor(_, rank) => memref_descriptor_ty(*rank),
+        FieldTy::Nominal(n) if registry.is_payload_free_enum(*n) => "i32".to_string(),
+        FieldTy::Nominal(n) => agg_struct_ty_of(*n, registry, visiting)?,
+        FieldTy::Vector(e, lanes) => mlir_vector(e, *lanes).ok_or(crate::emitter_gap!())?,
+    })
 }
 
 /// The base nominal name a pointer/borrow points *to* (`*const Vec<T>` -> `"Vec"`), for resolving a

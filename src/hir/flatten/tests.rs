@@ -380,6 +380,215 @@ fn generic_struct_layout_uses_its_attached_base_declaration() {
     );
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn generic_struct_borrowed_tensor_storage_matches_the_registry(#[case] precomputed: bool) {
+    let outer = if precomputed {
+        "struct Outer { inner: Holder<i32> }"
+    } else {
+        ""
+    };
+    let source = format!("struct Holder<T> {{ value: T, tensor: &Tensor<f32,[4]>, tail: i64 }} {outer} fn inspect() -> void {{}}");
+    let (ok, worker) = lower_with_registry(&source, "inspect");
+    assert!(ok);
+    let registry = &worker.global.registry;
+    let args = [Type::Scalar(ElementType::I32)];
+    let gid = super::struct_instance_gid("Holder", &args, registry.aggregate_identities()).unwrap();
+    assert_eq!(
+        registry.layouts.contains_key(&gid),
+        precomputed,
+        "the test controls whether registry storage exists"
+    );
+    let mut lowerer = Lowerer::new(registry);
+    lowerer
+        .struct_instance_layout_of("Holder", &args)
+        .expect("Holder storage");
+    let record = lowerer.generated_layout(gid).unwrap();
+    assert_eq!(
+        record.size_bytes, 56,
+        "borrowed tensor storage retains the complete descriptor size"
+    );
+    assert_eq!(
+        record.align_bytes, 8,
+        "borrowed tensor storage retains descriptor alignment"
+    );
+    assert_eq!(
+        record.field_offsets(),
+        vec![0, 8, 48],
+        "the trailing field follows the complete tensor descriptor"
+    );
+    assert_eq!(
+        record.fields[1].layout.size, 40,
+        "a rank-one tensor descriptor occupies 40 bytes"
+    );
+    assert_eq!(
+        record.fields[1].layout.ty,
+        FieldTy::Tensor(ElementType::F32, 1),
+        "borrowed tensor storage retains its tensor kind"
+    );
+    assert_eq!(
+        record.fields[1].mlir_type,
+        crate::codegen::flat::memref_descriptor_ty(1),
+        "borrowed tensor storage uses the descriptor LLVM type"
+    );
+    if let Some(expected) = registry.layouts.get(&gid) {
+        assert_eq!(
+            lowerer.layout_of(&gid).unwrap().name,
+            expected.name,
+            "the lowerer retains the registry instance name"
+        );
+        assert_eq!(
+            record.type_layout().fields,
+            expected.fields,
+            "generated storage fields match the frozen registry"
+        );
+    }
+}
+
+#[test]
+fn generic_struct_preserves_authoritative_registry_padding() {
+    let (ok, worker) = lower_with_registry(
+        "struct Holder<T> { value: T, tail: i64 } struct Outer { inner: Holder<i32> } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let mut registry = (*worker.global.registry).clone();
+    let args = [Type::Scalar(ElementType::I32)];
+    let gid = super::struct_instance_gid("Holder", &args, registry.aggregate_identities()).unwrap();
+    let expected = registry.layouts.get_mut(&gid).unwrap();
+    // Extra padding distinguishes reuse from another calculation of natural layout.
+    expected.size_bytes = 64;
+    expected.align_bytes = 16;
+    expected.fields[1].offset = 32;
+    expected.fields[1].size = 16;
+    let expected = expected.clone();
+    let mut lowerer = Lowerer::new(&registry);
+    lowerer
+        .struct_instance_layout_of("Holder", &args)
+        .expect("Holder storage");
+    let record = lowerer.generated_layout(gid).unwrap();
+    assert_eq!(
+        record.size_bytes, 64,
+        "registry total size takes precedence over recalculation"
+    );
+    assert_eq!(
+        record.align_bytes, 16,
+        "registry alignment takes precedence over recalculation"
+    );
+    assert_eq!(
+        record.fields[1].layout.offset, 32,
+        "registry field offsets take precedence over recalculation"
+    );
+    assert_eq!(
+        record.fields[1].layout.size, 16,
+        "registry field sizes take precedence over recalculation"
+    );
+    assert_eq!(
+        lowerer.layout_of(&gid).unwrap().fields,
+        expected.fields,
+        "the cached definition retains authoritative storage fields"
+    );
+}
+
+#[rstest::rstest]
+#[case("field_count")]
+#[case("field_name")]
+fn generic_struct_declines_registry_fields_that_do_not_match_the_declaration(
+    #[case] mismatch: &str,
+) {
+    let (ok, worker) = lower_with_registry(
+        "struct Holder<T> { value: T } struct Outer { inner: Holder<i32> } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let mut registry = (*worker.global.registry).clone();
+    let args = [Type::Scalar(ElementType::I32)];
+    let gid = super::struct_instance_gid("Holder", &args, registry.aggregate_identities()).unwrap();
+    let storage = registry.layouts.get_mut(&gid).unwrap();
+    if mismatch == "field_count" {
+        storage.fields.push(storage.fields[0].clone());
+    } else {
+        storage.fields[0].name = "wrong".into();
+    }
+    let mut lowerer = Lowerer::new(&registry);
+    assert!(
+        lowerer.struct_instance_layout_of("Holder", &args).is_none(),
+        "incompatible registry fields must decline: {mismatch}"
+    );
+}
+
+#[test]
+fn generic_struct_synthesizes_storage_when_the_registry_has_only_a_stub() {
+    let (ok, worker) = lower_with_registry(
+        "struct Holder<T> { value: T } struct Outer { inner: Holder<i32> } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let mut registry = (*worker.global.registry).clone();
+    let args = [Type::Scalar(ElementType::I32)];
+    let gid = super::struct_instance_gid("Holder", &args, registry.aggregate_identities()).unwrap();
+    let stub = registry.layouts.get_mut(&gid).unwrap();
+    stub.align_bytes = 0;
+    stub.size_bytes = 0;
+    stub.fields.clear();
+    let mut lowerer = Lowerer::new(&registry);
+    assert!(
+        lowerer.struct_instance_layout_of("Holder", &args).is_some(),
+        "a registry stub must allow concrete storage synthesis"
+    );
+    assert_eq!(
+        lowerer.generated_layout(gid).unwrap().size_bytes,
+        4,
+        "the concrete layout replaces the stub size"
+    );
+}
+
+#[test]
+fn generic_struct_reuses_storage_from_an_argument_independent_base() {
+    let (ok, worker) = lower_with_registry(
+        "struct Holder<T> { pointer: *const T, tail: i64 } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let mut registry = (*worker.global.registry).clone();
+    let args = [Type::Scalar(ElementType::I32)];
+    let gid = super::struct_instance_gid("Holder", &args, registry.aggregate_identities()).unwrap();
+    assert!(
+        !registry.layouts.contains_key(&gid),
+        "this test has only base storage"
+    );
+    let base = registry.resolve_unique_nominal(&"Holder".into()).unwrap();
+    let expected = registry.layouts.get_mut(&base).unwrap();
+    expected.size_bytes = 64;
+    expected.align_bytes = 16;
+    expected.fields[1].offset = 32;
+    let expected = expected.clone();
+    let mut lowerer = Lowerer::new(&registry);
+    lowerer
+        .struct_instance_layout_of("Holder", &args)
+        .expect("Holder storage");
+    let record = lowerer.generated_layout(gid).unwrap();
+    assert_eq!(
+        record.size_bytes, 64,
+        "argument-independent base storage supplies the total size"
+    );
+    assert_eq!(
+        record.align_bytes, 16,
+        "argument-independent base storage supplies the alignment"
+    );
+    assert_eq!(
+        record.type_layout().fields,
+        expected.fields,
+        "argument-independent base storage supplies the fields"
+    );
+    assert_eq!(
+        lowerer.layout_of(&gid).unwrap().id,
+        gid,
+        "reused base storage retains the concrete instance ID"
+    );
+}
+
 #[test]
 fn enum_layouts_canonicalize_nominal_spellings() {
     let (ok, worker) = lower_with_registry(

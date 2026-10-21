@@ -3475,11 +3475,10 @@ impl<'r> Lowerer<'r> {
         })
     }
 
-    /// Synthesize (once) and record the layout of a generic struct instance whose base layout
-    /// is a stub -- a by-value generic field makes the size depend on the arguments. The
-    /// declared fields are substituted with the instance's arguments and laid out with natural
-    /// alignment. Supported fields include scalars, pointers, and aggregates with known storage.
-    /// Declines a name two modules declare, so a wrong layout is never chosen.
+    /// Record a concrete generic struct layout. Reuse complete registry storage when available.
+    /// Otherwise, substitute the declared fields and use the registry's structural storage rules.
+    /// Nested aggregates resolve their own storage layouts.
+    /// An ambiguous bare name cannot select a declaration.
     fn struct_instance_layout_of<'a>(
         &mut self,
         base: impl Into<crate::layout::identity::AggregateBase<'a>>,
@@ -3494,6 +3493,28 @@ impl<'r> Lowerer<'r> {
             return Some(gid);
         }
         let decl = self.registry.structs.get(&declaration)?;
+        let storage = self
+            .registry
+            .layouts
+            .get(&gid)
+            .filter(|def| def.align_bytes != 0)
+            .or_else(|| {
+                self.registry
+                    .layouts
+                    .get(&declaration)
+                    .filter(|def| def.align_bytes != 0)
+            })
+            .map(|def| {
+                let mut storage = def.clone();
+                storage.id = gid;
+                storage
+            });
+        if storage
+            .as_ref()
+            .is_some_and(|def| def.fields.len() != decl.fields.len())
+        {
+            return None;
+        }
         let mut mapping = HashMap::new();
         for (g, a) in decl.generics.iter().zip(args) {
             mapping.insert(g.clone(), a.clone());
@@ -3501,72 +3522,94 @@ impl<'r> Lowerer<'r> {
         let mut fields = Vec::with_capacity(decl.fields.len());
         let (mut off, mut align) = (0u64, 1u64);
         let decl_fields = decl.fields.clone();
-        for (name, ty) in &decl_fields {
+        for (index, (name, ty)) in decl_fields.iter().enumerate() {
             let fty = ty.substitute(&mapping);
-            // A by-value field that is itself an instance (`Wrapper<N> { inner: Array<f32, N> }`)
-            // is laid out first and embedded as its own `!llvm.struct`.
-            let (sz, al, mlir, kind) = match &fty {
-                // An enum instance held by value, `Peek<T> { peeked : Option<T> }`. The type may
-                // spell the enum as a struct, so it is found by name.
-                Type::GenericInstance(b, a)
-                    if matches!(b.as_ref(), Type::Enum(n, _) | Type::Struct(n, _)
+            // Registry fields fix storage. Declared types retain metadata erased from storage.
+            let (field_layout, mlir) = if let Some(def) = &storage {
+                let field = &def.fields[index];
+                if field.name != *name {
+                    return None;
+                }
+                let mlir = crate::codegen::flat::registry_field_storage_type(
+                    &field.ty,
+                    self.registry,
+                    &mut Vec::new(),
+                )
+                .ok()?;
+                (field.clone(), mlir)
+            } else {
+                let (sz, al, mlir, kind) = match &fty {
+                    // An enum instance held by value, `Peek<T> { peeked : Option<T> }`. The type may
+                    // spell the enum as a struct, so it is found by name.
+                    Type::GenericInstance(b, a)
+                        if matches!(b.as_ref(), Type::Enum(n, _) | Type::Struct(n, _)
                         if self.registry.enum_data.contains_key(n.as_ref())) =>
-                {
-                    let (Type::Enum(inner_name, _) | Type::Struct(inner_name, _)) = b.as_ref()
-                    else {
-                        return None;
-                    };
-                    let (inner, _) = self.enum_instance_layout_of(inner_name.as_ref(), a)?;
-                    let layout = self.generated_layout(inner)?;
-                    (
-                        layout.size_bytes,
-                        layout.align_bytes,
-                        crate::codegen::flat::generated_storage_type(layout),
-                        FieldTy::Nominal(inner),
-                    )
-                }
-                Type::GenericInstance(b, a) if matches!(b.as_ref(), Type::Struct(..)) => {
-                    let inner = self.struct_instance_layout_of(b.as_ref(), a)?;
-                    let layout = self.generated_layout(inner)?;
-                    (
-                        layout.size_bytes,
-                        layout.align_bytes,
-                        crate::codegen::flat::generated_storage_type(layout),
-                        FieldTy::Nominal(inner),
-                    )
-                }
-                // A plain struct held by value, `Holder<Noisy> { value : Noisy }`.
-                Type::Struct(n, _) if self.nominal_struct_gid(n).is_some() => {
-                    let gid = self.nominal_struct_gid(n)?;
-                    let (sz, al, mlir) = self.payload_field(&fty)?;
-                    (sz, al, mlir, FieldTy::Nominal(gid))
-                }
-                _ => {
-                    let (sz, al, mlir) = enum_payload_field(&fty)?;
-                    let kind = match &fty {
-                        Type::Scalar(e) => FieldTy::Scalar(e.clone()),
-                        _ => FieldTy::Opaque,
-                    };
-                    (sz, al, mlir, kind)
-                }
-            };
-            off = crate::layout::align_up(off as usize, al as usize) as u64;
-            let metadata = self.payload_metadata(fty)?;
-            fields.push(crate::layout::GeneratedFieldLayout {
-                layout: crate::layout::FieldLayout {
+                    {
+                        let (Type::Enum(inner_name, _) | Type::Struct(inner_name, _)) = b.as_ref()
+                        else {
+                            return None;
+                        };
+                        let (inner, _) = self.enum_instance_layout_of(inner_name.as_ref(), a)?;
+                        let layout = self.generated_layout(inner)?;
+                        (
+                            layout.size_bytes,
+                            layout.align_bytes,
+                            crate::codegen::flat::generated_storage_type(layout),
+                            FieldTy::Nominal(inner),
+                        )
+                    }
+                    Type::GenericInstance(b, a) if matches!(b.as_ref(), Type::Struct(..)) => {
+                        let inner = self.struct_instance_layout_of(b.as_ref(), a)?;
+                        let layout = self.generated_layout(inner)?;
+                        (
+                            layout.size_bytes,
+                            layout.align_bytes,
+                            crate::codegen::flat::generated_storage_type(layout),
+                            FieldTy::Nominal(inner),
+                        )
+                    }
+                    // A plain struct held by value, `Holder<Noisy> { value : Noisy }`.
+                    Type::Struct(n, _) if self.nominal_struct_gid(n).is_some() => {
+                        let gid = self.nominal_struct_gid(n)?;
+                        let (sz, al, mlir) = self.payload_field(&fty)?;
+                        (sz, al, mlir, FieldTy::Nominal(gid))
+                    }
+                    _ => {
+                        let (sz, al, kind) = crate::layout::structural_field_info(&fty)?;
+                        let mlir = crate::codegen::flat::registry_field_storage_type(
+                            &kind,
+                            self.registry,
+                            &mut Vec::new(),
+                        )
+                        .ok()?;
+                        (sz as u64, al as u64, mlir, kind)
+                    }
+                };
+                off = crate::layout::align_up(off as usize, al as usize) as u64;
+                let field = crate::layout::FieldLayout {
                     name: name.clone(),
                     offset: off as usize,
                     size: sz as usize,
                     ty: kind,
-                },
+                };
+                off += sz;
+                align = align.max(al);
+                (field, mlir)
+            };
+            let metadata = self.payload_metadata(fty)?;
+            fields.push(crate::layout::GeneratedFieldLayout {
+                layout: field_layout,
                 mlir_type: mlir,
                 aggregate_id: metadata.aggregate_id,
                 pointer_target_id: metadata.pointer_target_id,
             });
-            off += sz;
-            align = align.max(al);
         }
-        let size = crate::layout::align_up(off as usize, align as usize);
+        let size = if let Some(def) = &storage {
+            align = def.align_bytes as u64;
+            def.size_bytes
+        } else {
+            crate::layout::align_up(off as usize, align as usize)
+        };
         if !self.agg_layout_indices.contains_key(&gid) {
             let layout = crate::layout::GeneratedAggregateLayout {
                 type_id: gid,
@@ -3576,7 +3619,8 @@ impl<'r> Lowerer<'r> {
                 fields,
                 variant_payloads: Vec::new(),
             };
-            self.instance_layouts.insert(gid, layout.type_definition());
+            self.instance_layouts
+                .insert(gid, storage.unwrap_or_else(|| layout.type_definition()));
             self.record_generated_layout(layout);
         }
         Some(gid)

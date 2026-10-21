@@ -148,6 +148,51 @@ pub struct FieldLayout {
     pub ty: FieldTy,
 }
 
+/// Field storage shared by the registry and generated struct layouts.
+/// Nominal types require a declaration resolver and return no structural storage here.
+pub(crate) fn structural_field_info(ty: &Type) -> Option<(usize, usize, FieldTy)> {
+    match ty {
+        Type::Scalar(et) => {
+            let (size, align) = scalar_size_align(et)?;
+            Some((size, align, FieldTy::Scalar(et.clone())))
+        }
+        // A borrowed tensor is passed as the tensor's own descriptor, which shares its memory,
+        // so a `&Tensor` field holds the descriptor too. A closure that uses a tensor
+        // reference keeps it in such a field.
+        Type::Borrow { inner, .. } if matches!(**inner, Type::Tensor(..)) => {
+            structural_field_info(inner)
+        }
+        // Pointer-like fields, all a pointer-sized opaque word: raw pointers, borrows, and a
+        // function/closure type (a function pointer, e.g. `Closure1`'s `func` field). (#242)
+        Type::Pointer(..)
+        | Type::Ref(..)
+        | Type::Borrow { .. }
+        | Type::Function(..)
+        | Type::Closure(..) => Some((8, 8, FieldTy::Opaque)),
+        // A tensor field is its memref descriptor by value, 8-aligned: two pointers, an
+        // offset, and a size and a stride per rank. A generic element has no descriptor yet.
+        Type::Tensor(elem, dims, _) => {
+            if matches!(elem, ElementType::Generic(_)) {
+                return None;
+            }
+            Some((
+                24 + 16 * dims.len(),
+                8,
+                FieldTy::Tensor(elem.clone(), dims.len()),
+            ))
+        }
+        // `<N x T>`: N lanes packed densely, then rounded to a whole byte, with the alignment
+        // the datalayout gives `vector<NxT>` -- the size rounded up to a power of two. The unit
+        // test below pins this against what LLVM reports, so the two cannot drift.
+        Type::Simd(el, n) => {
+            let (size, align) = vector_size_align(el, *n)?;
+            Some((size, align, FieldTy::Vector(el.clone(), *n)))
+        }
+        Type::Pinned(inner, _) | Type::Verified(inner) => structural_field_info(inner),
+        _ => None,
+    }
+}
+
 /// The computed layout of a nominal type: total size, alignment, and (for
 /// structs) the offset/size of each field in declaration order. `fields` is
 /// empty for enums.
@@ -317,43 +362,11 @@ impl<'a> LayoutComputer<'a> {
     /// in its arguments, an unresolved nominal, …) returns `None`, making the enclosing
     /// layout incomputable for now.
     fn field_info(&mut self, ty: &Type) -> Option<(usize, usize, FieldTy)> {
+        if let Some(info) = structural_field_info(ty) {
+            return Some(info);
+        }
+
         match ty {
-            Type::Scalar(et) => {
-                let (size, align) = scalar_size_align(et)?;
-                Some((size, align, FieldTy::Scalar(et.clone())))
-            }
-            // A borrowed tensor is passed as the tensor's own descriptor, which shares its memory,
-            // so a `&Tensor` field holds the descriptor too. A closure that uses a tensor
-            // reference keeps it in such a field.
-            Type::Borrow { inner, .. } if matches!(**inner, Type::Tensor(..)) => {
-                self.field_info(inner)
-            }
-            // Pointer-like fields, all a pointer-sized opaque word: raw pointers, borrows, and a
-            // function/closure type (a function pointer, e.g. `Closure1`'s `func` field). (#242)
-            Type::Pointer(..)
-            | Type::Ref(..)
-            | Type::Borrow { .. }
-            | Type::Function(..)
-            | Type::Closure(..) => Some((8, 8, FieldTy::Opaque)),
-            // A tensor field is its memref descriptor by value, 8-aligned: two pointers, an
-            // offset, and a size and a stride per rank. A generic element has no descriptor yet.
-            Type::Tensor(elem, dims, _) => {
-                if matches!(elem, ElementType::Generic(_)) {
-                    return None;
-                }
-                Some((
-                    24 + 16 * dims.len(),
-                    8,
-                    FieldTy::Tensor(elem.clone(), dims.len()),
-                ))
-            }
-            // `<N x T>`: N lanes packed densely, then rounded to a whole byte, with the alignment
-            // the datalayout gives `vector<NxT>` -- the size rounded up to a power of two. The unit
-            // test below pins this against what LLVM reports, so the two cannot drift.
-            Type::Simd(el, n) => {
-                let (size, align) = vector_size_align(el, *n)?;
-                Some((size, align, FieldTy::Vector(el.clone(), *n)))
-            }
             Type::Pinned(inner, _) | Type::Verified(inner) => self.field_info(inner),
             Type::Struct(_, Some(id)) | Type::Enum(_, Some(id)) => {
                 let layout = self.layout_of(*id)?;
