@@ -71,6 +71,94 @@ fn lower_with_registry(src: &str, fn_name: &str) -> (bool, LocalWorkerState) {
 }
 
 #[test]
+fn enum_type_arguments_substitute_trait_self() {
+    let concrete = Type::Scalar(ElementType::I32);
+    let mapping = HashMap::from([("Self".into(), concrete.clone())]);
+    for variant in ["None", "None()"] {
+        let function = parse_fn(&format!(
+            "fn make() -> Opt<Self> {{ return Opt<Self>::{variant}; }}"
+        ));
+        let Statement::Return(ret) = &function.body[0] else {
+            panic!("expected return");
+        };
+        let substituted = ret.expr.as_ref().unwrap().substitute(&mapping);
+        let args = match &substituted {
+            Expr::EnumVariant(expr) => expr.type_args.as_ref(),
+            Expr::FunctionCall(expr) => expr.owner_type_args.as_ref(),
+            _ => panic!("expected enum construction"),
+        }
+        .expect("construction keeps its parsed type arguments");
+        assert_eq!(
+            enum_instance_gid("Opt", args),
+            enum_instance_gid("Opt", std::slice::from_ref(&concrete)),
+            "substitution resolves Self in {variant}"
+        );
+    }
+}
+
+#[test]
+fn enum_type_arguments_survive_substitution() {
+    let concrete =
+        crate::parser::types::parse_type_text("*const Tensor<f32, [4], Memory::GPU_HBM>").unwrap();
+    let mapping = HashMap::from([("T".into(), Type::Scalar(ElementType::F32))]);
+    for variant in ["None", "Some(p)"] {
+        let function = parse_fn(&format!("fn make<T>(p: *const Tensor<T, [4], Memory::GPU_HBM>) -> Opt<*const Tensor<T, [4], Memory::GPU_HBM>> {{ return Opt<*const Tensor<T, [4], Memory::GPU_HBM>>::{variant}; }}"));
+        let Statement::Return(ret) = &function.body[0] else {
+            panic!("expected return");
+        };
+        let substituted = ret.expr.as_ref().unwrap().substitute(&mapping);
+        let args = match &substituted {
+            Expr::EnumVariant(expr) => expr.type_args.as_ref(),
+            Expr::FunctionCall(expr) => expr.owner_type_args.as_ref(),
+            _ => panic!("expected enum construction"),
+        }
+        .expect("construction keeps its parsed type arguments");
+        assert_eq!(
+            enum_instance_gid("Opt", args),
+            enum_instance_gid("Opt", std::slice::from_ref(&concrete)),
+            "substitution replaces tensor type parameters in {variant}"
+        );
+    }
+}
+
+#[test]
+fn enum_construction_and_matching_keep_tensor_types() {
+    let source =
+        include_str!("../../../tests/backend/pass/enum_tensor_pointers_construct_and_match.vx");
+    for name in ["read_host", "read_gpu"] {
+        let (ok, worker) = lower_with_registry(source, name);
+        assert!(ok, "{name} must lower");
+        assert_eq!(
+            worker.local_agg_layouts.len(),
+            1,
+            "{name} must use one enum layout for parameters, construction, and matching"
+        );
+        let payload = &worker.local_agg_layouts[0].variant_payloads[0][0].ty;
+        let Type::Pointer(inner, _, false) = payload else {
+            panic!("{name} must retain its pointer payload");
+        };
+        let Type::Tensor(ElementType::F32, dims, placement) = inner.as_ref() else {
+            panic!("{name} must retain the tensor type inside its pointer");
+        };
+        assert_eq!(dims.len(), 1, "tensor rank retained in {name}");
+        assert_eq!(
+            crate::syntax::types::const_value_text(dims[0].as_static().unwrap()),
+            Some("4".into()),
+            "tensor dimension retained in {name}"
+        );
+        assert_eq!(
+            placement.as_ref().map(|p| &p.space),
+            if name == "read_gpu" {
+                Some(&crate::syntax::MemorySpace::GpuHbm)
+            } else {
+                None
+            },
+            "tensor placement retained in {name}"
+        );
+    }
+}
+
+#[test]
 fn generated_struct_layout_records_nested_values_and_pointer_targets() {
     let (did, worker) = lower_with_registry(
         "struct Inner { value: i64 }\n\
@@ -91,7 +179,9 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
     let layout = worker
         .local_agg_layouts
         .iter()
-        .find(|l| l.type_id == struct_instance_gid("Holder", std::slice::from_ref(&inner_ty)))
+        .find(|l| {
+            l.type_id == struct_instance_gid("Holder", std::slice::from_ref(&inner_ty)).unwrap()
+        })
         .expect("the worker contains the Holder layout");
     assert_eq!(
         layout,
@@ -142,6 +232,122 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
 }
 
 #[test]
+fn aggregate_identity_ignores_named_expression_source_locations() {
+    use crate::syntax::{IdentifierExpr, Placement, Span, Topology};
+    let name = |text: &str, column| {
+        Expr::Identifier(IdentifierExpr::new(
+            text.into(),
+            Span {
+                line: 4,
+                column,
+                length: text.len(),
+                expansion: 0,
+            },
+        ))
+    };
+    let arguments = |text: &str, column| {
+        vec![
+            Type::Tensor(
+                ElementType::F32,
+                vec![Dim::Static(name(text, column))],
+                None,
+            ),
+            Type::Const(Box::new(Expr::BinaryOp(crate::syntax::BinaryOpExpr::new(
+                Box::new(name(text, column)),
+                BinaryOp::Mul,
+                Box::new(Expr::Number(NumberExpr::new(
+                    "4".into(),
+                    None,
+                    Span::default(),
+                ))),
+                Span {
+                    column,
+                    ..Span::default()
+                },
+            )))),
+            Type::Pointer(
+                Box::new(Type::Scalar(ElementType::I32)),
+                Some(Placement::on(Topology::GPU(Box::new(name(text, column))))),
+                false,
+            ),
+        ]
+    };
+    let (ok, worker) = lower_with_registry(
+        "enum Opt<T> { Some(*const T), None } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    for (first, moved) in arguments("N", 2).iter().zip(arguments("N", 20)) {
+        let record = |argument: Type| {
+            let mut lowerer = Lowerer::new(&worker.global.registry);
+            lowerer
+                .enum_instance_layout_of("Opt", &[argument])
+                .expect("supported layout");
+            lowerer.agg_layouts.remove(0)
+        };
+        assert_eq!(
+            record(first.clone()),
+            record(moved),
+            "source locations do not change retained layout metadata"
+        );
+    }
+    for identity in [enum_instance_gid, struct_instance_gid] {
+        for ((first, moved), different) in arguments("N", 2)
+            .iter()
+            .zip(arguments("N", 20))
+            .zip(arguments("M", 2))
+        {
+            let key = |ty: &Type| {
+                identity("Holder", std::slice::from_ref(ty))
+                    .expect("supported argument has an identity")
+            };
+            assert_eq!(
+                key(first),
+                key(&moved),
+                "source locations do not change aggregate identity"
+            );
+            assert_ne!(
+                key(first),
+                key(&different),
+                "different names retain different aggregate identities"
+            );
+        }
+    }
+}
+
+#[test]
+fn aggregate_identity_declines_unsupported_constant_expressions() {
+    let argument = Type::Const(Box::new(Expr::FunctionCall(
+        crate::syntax::FunctionCallExpr::new(
+            "calculate".into(),
+            None,
+            Vec::new(),
+            crate::syntax::Span::default(),
+        ),
+    )));
+    for identity in [enum_instance_gid, struct_instance_gid] {
+        assert_eq!(
+            identity("Holder", std::slice::from_ref(&argument)),
+            None,
+            "unsupported expressions must not receive an unstable aggregate ID"
+        );
+    }
+    let (ok, worker) = lower_with_registry(
+        "enum Opt<T> { Some(*const T), None } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let mut lowerer = Lowerer::new(&worker.global.registry);
+    assert!(
+        lowerer
+            .enum_instance_layout_of("Opt", &[argument])
+            .is_none(),
+        "unsupported identity must decline layout generation"
+    );
+    assert!(lowerer.agg_layouts.is_empty());
+}
+
+#[test]
 fn aggregate_identity_preserves_tensor_placement() {
     use crate::syntax::{MemorySpace, Placement, Topology};
     let pointer = |placement| {
@@ -164,8 +370,14 @@ fn aggregate_identity_preserves_tensor_placement() {
     let same_gpu = pointer(Some(Placement::on(Topology::gpu(0))));
     let other_gpu = pointer(Some(Placement::on(Topology::gpu(1))));
     for (name, identity) in [
-        ("enum", enum_instance_gid as fn(&str, &[Type]) -> TypeId),
-        ("struct", struct_instance_gid as fn(&str, &[Type]) -> TypeId),
+        (
+            "enum",
+            enum_instance_gid as fn(&str, &[Type]) -> Option<TypeId>,
+        ),
+        (
+            "struct",
+            struct_instance_gid as fn(&str, &[Type]) -> Option<TypeId>,
+        ),
     ] {
         let id = |ty| identity("Holder", std::slice::from_ref(ty));
         assert_ne!(id(&host), id(&gpu), "{name} distinguishes tensor memories");
@@ -410,7 +622,7 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
         "inspect",
     );
     assert!(did, "the function with an enum parameter must lower");
-    let gid = enum_instance_gid("Number", &[Type::Scalar(ElementType::I8)]);
+    let gid = enum_instance_gid("Number", &[Type::Scalar(ElementType::I8)]).unwrap();
     let layout = worker
         .local_agg_layouts
         .iter()
@@ -478,7 +690,7 @@ fn generated_enum_layout_keeps_each_variants_pointer_target() {
     let layout = worker
         .local_agg_layouts
         .iter()
-        .find(|l| l.type_id == enum_instance_gid("Address", &[]))
+        .find(|l| l.type_id == enum_instance_gid("Address", &[]).unwrap())
         .expect("the worker contains the Address layout");
     let payload = |name: &str, gid| crate::layout::GeneratedPayloadLayout {
         ty: Type::Pointer(Box::new(Type::Struct(name.into(), Some(gid))), None, false),

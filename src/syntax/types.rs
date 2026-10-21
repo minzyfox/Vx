@@ -892,6 +892,10 @@ impl Type {
 
     pub fn substitute(&self, mapping: &std::collections::HashMap<Symbol, Type>) -> Type {
         match self {
+            // A trait's `Self` has no concrete target while the parser reads its body.
+            Type::Struct(name, None) if name.as_ref() == "Self" => {
+                mapping.get(name).cloned().unwrap_or_else(|| self.clone())
+            }
             Type::Generic(name, _) => {
                 if let Some(concrete) = mapping.get(name) {
                     concrete.clone()

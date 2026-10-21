@@ -72,60 +72,99 @@ pub fn ptr_gid() -> TypeId {
 }
 
 // Function symbols omit some placement details that generated layout metadata must retain.
-fn aggregate_type_key(ty: &Type) -> String {
-    use crate::syntax::types::{Mangle, Placement, Topology};
-
-    fn index_key(expr: &Expr) -> String {
-        match expr {
-            Expr::Number(number) => number
-                .value
-                .as_ref()
-                .parse::<i128>()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| number.value.to_string()),
-            _ => format!("{expr:?}"),
-        }
+fn aggregate_const_key(expr: &Expr) -> Option<String> {
+    if let Some(value) = crate::syntax::types::const_value_text(expr) {
+        return Some(format!("number({value:?})"));
     }
+    Some(match expr {
+        Expr::Identifier(id) => format!("name({:?})", id.name),
+        Expr::StringLiteral(value) => format!("string({:?})", value.value),
+        Expr::BinaryOp(expr) => format!(
+            "binary({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::UnaryOp(expr) => format!(
+            "unary({:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.expr)?
+        ),
+        Expr::RelationalOp(expr) => format!(
+            "compare({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::LogicalOp(expr) => format!(
+            "logical({:?},{:?},{:?})",
+            expr.op,
+            aggregate_const_key(&expr.lhs)?,
+            aggregate_const_key(&expr.rhs)?
+        ),
+        Expr::MemberAccess(expr) => format!(
+            "member({:?},{:?})",
+            aggregate_const_key(&expr.base)?,
+            expr.member
+        ),
+        Expr::IndexAccess(expr) => format!(
+            "index({:?},{:?})",
+            aggregate_const_key(&expr.base)?,
+            aggregate_const_key(&expr.index)?
+        ),
+        // Unsupported expressions must decline instead of depending on source annotations.
+        _ => return None,
+    })
+}
 
-    fn topology_key(topology: &Topology) -> String {
-        match topology {
-            Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
-                format!("{:?}({:?})", topology.kind(), index_key(index))
-            }
-            Topology::Slice(base, start, end) => format!(
-                "slice({:?},{:?},{:?})",
-                topology_key(base),
-                index_key(start),
-                index_key(end)
-            ),
-            _ => format!("{:?}", topology.kind()),
+fn aggregate_topology_key(topology: &crate::syntax::Topology) -> Option<String> {
+    use crate::syntax::Topology;
+    Some(match topology {
+        Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
+            format!("{:?}({:?})", topology.kind(), aggregate_const_key(index)?)
         }
-    }
+        Topology::Slice(base, start, end) => format!(
+            "slice({:?},{:?},{:?})",
+            aggregate_topology_key(base)?,
+            aggregate_const_key(start)?,
+            aggregate_const_key(end)?
+        ),
+        _ => format!("{:?}", topology.kind()),
+    })
+}
 
-    let placement_key = |placement: &Option<Placement>| {
-        placement
-            .as_ref()
-            .map(|p| (topology_key(&p.topology), format!("{:?}", p.space)))
+fn aggregate_placement_key(placement: &Option<crate::syntax::Placement>) -> Option<String> {
+    Some(match placement {
+        Some(p) => format!("({:?},{:?})", aggregate_topology_key(&p.topology)?, p.space),
+        None => "None".into(),
+    })
+}
+
+fn aggregate_type_key(ty: &Type) -> Option<String> {
+    use crate::syntax::types::Mangle;
+    let keys = |args: &[Type]| {
+        args.iter()
+            .map(aggregate_type_key)
+            .collect::<Option<Vec<_>>>()
     };
-    match ty {
+    Some(match ty {
         Type::Tensor(elem, dims, placement) => {
-            let dimensions: Vec<_> = dims
+            let dimensions = dims
                 .iter()
                 .map(|dim| match dim {
-                    Dim::Dyn => "?".into(),
-                    Dim::Static(expr) => crate::syntax::types::const_value_text(expr)
-                        .unwrap_or_else(|| format!("{expr:?}")),
+                    Dim::Dyn => Some("?".into()),
+                    Dim::Static(expr) => aggregate_const_key(expr),
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
             format!(
                 "tensor({elem:?},{dimensions:?},{:?})",
-                placement_key(placement)
+                aggregate_placement_key(placement)?
             )
         }
         Type::Pointer(inner, placement, mutable) => format!(
             "pointer({:?},{:?},{mutable})",
-            aggregate_type_key(inner),
-            placement_key(placement)
+            aggregate_type_key(inner)?,
+            aggregate_placement_key(placement)?
         ),
         Type::Borrow {
             inner,
@@ -134,43 +173,49 @@ fn aggregate_type_key(ty: &Type) -> String {
             ..
         } => format!(
             "borrow({:?},{mem_space:?},{is_mut})",
-            aggregate_type_key(inner)
+            aggregate_type_key(inner)?
         ),
-        Type::Ref(inner, space) => format!("ref({:?},{space:?})", aggregate_type_key(inner)),
-        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner)),
+        Type::Ref(inner, space) => format!("ref({:?},{space:?})", aggregate_type_key(inner)?),
+        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner)?),
         Type::Pinned(inner, topology) => format!(
             "pinned({:?},{:?})",
-            aggregate_type_key(inner),
-            topology_key(topology)
+            aggregate_type_key(inner)?,
+            aggregate_topology_key(topology)?
         ),
         Type::GenericInstance(base, args) => format!(
             "instance({:?},{:?})",
-            aggregate_type_key(base),
-            args.iter().map(aggregate_type_key).collect::<Vec<_>>()
+            aggregate_type_key(base)?,
+            keys(args)?
         ),
         Type::Function(params, result, unsafe_fn) => format!(
             "function({:?},{:?},{unsafe_fn})",
-            params.iter().map(aggregate_type_key).collect::<Vec<_>>(),
-            aggregate_type_key(result)
+            keys(params)?,
+            aggregate_type_key(result)?
         ),
         Type::Closure(params, result) => format!(
             "closure({:?},{:?})",
-            params.iter().map(aggregate_type_key).collect::<Vec<_>>(),
-            aggregate_type_key(result)
+            keys(params)?,
+            aggregate_type_key(result)?
         ),
+        Type::Const(expr) => format!("constant({:?})", aggregate_const_key(expr)?),
+        Type::Module(..) | Type::Unknown => return None,
         _ => ty.mangle(),
-    }
+    })
 }
 
 /// The stable GID of a concrete data-carrying enum (`Option<i32>`).
 /// The hash includes the base name, type arguments, and placement.
 /// Signatures and bodies use the same ID for an instance.
 /// Generated enum IDs use module 0, separate from registry structs.
-pub fn enum_instance_gid(base: &str, args: &[Type]) -> TypeId {
-    let mangled: Vec<String> = args.iter().map(aggregate_type_key).collect();
+/// Unsupported type-level expressions have no generated ID.
+pub fn enum_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+    let mangled = args
+        .iter()
+        .map(aggregate_type_key)
+        .collect::<Option<Vec<_>>>()?;
     let sym = crate::hash::DefPath::Named(&format!("$enum::{base}<{}>", mangled.join(",")))
         .compute_symbol_hash();
-    TypeId::new(0, sym, 0, 0)
+    Some(TypeId::new(0, sym, 0, 0))
 }
 
 /// The block a `comptime` `if` folded to. The checker evaluates the condition and empties the
@@ -216,22 +261,14 @@ pub struct InlineBlock {
 /// The stable per-instance GID of a monomorphized generic struct whose layout depends on its
 /// arguments (`Array<f32, 10>`): module 0 + a content hash of the base name and each argument's
 /// identity. Numeric constants contribute their evaluated values, matching payload metadata.
-pub fn struct_instance_gid(base: &str, args: &[Type]) -> TypeId {
-    let keys: Vec<String> = args
+pub fn struct_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+    let keys = args
         .iter()
-        .map(|a| match a {
-            Type::Const(e) => {
-                crate::syntax::types::const_value_text(e).unwrap_or_else(|| match e.as_ref() {
-                    Expr::Number(number) => number.value.to_string(),
-                    other => format!("{other:?}"),
-                })
-            }
-            other => aggregate_type_key(other),
-        })
-        .collect();
+        .map(aggregate_type_key)
+        .collect::<Option<Vec<_>>>()?;
     let sym = crate::hash::DefPath::Named(&format!("$struct::{base}<{}>", keys.join(",")))
         .compute_symbol_hash();
-    TypeId::new(0, sym, 0, 0)
+    Some(TypeId::new(0, sym, 0, 0))
 }
 
 /// The tensor GID of a `Type::Tensor`, or `None` if it is not a tensor, its element is generic, or a
@@ -1943,6 +1980,7 @@ impl<'r> Lowerer<'r> {
     fn infer_ast_type(&self, e: &Expr) -> Option<Type> {
         match e {
             Expr::Identifier(id) => self.ast_types.get(&id.name).cloned(),
+            Expr::EnumVariant(ev) => enum_construct_type(ev),
             // A numeric literal's own scalar type (`let x = 5` -> `i32`), so an unannotated `let`
             // records its type in `ast_types` and a later chain resolves — `&x : &i32`, `&&x : &&i32`,
             // and a nested `**rr` can recover the pointee element. Without this the chain breaks at the
@@ -2251,16 +2289,11 @@ impl<'r> Lowerer<'r> {
             }
             _ => None,
         }) {
-            // The concrete instance name comes from the *subject's* type (`match *self` on
-            // `&Option<i32>` -> `Option<i32>`): monomorphization substitutes the receiver's type args
-            // in the signature but not in the body's match patterns, which keep the generic spelling
-            // (`Option<T>`). Fall back to the pattern's spelling when the subject type is unavailable.
-            let enum_name = self
+            // The subject retains concrete type arguments even when patterns still name generic parameters.
+            let enum_ty = self
                 .infer_ast_type(&m.expr)
-                .map(|t| deref_to_pointee(&t).to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(pattern_en);
-            return self.lower_data_match(m, &enum_name);
+                .unwrap_or_else(|| Type::Enum(pattern_en.into(), None));
+            return self.lower_data_match(m, deref_to_pointee(&enum_ty));
         }
         let subj = self.lower_expr(&m.expr)?;
         if !matches!(subj.ty, LoweredTy::Scalar(ElementType::I32)) {
@@ -2395,9 +2428,12 @@ impl<'r> Lowerer<'r> {
     /// tag against the variant's ordinal and, in the taken block, bind each payload pattern to the
     /// loaded payload field before running the arm body — the same tag-dispatch + `extractvalue` the
     /// AST codegen emits, but through the flat aggregate machinery. (#242)
-    fn lower_data_match(&mut self, m: &crate::syntax::MatchExpr, enum_name: &str) -> Lowered<()> {
+    fn lower_data_match(&mut self, m: &crate::syntax::MatchExpr, enum_ty: &Type) -> Lowered<()> {
+        let (base, args) = nominal_name_and_args(enum_ty).ok_or(Decline::TypeNotModelled {
+            what: "a match subject with no concrete enum type",
+        })?;
         let (gid, offsets) =
-            self.enum_instance_layout(enum_name)
+            self.enum_instance_layout_of(&base, &args)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
                 })?;
@@ -2405,11 +2441,10 @@ impl<'r> Lowerer<'r> {
         let tag_off = *offsets.first().ok_or(Decline::TypeNotModelled {
             what: "an enum payload offset that is not laid out",
         })?;
-        let base = base_name(enum_name);
         let registry = self.registry;
         let data = registry
             .enum_data
-            .get(base)
+            .get(base.as_ref())
             .ok_or(Decline::TypeNotModelled {
                 what: "an enum with no registered data",
             })?;
@@ -3339,8 +3374,13 @@ impl<'r> Lowerer<'r> {
             .ok_or(Decline::TypeNotModelled {
                 what: "a variant not in the enum",
             })? as u64;
+        let ty = enum_construct_type(ev).ok_or(Decline::TypeNotModelled {
+            what: "an enum construction with no concrete type arguments",
+        })?;
+        let (_, args) =
+            nominal_name_and_args(&ty).expect("an enum construction has a nominal type");
         let (gid, offsets) =
-            self.enum_instance_layout(&ev.enum_name)
+            self.enum_instance_layout_of(base, &args)
                 .ok_or(Decline::TypeNotModelled {
                     what: "an enum with no modelled instance layout",
                 })?;
@@ -3508,7 +3548,8 @@ impl<'r> Lowerer<'r> {
                 .variants
                 .iter()
                 .any(|(_, p)| !p.is_empty())
-                .then(|| enum_instance_gid(name.as_ref(), args));
+                .then(|| enum_instance_gid(name.as_ref(), args))
+                .flatten();
         }
         if let Some(LoweredTy::Aggregate(gid)) = lowered_ty(ty, self.registry) {
             return Some(gid);
@@ -3531,21 +3572,76 @@ impl<'r> Lowerer<'r> {
         }
         let nominal = nominal.filter(|gid| self.registry.structs.contains_key(gid))?;
         if matches!(ty, Type::GenericInstance(..)) {
-            Some(struct_instance_gid(name.as_ref(), args))
+            struct_instance_gid(name.as_ref(), args)
         } else {
             Some(nominal)
         }
     }
 
-    // Metadata must ignore declaration-ID omissions and numeric constant source annotations.
+    // Retained metadata must use the same source-independent expressions as aggregate identity.
     fn normalize_payload_type(&self, ty: &mut Type) {
         fn normalize_constant(expr: &mut Expr) {
+            use crate::syntax::Span;
             if let Some(value) = crate::syntax::types::const_value_text(expr) {
-                *expr = Expr::Number(crate::syntax::NumberExpr::new(
-                    value,
-                    None,
-                    crate::syntax::Span::default(),
-                ));
+                *expr = Expr::Number(NumberExpr::new(value, None, Span::default()));
+                return;
+            }
+            match expr {
+                Expr::Identifier(expr) => expr.span = Span::default(),
+                Expr::StringLiteral(expr) => expr.span = Span::default(),
+                Expr::BinaryOp(expr) => {
+                    normalize_constant(&mut expr.lhs);
+                    normalize_constant(&mut expr.rhs);
+                    expr.span = Span::default();
+                    expr.operand_ty = None;
+                }
+                Expr::RelationalOp(expr) => {
+                    normalize_constant(&mut expr.lhs);
+                    normalize_constant(&mut expr.rhs);
+                    expr.span = Span::default();
+                    expr.operand_ty = None;
+                }
+                Expr::LogicalOp(expr) => {
+                    normalize_constant(&mut expr.lhs);
+                    normalize_constant(&mut expr.rhs);
+                    expr.span = Span::default();
+                }
+                Expr::UnaryOp(expr) => {
+                    normalize_constant(&mut expr.expr);
+                    expr.span = Span::default();
+                }
+                Expr::MemberAccess(expr) => {
+                    normalize_constant(&mut expr.base);
+                    expr.span = Span::default();
+                    expr.struct_name = None;
+                }
+                Expr::IndexAccess(expr) => {
+                    normalize_constant(&mut expr.base);
+                    normalize_constant(&mut expr.index);
+                    expr.span = Span::default();
+                }
+                _ => {}
+            }
+        }
+
+        fn normalize_topology(topology: &mut crate::syntax::Topology) {
+            use crate::syntax::Topology;
+            match topology {
+                Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
+                    normalize_constant(index)
+                }
+                Topology::Slice(base, start, end) => {
+                    normalize_topology(base);
+                    normalize_constant(start);
+                    normalize_constant(end);
+                }
+                _ => {}
+            }
+        }
+
+        fn normalize_placement(placement: &mut Option<crate::syntax::Placement>) {
+            if let Some(placement) = placement {
+                normalize_topology(&mut placement.topology);
             }
         }
 
@@ -3555,11 +3651,17 @@ impl<'r> Lowerer<'r> {
                     *id = self.registry.resolve_unique_nominal(name);
                 }
             }
-            Type::Pointer(inner, ..)
-            | Type::Borrow { inner, .. }
-            | Type::Ref(inner, ..)
-            | Type::Verified(inner)
-            | Type::Pinned(inner, ..) => self.normalize_payload_type(inner),
+            Type::Borrow { inner, .. } | Type::Ref(inner, ..) | Type::Verified(inner) => {
+                self.normalize_payload_type(inner)
+            }
+            Type::Pointer(inner, placement, _) => {
+                self.normalize_payload_type(inner);
+                normalize_placement(placement);
+            }
+            Type::Pinned(inner, topology) => {
+                self.normalize_payload_type(inner);
+                normalize_topology(topology);
+            }
             Type::GenericInstance(base, args) => {
                 self.normalize_payload_type(base);
                 for arg in args {
@@ -3573,7 +3675,8 @@ impl<'r> Lowerer<'r> {
                 self.normalize_payload_type(result);
             }
             Type::Const(expr) => normalize_constant(expr),
-            Type::Tensor(_, dims, _) => {
+            Type::Tensor(_, dims, placement) => {
+                normalize_placement(placement);
                 for dim in dims {
                     if let Dim::Static(expr) = dim {
                         normalize_constant(expr);
@@ -3605,7 +3708,7 @@ impl<'r> Lowerer<'r> {
     /// alignment. Supported fields include scalars, pointers, and aggregates with known storage.
     /// Declines a name two modules declare, so a wrong layout is never chosen.
     fn struct_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<TypeId> {
-        let gid = struct_instance_gid(base, args);
+        let gid = struct_instance_gid(base, args)?;
         if self.instance_layouts.contains_key(&gid) {
             return Some(gid);
         }
@@ -3726,21 +3829,6 @@ impl<'r> Lowerer<'r> {
             && self.struct_instance_layout_of(n.as_ref(), a).is_some()
     }
 
-    /// Record a concrete enum's storage layout and return its ID and logical offsets.
-    /// Each payload position uses the widest supported variant at that position.
-    /// Actual variant types remain separate in the generated layout record.
-    /// Returns `None` for an unsupported payload type.
-    fn enum_instance_layout(&mut self, enum_name: &str) -> Option<(TypeId, Vec<u64>)> {
-        let (base, args) = parse_enum_instance(enum_name);
-        self.enum_instance_layout_of(&base, &args)
-    }
-
-    /// The same, for a caller that already holds the instance structurally.
-    ///
-    /// A `Type::GenericInstance` carries its base and its arguments. Rendering one to `"Option<i32>"`
-    /// so this function can split it back apart loses the arguments' identity on the way through the
-    /// text and gains nothing: `parse_scalar_type_arg` can only recover a scalar spelling or a bare
-    /// nominal, so anything else comes back as a `Struct` named by whatever it printed as.
     /// The registry GID of a declared, non-generic struct named `name`; `None` for an enum, a
     /// generic struct's stub, or a name nothing declares.
     fn nominal_struct_gid(&self, name: &Symbol) -> Option<TypeId> {
@@ -3796,11 +3884,14 @@ impl<'r> Lowerer<'r> {
     }
 
     fn enum_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<(TypeId, Vec<u64>)> {
-        let gid = enum_instance_gid(base, args);
+        let gid = enum_instance_gid(base, args)?;
         if let Some(layout) = self.generated_layout(gid) {
             return Some((gid, layout.field_offsets()));
         }
         let data = self.registry.enum_data.get(base)?;
+        if data.generics.len() != args.len() {
+            return None;
+        }
         let mut mapping = HashMap::new();
         for (g, a) in data.generics.iter().zip(args) {
             mapping.insert(g.clone(), a.clone());
@@ -3919,7 +4010,7 @@ impl<'r> Lowerer<'r> {
                 // A generic struct whose layout depends on its arguments: the base is a stub,
                 // and the name carries the instance's arguments, so its layout is synthesized.
                 None => {
-                    let (base, args) = parse_enum_instance(si.name.as_ref());
+                    let (base, args) = parse_struct_instance(si.name.as_ref());
                     self.struct_instance_layout_of(&base, &args).ok_or(
                         Decline::TypeNotModelled {
                             what: "a struct with no GID",
@@ -6622,8 +6713,19 @@ fn named_without_side_effects(e: &Expr) -> bool {
     }
 }
 
-/// Parse a monomorphized enum instance name into its base name + type arguments: `"Option<i32>"` ->
-/// `("Option", [i32])`, `"Color"` -> `("Color", [])`. Type args are parsed as scalars (else a nominal
+/// Recover an enum construction's type without parsing its printed name.
+fn enum_construct_type(ev: &crate::syntax::EnumVariantExpr) -> Option<Type> {
+    let name = base_name(&ev.enum_name);
+    match &ev.type_args {
+        Some(args) if !args.is_empty() => Some(Type::GenericInstance(
+            Box::new(Type::Struct(name.into(), None)),
+            args.clone(),
+        )),
+        _ if !ev.enum_name.contains('<') => Some(Type::Enum(name.into(), None)),
+        _ => None,
+    }
+}
+
 /// The name before the type arguments: `"Option<i32>"` -> `"Option"`.
 ///
 /// Deliberately not a type parse. Most callers want the enum's own name to look up its registered
@@ -6633,8 +6735,8 @@ fn base_name(name: &str) -> &str {
     name.split('<').next().unwrap_or(name)
 }
 
-/// `Struct`), matching the AST codegen's string-keyed approach. (#242)
-fn parse_enum_instance(name: &str) -> (String, Vec<Type>) {
+/// Recover the arguments of a struct construction that has no attached type ID.
+fn parse_struct_instance(name: &str) -> (String, Vec<Type>) {
     let Some(lt) = name.find('<') else {
         return (name.to_string(), Vec::new());
     };
@@ -6686,7 +6788,7 @@ fn parse_scalar_type_arg(s: &str) -> Type {
         // spelling: the layout synthesizer already lays out an instance-typed field, and has no
         // way to resolve a nominal name carrying angle brackets.
         other if other.contains('<') => {
-            let (base, args) = parse_enum_instance(other);
+            let (base, args) = parse_struct_instance(other);
             return Type::GenericInstance(Box::new(Type::Struct(base.into(), None)), args);
         }
         other => return Type::Struct(other.to_string().into(), None),
@@ -6791,7 +6893,7 @@ fn agg_gid_of_ty(ty: &Type, registry: &ImmutableGlobalRegistry) -> Option<TypeId
                 .get(n.as_ref())
                 .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()))
             {
-                return Some(enum_instance_gid(n.as_ref(), args));
+                return enum_instance_gid(n.as_ref(), args);
             }
         }
     }

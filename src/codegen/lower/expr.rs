@@ -2862,6 +2862,7 @@ impl<'c> LowerToMelior<'c> for FunctionCallExpr {
         block: melior::ir::BlockRef<'c, 'c>,
     ) -> Self::Output {
         let FunctionCallExpr {
+            owner_type_args: _,
             name,
             args,
             type_args,
@@ -3701,6 +3702,7 @@ impl<'c> LowerToMelior<'c> for MethodCallExpr {
         new_args.extend(args.clone());
         gen.generate_expr(
             &Expr::FunctionCall(FunctionCallExpr {
+                owner_type_args: None,
                 name: method_name.clone(),
                 type_args: None,
                 args: new_args,
@@ -4231,6 +4233,7 @@ impl<'c> LowerToMelior<'c> for EnumVariantExpr {
             variant_name,
             payload,
             span: _,
+            type_args: _,
         } = self;
 
         let mut tag_val = 0;
@@ -4383,6 +4386,7 @@ impl<'c> LowerToMelior<'c> for VecMacroExpr {
         };
 
         let new_call = Expr::FunctionCall(FunctionCallExpr {
+            owner_type_args: None,
             name: format!("Vec_{}::new", type_suffix).into(),
             args: vec![],
             type_args: None,
@@ -4430,6 +4434,7 @@ impl<'c> LowerToMelior<'c> for VecMacroExpr {
 
         for el in &self.elements {
             let push_call = Expr::FunctionCall(FunctionCallExpr {
+                owner_type_args: None,
                 name: format!("Vec_{}::push", type_suffix).into(),
                 args: vec![
                     Expr::Borrow(BorrowExpr {

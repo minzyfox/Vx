@@ -563,12 +563,12 @@ fn resolve_agg_gid(
     // here and falls through to the nominal resolution below. (#242)
     if let Type::GenericInstance(base, args) = ty {
         if let Type::Enum(name, _) | Type::Struct(name, _) = base.as_ref() {
-            let gid = crate::hir::flatten::enum_instance_gid(name.as_ref(), args);
+            let gid = crate::hir::flatten::enum_instance_gid(name.as_ref(), args)?;
             if aggs.contains_key(&gid) {
                 return Some(gid);
             }
             // A generic struct instance whose layout the lowerer synthesized (`Array<f32, 10>`).
-            let gid = crate::hir::flatten::struct_instance_gid(name.as_ref(), args);
+            let gid = crate::hir::flatten::struct_instance_gid(name.as_ref(), args)?;
             if aggs.contains_key(&gid) {
                 return Some(gid);
             }
@@ -581,7 +581,7 @@ fn resolve_agg_gid(
     match nominal {
         Type::Struct(name, id) | Type::Enum(name, id) => {
             // A data-carrying enum with no generics is the instance with no arguments.
-            let bare = crate::hir::flatten::enum_instance_gid(name.as_ref(), &[]);
+            let bare = crate::hir::flatten::enum_instance_gid(name.as_ref(), &[])?;
             if aggs.contains_key(&bare) {
                 return Some(bare);
             }

@@ -714,6 +714,7 @@ fn lower_for_loop<'c>(
         );
 
         let next_call = Expr::FunctionCall(FunctionCallExpr {
+            owner_type_args: None,
             name: actual_next_name.into(),
             type_args: None,
             args: vec![Expr::Borrow(BorrowExpr {

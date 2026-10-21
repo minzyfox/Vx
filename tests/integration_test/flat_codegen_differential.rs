@@ -1608,6 +1608,28 @@ fn enum_variants_with_different_structs_run_in_parallel() {
 }
 
 #[test]
+fn enum_tensor_pointers_construct_and_match() {
+    assert_generated_aggregate_runs(
+        "enum_tensor_pointers_construct_and_match.vx",
+        &["5", "7", "3", "3"],
+        None,
+    );
+}
+
+#[test]
+fn enum_tensor_pointers_construct_and_match_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs(
+        "enum_tensor_pointers_construct_and_match.vx",
+        &["5", "7", "3", "3"],
+        Some(2),
+    );
+}
+
+#[test]
 fn enum_parameters_with_host_and_gpu_tensor_pointers_compile() {
     assert_generated_aggregate_runs("enum_pointer_tensor_placements.vx", &["3"], None);
 }

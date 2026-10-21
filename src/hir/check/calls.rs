@@ -137,6 +137,7 @@ impl<'a> TypeChecker<'a> {
                     new_args.extend(args.clone());
 
                     *expr = Expr::FunctionCall(FunctionCallExpr {
+                        owner_type_args: None,
                         name: call_name.into(),
                         type_args: None,
                         args: new_args,
@@ -674,6 +675,7 @@ impl<'a> TypeChecker<'a> {
         }
         match expr {
             Expr::FunctionCall(FunctionCallExpr {
+                owner_type_args: _,
                 name,
                 type_args,
                 args,
@@ -882,6 +884,7 @@ impl<'a> TypeChecker<'a> {
                             new_args.extend(args.clone());
 
                             *expr = Expr::FunctionCall(FunctionCallExpr {
+                                owner_type_args: None,
                                 name: call_name.into(),
                                 type_args: None,
                                 args: new_args,
@@ -2840,6 +2843,7 @@ impl<'a> TypeChecker<'a> {
         );
 
         let mut func_call = Expr::FunctionCall(FunctionCallExpr {
+            owner_type_args: None,
             name: crate::symbol::Symbol::from(mangled_name.as_str()),
             type_args: None,
             args: call_args,
@@ -2961,6 +2965,7 @@ impl<'a> TypeChecker<'a> {
                         let mangled_name = format!("{}_{}", prefix, _method);
                         self.record_call_edge(&mangled_name, &method_span);
                         let func_call = Expr::FunctionCall(FunctionCallExpr {
+                            owner_type_args: None,
                             name: crate::symbol::Symbol::from(mangled_name.as_str()),
                             type_args: None,
                             args: args.clone(),

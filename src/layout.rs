@@ -358,7 +358,7 @@ impl<'a> LayoutComputer<'a> {
         if decl.generics.is_empty() || args.iter().any(Type::has_generic_params) {
             return None;
         }
-        let id = crate::hir::flatten::struct_instance_gid(decl.name.as_ref(), args);
+        let id = crate::hir::flatten::struct_instance_gid(decl.name.as_ref(), args)?;
         if self.instances.contains_key(&id) {
             return Some(id);
         }
