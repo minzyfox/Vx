@@ -556,19 +556,20 @@ fn resolve_agg_gid(
     ty: &Type,
     aggs: &AggMap,
     agg_names: &HashMap<String, TypeId>,
+    identities: &crate::layout::identity::AggregateIdentities,
 ) -> Option<TypeId> {
     // A data-carrying enum instance (`Option<i32>`) has a *synthesized* per-instance layout keyed by
     // `enum_instance_gid` (the lowerer recorded it in the side table now folded into `aggs`); try that
     // first. Its `gid` is distinct from any registry layout, so a struct instance (`Vec<i32>`) misses
     // here and falls through to the nominal resolution below. (#242)
     if let Type::GenericInstance(base, args) = ty {
-        if let Type::Enum(name, _) | Type::Struct(name, _) = base.as_ref() {
-            let gid = crate::hir::flatten::enum_instance_gid(name.as_ref(), args)?;
+        if matches!(base.as_ref(), Type::Enum(..) | Type::Struct(..)) {
+            let gid = crate::hir::flatten::enum_instance_gid(base.as_ref(), args, identities)?;
             if aggs.contains_key(&gid) {
                 return Some(gid);
             }
             // A generic struct instance whose layout the lowerer synthesized (`Array<f32, 10>`).
-            let gid = crate::hir::flatten::struct_instance_gid(name.as_ref(), args)?;
+            let gid = crate::hir::flatten::struct_instance_gid(base.as_ref(), args, identities)?;
             if aggs.contains_key(&gid) {
                 return Some(gid);
             }
@@ -581,7 +582,7 @@ fn resolve_agg_gid(
     match nominal {
         Type::Struct(name, id) | Type::Enum(name, id) => {
             // A data-carrying enum with no generics is the instance with no arguments.
-            let bare = crate::hir::flatten::enum_instance_gid(name.as_ref(), &[])?;
+            let bare = crate::hir::flatten::enum_instance_gid(nominal, &[], identities)?;
             if aggs.contains_key(&bare) {
                 return Some(bare);
             }
@@ -650,11 +651,16 @@ pub fn build_callee_map(
                         _ => None,
                     }
                 }),
-                ret_agg: resolve_agg_gid(&sig.ret_ty, aggs, agg_names),
+                ret_agg: resolve_agg_gid(
+                    &sig.ret_ty,
+                    aggs,
+                    agg_names,
+                    registry.aggregate_identities(),
+                ),
                 ret_ptr: is_ptr_ty(&sig.ret_ty),
                 ret_pointee: match peel_wrappers(&sig.ret_ty) {
                     Type::Borrow { inner, .. } | Type::Pointer(inner, ..) => {
-                        resolve_agg_gid(inner, aggs, agg_names)
+                        resolve_agg_gid(inner, aggs, agg_names, registry.aggregate_identities())
                     }
                     _ => None,
                 },
@@ -947,6 +953,7 @@ pub type TensorMap = HashMap<TypeId, (ElementType, Vec<String>)>;
 /// reference none (scalar/control-flow-only functions).
 #[derive(Default)]
 pub struct EmitCtx {
+    identities: std::sync::Arc<crate::layout::identity::AggregateIdentities>,
     /// Record the Vx name and type of each parameter of a function that holds a `spawn`, for
     /// `--emit-ptx` to describe the parameters of a GPU kernel.
     pub describe_params: bool,
@@ -1189,6 +1196,7 @@ impl EmitCtx {
         let agg_names = build_agg_names(registry, &aggs);
         let callees = build_callee_map(registry, &aggs, &agg_names, sched);
         Self {
+            identities: registry.aggregate_identities().clone(),
             callees,
             aggs,
             agg_names,
@@ -1215,7 +1223,7 @@ impl EmitCtx {
     /// monomorphized cross-module signature left it unresolved, the base name's GID (`agg_names`).
     /// (#242)
     fn agg_gid(&self, ty: &Type) -> Option<TypeId> {
-        resolve_agg_gid(ty, &self.aggs, &self.agg_names)
+        resolve_agg_gid(ty, &self.aggs, &self.agg_names, &self.identities)
     }
 }
 

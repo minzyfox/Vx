@@ -21,6 +21,8 @@
 // sizes mirror `SizeOfExpr` lowering in `codegen/lower/expr.rs`.
 //
 //===----------------------------------------------------------------------===//
+pub mod identity;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::gid::TypeId;
@@ -164,6 +166,7 @@ pub fn vector_size_align(el: &ElementType, lanes: usize) -> Option<(usize, usize
 /// (an infinite-sized type) resolves to `None` here and is reported separately
 /// by the registry's cycle detection.
 pub struct LayoutComputer<'a> {
+    identities: identity::AggregateIdentities,
     structs: FxHashMap<TypeId, &'a StructDecl>,
     enums: FxHashMap<TypeId, &'a EnumDecl>,
     memo: FxHashMap<TypeId, Option<TypeLayout>>,
@@ -180,7 +183,14 @@ impl<'a> LayoutComputer<'a> {
         structs: FxHashMap<TypeId, &'a StructDecl>,
         enums: FxHashMap<TypeId, &'a EnumDecl>,
     ) -> Self {
+        let identities = identity::AggregateIdentities::new(
+            structs
+                .iter()
+                .map(|(id, decl)| (*id, decl.name.clone()))
+                .chain(enums.iter().map(|(id, decl)| (*id, decl.name.clone()))),
+        );
         Self {
+            identities,
             structs,
             enums,
             memo: FxHashMap::default(),
@@ -358,7 +368,7 @@ impl<'a> LayoutComputer<'a> {
         if decl.generics.is_empty() || args.iter().any(Type::has_generic_params) {
             return None;
         }
-        let id = crate::hir::flatten::struct_instance_gid(decl.name.as_ref(), args)?;
+        let id = crate::hir::flatten::struct_instance_gid(base, args, &self.identities)?;
         if self.instances.contains_key(&id) {
             return Some(id);
         }

@@ -102,6 +102,7 @@ pub struct FnBody {
 /// The globally frozen type registry for parallel compilation phases.
 #[derive(Debug, Clone)]
 pub struct ImmutableGlobalRegistry {
+    pub(crate) aggregate_identities: std::sync::Arc<crate::layout::identity::AggregateIdentities>,
     pub layouts: FxHashMap<TypeId, TypeDefinition>,
     pub module_indices: FxHashMap<u64, FxHashMap<crate::symbol::Symbol, TypeId>>,
     /// Function signatures by name, for call resolution in the flat HIR. A name defined in more than
@@ -479,7 +480,11 @@ impl ImmutableGlobalRegistry {
         }
 
         let layout_by_base_name = LayoutNameIndex::build(&layouts);
+        let aggregate_identities = std::sync::Arc::new(
+            crate::layout::identity::AggregateIdentities::from_layouts(&layouts),
+        );
         Ok(Self {
+            aggregate_identities,
             layouts,
             module_indices,
             fn_sigs: FxHashMap::default(),
@@ -492,6 +497,17 @@ impl ImmutableGlobalRegistry {
             const_tables: Vec::new(),
             layout_by_base_name,
         })
+    }
+
+    pub fn aggregate_identities(
+        &self,
+    ) -> &std::sync::Arc<crate::layout::identity::AggregateIdentities> {
+        assert_eq!(
+            self.aggregate_identities.len(),
+            self.layouts.len(),
+            "layouts changed after the aggregate identity index was built"
+        );
+        &self.aggregate_identities
     }
 
     /// An enum whose variants carry no data: its layout has no fields, and its value is an
@@ -585,6 +601,9 @@ impl ImmutableGlobalRegistry {
         }
         // The merge is the one path that grows `layouts` after the freeze, so the index follows it.
         self.layout_by_base_name = LayoutNameIndex::build(&self.layouts);
+        self.aggregate_identities = std::sync::Arc::new(
+            crate::layout::identity::AggregateIdentities::from_layouts(&self.layouts),
+        );
         for (module_hash, by_name) in other.module_indices {
             let dst = self.module_indices.entry(module_hash).or_default();
             for (name, gid) in by_name {
@@ -785,6 +804,17 @@ mod tests {
             fields: Vec::new(),
             by_value_dependencies: deps,
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "aggregate identity index")]
+    fn aggregate_identity_index_refuses_a_table_that_grew_under_it() {
+        let mut registry =
+            ImmutableGlobalRegistry::build_and_validate(vec![make_def("First", 1, 1, vec![])])
+                .unwrap();
+        let second = make_def("Second", 1, 2, vec![]);
+        registry.layouts.insert(second.id, second);
+        registry.aggregate_identities();
     }
 
     /// The base-name index answers what the old scan of every layout answered, in one probe: the

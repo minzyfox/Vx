@@ -140,11 +140,14 @@ fn aggregate_placement_key(placement: &Option<crate::syntax::Placement>) -> Opti
     })
 }
 
-fn aggregate_type_key(ty: &Type) -> Option<String> {
+fn aggregate_type_key(
+    ty: &Type,
+    identities: &crate::layout::identity::AggregateIdentities,
+) -> Option<String> {
     use crate::syntax::types::Mangle;
     let keys = |args: &[Type]| {
         args.iter()
-            .map(aggregate_type_key)
+            .map(|ty| aggregate_type_key(ty, identities))
             .collect::<Option<Vec<_>>>()
     };
     Some(match ty {
@@ -163,7 +166,7 @@ fn aggregate_type_key(ty: &Type) -> Option<String> {
         }
         Type::Pointer(inner, placement, mutable) => format!(
             "pointer({:?},{:?},{mutable})",
-            aggregate_type_key(inner)?,
+            aggregate_type_key(inner, identities)?,
             aggregate_placement_key(placement)?
         ),
         Type::Borrow {
@@ -173,47 +176,63 @@ fn aggregate_type_key(ty: &Type) -> Option<String> {
             ..
         } => format!(
             "borrow({:?},{mem_space:?},{is_mut})",
-            aggregate_type_key(inner)?
+            aggregate_type_key(inner, identities)?
         ),
-        Type::Ref(inner, space) => format!("ref({:?},{space:?})", aggregate_type_key(inner)?),
-        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner)?),
+        Type::Ref(inner, space) => format!(
+            "ref({:?},{space:?})",
+            aggregate_type_key(inner, identities)?
+        ),
+        Type::Verified(inner) => format!("verified({:?})", aggregate_type_key(inner, identities)?),
         Type::Pinned(inner, topology) => format!(
             "pinned({:?},{:?})",
-            aggregate_type_key(inner)?,
+            aggregate_type_key(inner, identities)?,
             aggregate_topology_key(topology)?
         ),
         Type::GenericInstance(base, args) => format!(
             "instance({:?},{:?})",
-            aggregate_type_key(base)?,
+            aggregate_type_key(base, identities)?,
             keys(args)?
         ),
         Type::Function(params, result, unsafe_fn) => format!(
             "function({:?},{:?},{unsafe_fn})",
             keys(params)?,
-            aggregate_type_key(result)?
+            aggregate_type_key(result, identities)?
         ),
         Type::Closure(params, result) => format!(
             "closure({:?},{:?})",
             keys(params)?,
-            aggregate_type_key(result)?
+            aggregate_type_key(result, identities)?
         ),
         Type::Const(expr) => format!("constant({:?})", aggregate_const_key(expr)?),
+        Type::Struct(name, id) | Type::Enum(name, id) => {
+            if id.is_none() && crate::syntax::is_void_ty(ty) {
+                ty.mangle()
+            } else {
+                let (_, id) = identities.resolve(name, *id)?;
+                format!("nominal({id:?})")
+            }
+        }
         Type::Module(..) | Type::Unknown => return None,
         _ => ty.mangle(),
     })
 }
 
 /// The stable GID of a concrete data-carrying enum (`Option<i32>`).
-/// The hash includes the base name, type arguments, and placement.
+/// The hash includes the declaration ID, type arguments, and placement.
 /// Signatures and bodies use the same ID for an instance.
 /// Generated enum IDs use module 0, separate from registry structs.
 /// Unsupported type-level expressions have no generated ID.
-pub fn enum_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+pub fn enum_instance_gid<'a>(
+    base: impl Into<crate::layout::identity::AggregateBase<'a>>,
+    args: &[Type],
+    identities: &crate::layout::identity::AggregateIdentities,
+) -> Option<TypeId> {
+    let (_, base) = identities.resolve_base(base.into())?;
     let mangled = args
         .iter()
-        .map(aggregate_type_key)
+        .map(|ty| aggregate_type_key(ty, identities))
         .collect::<Option<Vec<_>>>()?;
-    let sym = crate::hash::DefPath::Named(&format!("$enum::{base}<{}>", mangled.join(",")))
+    let sym = crate::hash::DefPath::Named(&format!("$enum::{base:?}<{}>", mangled.join(",")))
         .compute_symbol_hash();
     Some(TypeId::new(0, sym, 0, 0))
 }
@@ -259,14 +278,19 @@ pub struct InlineBlock {
 }
 
 /// The stable per-instance GID of a monomorphized generic struct whose layout depends on its
-/// arguments (`Array<f32, 10>`): module 0 + a content hash of the base name and each argument's
+/// arguments (`Array<f32, 10>`): module 0 + a content hash of the declaration ID and each argument's
 /// identity. Numeric constants contribute their evaluated values, matching payload metadata.
-pub fn struct_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+pub fn struct_instance_gid<'a>(
+    base: impl Into<crate::layout::identity::AggregateBase<'a>>,
+    args: &[Type],
+    identities: &crate::layout::identity::AggregateIdentities,
+) -> Option<TypeId> {
+    let (_, base) = identities.resolve_base(base.into())?;
     let keys = args
         .iter()
-        .map(aggregate_type_key)
+        .map(|ty| aggregate_type_key(ty, identities))
         .collect::<Option<Vec<_>>>()?;
-    let sym = crate::hash::DefPath::Named(&format!("$struct::{base}<{}>", keys.join(",")))
+    let sym = crate::hash::DefPath::Named(&format!("$struct::{base:?}<{}>", keys.join(",")))
         .compute_symbol_hash();
     Some(TypeId::new(0, sym, 0, 0))
 }
@@ -3457,7 +3481,7 @@ impl<'r> Lowerer<'r> {
                 if matches!(base.as_ref(), Type::Struct(..))
                     && self.registry.layout_gid_by_base_name(n.as_ref()).is_none()
                 {
-                    if let Some(gid) = self.struct_instance_layout_of(n.as_ref(), args) {
+                    if let Some(gid) = self.struct_instance_layout_of(base.as_ref(), args) {
                         return Some(LoweredTy::Aggregate(gid));
                     }
                 }
@@ -3504,8 +3528,8 @@ impl<'r> Lowerer<'r> {
             return Some(gid);
         }
         if let Type::GenericInstance(base, args) = deref_to_pointee(ty) {
-            if let Type::Struct(n, _) = base.as_ref() {
-                return self.struct_instance_layout_of(n.as_ref(), args);
+            if matches!(base.as_ref(), Type::Struct(..)) {
+                return self.struct_instance_layout_of(base.as_ref(), args);
             }
         }
         None
@@ -3548,7 +3572,9 @@ impl<'r> Lowerer<'r> {
                 .variants
                 .iter()
                 .any(|(_, p)| !p.is_empty())
-                .then(|| enum_instance_gid(name.as_ref(), args))
+                .then(|| {
+                    enum_instance_gid(name.as_ref(), args, self.registry.aggregate_identities())
+                })
                 .flatten();
         }
         if let Some(LoweredTy::Aggregate(gid)) = lowered_ty(ty, self.registry) {
@@ -3572,134 +3598,27 @@ impl<'r> Lowerer<'r> {
         }
         let nominal = nominal.filter(|gid| self.registry.structs.contains_key(gid))?;
         if matches!(ty, Type::GenericInstance(..)) {
-            struct_instance_gid(name.as_ref(), args)
+            struct_instance_gid(base, args, self.registry.aggregate_identities())
         } else {
             Some(nominal)
         }
     }
 
-    // Retained metadata must use the same source-independent expressions as aggregate identity.
-    fn normalize_payload_type(&self, ty: &mut Type) {
-        fn normalize_constant(expr: &mut Expr) {
-            use crate::syntax::Span;
-            if let Some(value) = crate::syntax::types::const_value_text(expr) {
-                *expr = Expr::Number(NumberExpr::new(value, None, Span::default()));
-                return;
-            }
-            match expr {
-                Expr::Identifier(expr) => expr.span = Span::default(),
-                Expr::StringLiteral(expr) => expr.span = Span::default(),
-                Expr::BinaryOp(expr) => {
-                    normalize_constant(&mut expr.lhs);
-                    normalize_constant(&mut expr.rhs);
-                    expr.span = Span::default();
-                    expr.operand_ty = None;
-                }
-                Expr::RelationalOp(expr) => {
-                    normalize_constant(&mut expr.lhs);
-                    normalize_constant(&mut expr.rhs);
-                    expr.span = Span::default();
-                    expr.operand_ty = None;
-                }
-                Expr::LogicalOp(expr) => {
-                    normalize_constant(&mut expr.lhs);
-                    normalize_constant(&mut expr.rhs);
-                    expr.span = Span::default();
-                }
-                Expr::UnaryOp(expr) => {
-                    normalize_constant(&mut expr.expr);
-                    expr.span = Span::default();
-                }
-                Expr::MemberAccess(expr) => {
-                    normalize_constant(&mut expr.base);
-                    expr.span = Span::default();
-                    expr.struct_name = None;
-                }
-                Expr::IndexAccess(expr) => {
-                    normalize_constant(&mut expr.base);
-                    normalize_constant(&mut expr.index);
-                    expr.span = Span::default();
-                }
-                _ => {}
-            }
-        }
-
-        fn normalize_topology(topology: &mut crate::syntax::Topology) {
-            use crate::syntax::Topology;
-            match topology {
-                Topology::GPU(index) | Topology::NPU(index) | Topology::AccCore(index) => {
-                    normalize_constant(index)
-                }
-                Topology::Slice(base, start, end) => {
-                    normalize_topology(base);
-                    normalize_constant(start);
-                    normalize_constant(end);
-                }
-                _ => {}
-            }
-        }
-
-        fn normalize_placement(placement: &mut Option<crate::syntax::Placement>) {
-            if let Some(placement) = placement {
-                normalize_topology(&mut placement.topology);
-            }
-        }
-
-        match ty {
-            Type::Struct(name, id) | Type::Enum(name, id) => {
-                if id.is_none() {
-                    *id = self.registry.resolve_unique_nominal(name);
-                }
-            }
-            Type::Borrow { inner, .. } | Type::Ref(inner, ..) | Type::Verified(inner) => {
-                self.normalize_payload_type(inner)
-            }
-            Type::Pointer(inner, placement, _) => {
-                self.normalize_payload_type(inner);
-                normalize_placement(placement);
-            }
-            Type::Pinned(inner, topology) => {
-                self.normalize_payload_type(inner);
-                normalize_topology(topology);
-            }
-            Type::GenericInstance(base, args) => {
-                self.normalize_payload_type(base);
-                for arg in args {
-                    self.normalize_payload_type(arg);
-                }
-            }
-            Type::Function(params, result, _) | Type::Closure(params, result) => {
-                for param in params {
-                    self.normalize_payload_type(param);
-                }
-                self.normalize_payload_type(result);
-            }
-            Type::Const(expr) => normalize_constant(expr),
-            Type::Tensor(_, dims, placement) => {
-                normalize_placement(placement);
-                for dim in dims {
-                    if let Dim::Static(expr) = dim {
-                        normalize_constant(expr);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn payload_metadata(&self, mut ty: Type) -> crate::layout::GeneratedPayloadLayout {
-        self.normalize_payload_type(&mut ty);
+    fn payload_metadata(&self, mut ty: Type) -> Option<crate::layout::GeneratedPayloadLayout> {
+        self.registry
+            .aggregate_identities()
+            .normalize_type(&mut ty)?;
         let (aggregate_id, pointer_target_id) = match &ty {
             Type::Pointer(inner, ..) | Type::Borrow { inner, .. } | Type::Ref(inner, ..) => {
                 (None, self.known_aggregate_id(inner))
             }
             _ => (self.known_aggregate_id(&ty), None),
         };
-        crate::layout::GeneratedPayloadLayout {
+        Some(crate::layout::GeneratedPayloadLayout {
             ty,
             aggregate_id,
             pointer_target_id,
-        }
+        })
     }
 
     /// Synthesize (once) and record the layout of a generic struct instance whose base layout
@@ -3707,21 +3626,20 @@ impl<'r> Lowerer<'r> {
     /// declared fields are substituted with the instance's arguments and laid out with natural
     /// alignment. Supported fields include scalars, pointers, and aggregates with known storage.
     /// Declines a name two modules declare, so a wrong layout is never chosen.
-    fn struct_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<TypeId> {
-        let gid = struct_instance_gid(base, args)?;
+    fn struct_instance_layout_of<'a>(
+        &mut self,
+        base: impl Into<crate::layout::identity::AggregateBase<'a>>,
+        args: &[Type],
+    ) -> Option<TypeId> {
+        let (base, declaration) = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(base.into())?;
+        let gid = struct_instance_gid(declaration, args, self.registry.aggregate_identities())?;
         if self.instance_layouts.contains_key(&gid) {
             return Some(gid);
         }
-        let mut found: Option<TypeId> = None;
-        for def in self.registry.layouts.values() {
-            if def.name == base {
-                if found.is_some_and(|g| g != def.id) {
-                    return None;
-                }
-                found = Some(def.id);
-            }
-        }
-        let decl = self.registry.structs.get(&found?)?;
+        let decl = self.registry.structs.get(&declaration)?;
         let mut mapping = HashMap::new();
         for (g, a) in decl.generics.iter().zip(args) {
             mapping.insert(g.clone(), a.clone());
@@ -3754,10 +3672,7 @@ impl<'r> Lowerer<'r> {
                     )
                 }
                 Type::GenericInstance(b, a) if matches!(b.as_ref(), Type::Struct(..)) => {
-                    let Type::Struct(inner_name, _) = b.as_ref() else {
-                        return None;
-                    };
-                    let inner = self.struct_instance_layout_of(inner_name.as_ref(), a)?;
+                    let inner = self.struct_instance_layout_of(b.as_ref(), a)?;
                     let layout = self.generated_layout(inner)?;
                     (
                         layout.size_bytes,
@@ -3782,7 +3697,7 @@ impl<'r> Lowerer<'r> {
                 }
             };
             off = crate::layout::align_up(off as usize, al as usize) as u64;
-            let metadata = self.payload_metadata(fty);
+            let metadata = self.payload_metadata(fty)?;
             fields.push(crate::layout::GeneratedFieldLayout {
                 layout: crate::layout::FieldLayout {
                     name: name.clone(),
@@ -3822,11 +3737,11 @@ impl<'r> Lowerer<'r> {
         let Type::GenericInstance(b, a) = inner.as_ref() else {
             return false;
         };
-        let Type::Struct(n, _) = b.as_ref() else {
+        let Type::Struct(..) = b.as_ref() else {
             return false;
         };
         agg_gid_of_ty(ty, self.registry).is_none()
-            && self.struct_instance_layout_of(n.as_ref(), a).is_some()
+            && self.struct_instance_layout_of(b.as_ref(), a).is_some()
     }
 
     /// The registry GID of a declared, non-generic struct named `name`; `None` for an enum, a
@@ -3868,10 +3783,10 @@ impl<'r> Lowerer<'r> {
                 Some((def.size_bytes as u64, def.align_bytes as u64, mlir))
             }
             Type::GenericInstance(base, args) => {
-                let Type::Struct(name, _) = base.as_ref() else {
+                let Type::Struct(..) = base.as_ref() else {
                     return None;
                 };
-                let gid = self.struct_instance_layout_of(name.as_ref(), args)?;
+                let gid = self.struct_instance_layout_of(base.as_ref(), args)?;
                 let layout = self.generated_layout(gid)?;
                 Some((
                     layout.size_bytes,
@@ -3884,7 +3799,7 @@ impl<'r> Lowerer<'r> {
     }
 
     fn enum_instance_layout_of(&mut self, base: &str, args: &[Type]) -> Option<(TypeId, Vec<u64>)> {
-        let gid = enum_instance_gid(base, args)?;
+        let gid = enum_instance_gid(base, args, self.registry.aggregate_identities())?;
         if let Some(layout) = self.generated_layout(gid) {
             return Some((gid, layout.field_offsets()));
         }
@@ -3945,7 +3860,7 @@ impl<'r> Lowerer<'r> {
             // bits through that: 7 stored as an `i32` and copied through an `f32` field is
             // a denormal, which the copy is free to flush to zero (Vx#570). A pointer
             // keeps its own type, which is what carries it.
-            let metadata = self.payload_metadata(pt.clone());
+            let metadata = self.payload_metadata(pt.clone())?;
             let kind = match &metadata.ty {
                 Type::Scalar(e) => FieldTy::Scalar(e.clone()),
                 _ => metadata
@@ -3981,9 +3896,9 @@ impl<'r> Lowerer<'r> {
                     types
                         .iter()
                         .map(|ty| self.payload_metadata(ty.substitute(&mapping)))
-                        .collect()
+                        .collect::<Option<Vec<_>>>()
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
             self.record_generated_layout(crate::layout::GeneratedAggregateLayout {
                 type_id: gid,
                 name: base.to_string(),
@@ -4011,7 +3926,7 @@ impl<'r> Lowerer<'r> {
                 // and the name carries the instance's arguments, so its layout is synthesized.
                 None => {
                     let (base, args) = parse_struct_instance(si.name.as_ref());
-                    self.struct_instance_layout_of(&base, &args).ok_or(
+                    self.struct_instance_layout_of(base.as_str(), &args).ok_or(
                         Decline::TypeNotModelled {
                             what: "a struct with no GID",
                         },
@@ -6893,7 +6808,7 @@ fn agg_gid_of_ty(ty: &Type, registry: &ImmutableGlobalRegistry) -> Option<TypeId
                 .get(n.as_ref())
                 .is_some_and(|d| d.variants.iter().any(|(_, p)| !p.is_empty()))
             {
-                return enum_instance_gid(n.as_ref(), args);
+                return enum_instance_gid(base.as_ref(), args, registry.aggregate_identities());
             }
         }
     }

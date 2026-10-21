@@ -1183,7 +1183,11 @@ pub fn deserialize_registry_interface(bytes: &[u8]) -> Result<ImmutableGlobalReg
     }
 
     let layout_by_base_name = LayoutNameIndex::build(&layouts);
+    let aggregate_identities = std::sync::Arc::new(
+        crate::layout::identity::AggregateIdentities::from_layouts(&layouts),
+    );
     Ok(ImmutableGlobalRegistry {
+        aggregate_identities,
         layouts,
         module_indices,
         fn_sigs,
@@ -1227,6 +1231,43 @@ mod tests {
         let symbol_map = crate::resolver::build_symbol_map(&mods);
         mods[0].resolve_names(&symbol_map, &[]);
         mods.pop().unwrap()
+    }
+
+    #[test]
+    fn aggregate_identity_survives_interface_loading_and_merging() {
+        let module = parse_and_resolve(
+            "crate::identity",
+            "struct Node { value: i32 } struct Holder<T> { value: T }",
+        );
+        let original = crate::pipeline::build_frozen_registry(&[module]).unwrap();
+        let bytes = serialize_registry_interface(&original);
+        let loaded = deserialize_registry_interface(&bytes).unwrap();
+        let argument = crate::syntax::Type::Pointer(
+            Box::new(crate::syntax::Type::Struct("Node".into(), None)),
+            None,
+            false,
+        );
+        let key = |registry: &ImmutableGlobalRegistry| {
+            crate::hir::flatten::struct_instance_gid(
+                "Holder",
+                std::slice::from_ref(&argument),
+                registry.aggregate_identities(),
+            )
+            .expect("declarations have a generated identity")
+        };
+        let expected = key(&original);
+        assert_eq!(
+            key(&loaded),
+            expected,
+            "loaded declarations retain aggregate identity"
+        );
+        let mut merged = ImmutableGlobalRegistry::build_and_validate(vec![]).unwrap();
+        merged.merge_from(loaded);
+        assert_eq!(
+            key(&merged),
+            expected,
+            "merged declarations retain aggregate identity"
+        );
     }
 
     /// The registry interface survives a serialize -> file -> load -> deserialize round trip: the

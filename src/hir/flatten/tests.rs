@@ -13,6 +13,23 @@ use crate::bytecode::{
 use crate::session::GlobalSession;
 use std::sync::Arc;
 
+fn test_identities() -> crate::layout::identity::AggregateIdentities {
+    crate::layout::identity::AggregateIdentities::new(
+        ["Opt", "Holder", "Sized", "Number", "Address"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (TypeId::new(1, i as u64 + 1, 0, 0), name.into())),
+    )
+}
+
+fn enum_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+    super::enum_instance_gid(base, args, &test_identities())
+}
+
+fn struct_instance_gid(base: &str, args: &[Type]) -> Option<TypeId> {
+    super::struct_instance_gid(base, args, &test_identities())
+}
+
 fn parse_fn(src: &str) -> Function {
     let mut lexer = crate::lexer::Lexer::new(src);
     let tokens = lexer.tokenize();
@@ -180,7 +197,13 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
         .local_agg_layouts
         .iter()
         .find(|l| {
-            l.type_id == struct_instance_gid("Holder", std::slice::from_ref(&inner_ty)).unwrap()
+            l.type_id
+                == super::struct_instance_gid(
+                    "Holder",
+                    std::slice::from_ref(&inner_ty),
+                    worker.global.registry.aggregate_identities(),
+                )
+                .unwrap()
         })
         .expect("the worker contains the Holder layout");
     assert_eq!(
@@ -228,6 +251,251 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
             variant_payloads: vec![],
         },
         "the worker must retain the struct's complete generated layout"
+    );
+}
+
+#[test]
+fn aggregate_identity_preserves_declarations_in_bases_and_arguments() {
+    use crate::layout::identity::{AggregateBase, AggregateIdentities};
+    let first = TypeId::new(10, 1, 0, 0);
+    let second = TypeId::new(20, 1, 0, 0);
+    let holder = TypeId::new(10, 2, 0, 0);
+    let other_holder = TypeId::new(20, 2, 0, 0);
+    let identities = AggregateIdentities::new([
+        (first, "Node".into()),
+        (second, "Node".into()),
+        (holder, "Holder".into()),
+        (other_holder, "Holder".into()),
+        (TypeId::new(10, 3, 0, 0), "Unique".into()),
+    ]);
+    let pointer =
+        |name: &str, id| Type::Pointer(Box::new(Type::Struct(name.into(), id)), None, false);
+    for is_enum in [false, true] {
+        let identity = |base: AggregateBase<'_>, ty: &Type| {
+            if is_enum {
+                super::enum_instance_gid(base, std::slice::from_ref(ty), &identities)
+            } else {
+                super::struct_instance_gid(base, std::slice::from_ref(ty), &identities)
+            }
+        };
+        let key = |base, ty: &Type| {
+            identity(AggregateBase::Declaration(base), ty).expect("resolved type has an identity")
+        };
+        let node = pointer("Node", Some(first));
+        assert_ne!(
+            key(holder, &node),
+            key(holder, &pointer("Node", Some(second))),
+            "same-named argument declarations retain different identities"
+        );
+        assert_ne!(
+            key(holder, &node),
+            key(other_holder, &node),
+            "same-named aggregate declarations retain different identities"
+        );
+        assert_eq!(
+            key(holder, &node),
+            key(holder, &pointer("module::Node", Some(first))),
+            "attached declaration identity ignores name spelling"
+        );
+        let attached_base = Type::Struct("module::Holder".into(), Some(holder));
+        assert_eq!(
+            identity(AggregateBase::Type(&attached_base), &node),
+            Some(key(holder, &node)),
+            "attached base declaration identity ignores name spelling"
+        );
+        assert_eq!(
+            identity(AggregateBase::Declaration(holder), &pointer("Node", None)),
+            None,
+            "ambiguous argument names must decline"
+        );
+        assert_eq!(
+            identity(AggregateBase::Name("Holder"), &node),
+            None,
+            "ambiguous aggregate names must decline"
+        );
+        assert_eq!(
+            identity(
+                AggregateBase::Declaration(holder),
+                &pointer("Unique", Some(TypeId::new(99, 1, 0, 0)))
+            ),
+            None,
+            "unknown attached IDs must not fall back to a name"
+        );
+    }
+}
+
+#[test]
+fn generic_struct_layout_uses_its_attached_base_declaration() {
+    let first = TypeId::new(10, 1, 0, 0);
+    let second = TypeId::new(20, 1, 0, 0);
+    let definition = |id| crate::registry::TypeDefinition {
+        id,
+        name: "Holder".into(),
+        size_bytes: 0,
+        align_bytes: 0,
+        fields: vec![],
+        by_value_dependencies: vec![],
+    };
+    let mut registry =
+        ImmutableGlobalRegistry::build_and_validate(vec![definition(first), definition(second)])
+            .unwrap();
+    let fields = |extra| crate::registry::StructFields {
+        generics: vec!["T".into()],
+        fields: if extra {
+            vec![
+                ("value".into(), Type::Generic("T".into(), None)),
+                ("extra".into(), Type::Scalar(ElementType::I64)),
+            ]
+        } else {
+            vec![("value".into(), Type::Generic("T".into(), None))]
+        },
+    };
+    registry.structs.insert(first, fields(false));
+    registry.structs.insert(second, fields(true));
+    let mut lowerer = Lowerer::new(&registry);
+    let args = [Type::Scalar(ElementType::I32)];
+    let first_layout = lowerer
+        .struct_instance_layout_of(&Type::Struct("Holder".into(), Some(first)), &args)
+        .expect("first declaration layout");
+    let second_layout = lowerer
+        .struct_instance_layout_of(&Type::Struct("Holder".into(), Some(second)), &args)
+        .expect("second declaration layout");
+    assert_ne!(
+        first_layout, second_layout,
+        "different base declarations use different layout IDs"
+    );
+    assert_eq!(
+        lowerer.generated_layout(first_layout).unwrap().size_bytes,
+        4,
+        "first declaration supplies its fields"
+    );
+    assert_eq!(
+        lowerer.generated_layout(second_layout).unwrap().size_bytes,
+        16,
+        "second declaration supplies its fields"
+    );
+    assert!(
+        lowerer.struct_instance_layout_of("Holder", &args).is_none(),
+        "ambiguous base names must not choose a declaration"
+    );
+}
+
+#[test]
+fn enum_layouts_canonicalize_nominal_spellings() {
+    let (ok, worker) = lower_with_registry(
+        "struct Node { value: i32 } enum Opt<T> { Some(T), None } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let node = worker
+        .global
+        .registry
+        .resolve_unique_nominal(&"Node".into())
+        .unwrap();
+    let record = |inner| {
+        let mut lowerer = Lowerer::new(&worker.global.registry);
+        lowerer
+            .enum_instance_layout_of("Opt", &[Type::Pointer(Box::new(inner), None, false)])
+            .unwrap();
+        lowerer.agg_layouts.remove(0)
+    };
+    let expected = record(Type::Struct("Node".into(), Some(node)));
+    for ty in [
+        Type::Struct("Node".into(), None),
+        Type::Enum("module::Node".into(), Some(node)),
+        Type::Struct("void".into(), Some(node)),
+    ] {
+        assert_eq!(
+            record(ty),
+            expected,
+            "nominal declaration spellings do not change retained metadata"
+        );
+    }
+}
+
+#[test]
+fn enum_layouts_erase_local_borrow_regions() {
+    let (ok, worker) = lower_with_registry(
+        "struct Node { value: i32 } enum Opt<T> { Some(T), None } fn inspect() -> void {}",
+        "inspect",
+    );
+    assert!(ok);
+    let node = worker
+        .global
+        .registry
+        .resolve_unique_nominal(&"Node".into())
+        .unwrap();
+    let borrowed = |region_id| Type::Borrow {
+        inner: Box::new(Type::Struct("Node".into(), Some(node))),
+        mem_space: None,
+        is_mut: false,
+        region_id,
+    };
+    let record = |ty| {
+        let mut lowerer = Lowerer::new(&worker.global.registry);
+        lowerer
+            .enum_instance_layout_of("Opt", &[ty])
+            .expect("borrowed enum layout");
+        lowerer.agg_layouts.remove(0)
+    };
+    let first = record(borrowed(17));
+    let second = record(borrowed(41));
+    assert_eq!(
+        first.type_id, second.type_id,
+        "local borrow regions do not change aggregate identity"
+    );
+    assert_eq!(
+        first, second,
+        "local borrow regions do not change retained layout metadata"
+    );
+    let mut mutable = borrowed(17);
+    if let Type::Borrow { is_mut, .. } = &mut mutable {
+        *is_mut = true;
+    }
+    for (label, ty) in [
+        ("borrow mutability", mutable),
+        (
+            "borrow memory",
+            Type::Borrow {
+                inner: Box::new(Type::Struct("Node".into(), Some(node))),
+                mem_space: Some(crate::syntax::MemorySpace::GpuHbm),
+                is_mut: false,
+                region_id: 17,
+            },
+        ),
+        (
+            "reference kind",
+            Type::Ref(
+                Box::new(Type::Struct("Node".into(), Some(node))),
+                crate::syntax::MemorySpace::CPUDRAM,
+            ),
+        ),
+        (
+            "raw pointer kind",
+            Type::Pointer(
+                Box::new(Type::Struct("Node".into(), Some(node))),
+                None,
+                false,
+            ),
+        ),
+    ] {
+        assert_ne!(
+            first.type_id,
+            record(ty).type_id,
+            "{label} retains a different identity"
+        );
+    }
+    let pointer = |mutable| {
+        Type::Pointer(
+            Box::new(Type::Struct("Node".into(), Some(node))),
+            None,
+            mutable,
+        )
+    };
+    assert_ne!(
+        record(pointer(false)).type_id,
+        record(pointer(true)).type_id,
+        "raw pointer permissions retain different identities"
     );
 }
 
@@ -381,6 +649,12 @@ fn aggregate_identity_preserves_tensor_placement() {
     ] {
         let id = |ty| identity("Holder", std::slice::from_ref(ty));
         assert_ne!(id(&host), id(&gpu), "{name} distinguishes tensor memories");
+        let explicit_host = pointer(Some(Placement::at(MemorySpace::CPUDRAM)));
+        assert_ne!(
+            id(&host),
+            id(&explicit_host),
+            "{name} retains explicit placement for the calling convention"
+        );
         assert_eq!(
             id(&gpu),
             id(&same_gpu),
@@ -622,7 +896,12 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
         "inspect",
     );
     assert!(did, "the function with an enum parameter must lower");
-    let gid = enum_instance_gid("Number", &[Type::Scalar(ElementType::I8)]).unwrap();
+    let gid = super::enum_instance_gid(
+        "Number",
+        &[Type::Scalar(ElementType::I8)],
+        worker.global.registry.aggregate_identities(),
+    )
+    .unwrap();
     let layout = worker
         .local_agg_layouts
         .iter()
@@ -690,7 +969,15 @@ fn generated_enum_layout_keeps_each_variants_pointer_target() {
     let layout = worker
         .local_agg_layouts
         .iter()
-        .find(|l| l.type_id == enum_instance_gid("Address", &[]).unwrap())
+        .find(|l| {
+            l.type_id
+                == super::enum_instance_gid(
+                    "Address",
+                    &[],
+                    worker.global.registry.aggregate_identities(),
+                )
+                .unwrap()
+        })
         .expect("the worker contains the Address layout");
     let payload = |name: &str, gid| crate::layout::GeneratedPayloadLayout {
         ty: Type::Pointer(Box::new(Type::Struct(name.into(), Some(gid))), None, false),

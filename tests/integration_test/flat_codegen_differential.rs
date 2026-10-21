@@ -1608,6 +1608,28 @@ fn enum_variants_with_different_structs_run_in_parallel() {
 }
 
 #[test]
+fn enum_borrows_from_separate_functions_run() {
+    assert_generated_aggregate_runs(
+        "enum_borrows_from_separate_functions.vx",
+        &["11", "23"],
+        None,
+    );
+}
+
+#[test]
+fn enum_borrows_from_separate_functions_run_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_generated_aggregate_runs(
+        "enum_borrows_from_separate_functions.vx",
+        &["11", "23"],
+        Some(2),
+    );
+}
+
+#[test]
 fn enum_tensor_pointers_construct_and_match() {
     assert_generated_aggregate_runs(
         "enum_tensor_pointers_construct_and_match.vx",
