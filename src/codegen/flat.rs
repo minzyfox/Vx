@@ -1264,12 +1264,17 @@ impl EmitCtx {
                 generated.insert(layout.type_id, layout);
             }
         }
+        let mut registry_storage_added = false;
         for (id, layout) in generated {
+            registry_storage_added |=
+                !self.aggs.contains_key(&id) && registry.layouts.contains_key(&id);
             self.aggs.insert(id, AggLayout::from_generated(layout));
         }
-        if !layouts.is_empty() {
-            // Complete nominal layouts must be visible before resolving function signatures.
+        // Names change only when a registry ID gains usable storage.
+        if registry_storage_added {
             self.agg_names = build_agg_names(registry, &self.aggs);
+        }
+        if !layouts.is_empty() {
             self.callees = build_callee_map(registry, &self.aggs, &self.agg_names, sched);
         }
         Ok(())
@@ -3397,6 +3402,144 @@ mod tests {
                     "pointer target metadata survives"
                 );
             },
+        );
+    }
+
+    #[rstest::rstest]
+    fn existing_registry_storage_keeps_the_name_map(
+        #[values(crate::config::Schedule::Sequential, crate::config::Schedule::Parallel)]
+        schedule: crate::config::Schedule,
+    ) {
+        let (registry, layout) = registry_overlap_fixture();
+        let mut ctx = EmitCtx::from_registry(&registry, schedule);
+        let names = ctx.agg_names.clone();
+        let name_buffer = ctx.agg_names.get_key_value("Holder").unwrap().0.as_ptr();
+        ctx.install_generated_layouts(&registry, &[layout], schedule)
+            .unwrap();
+        assert_eq!(
+            ctx.agg_names, names,
+            "existing registry storage keeps name resolution"
+        );
+        assert_eq!(
+            ctx.agg_names.get_key_value("Holder").unwrap().0.as_ptr(),
+            name_buffer,
+            "existing registry storage must not rebuild names"
+        );
+    }
+
+    #[rstest::rstest]
+    fn new_enum_storage_refreshes_callees_without_rebuilding_names(
+        #[values(crate::config::Schedule::Sequential, crate::config::Schedule::Parallel)]
+        schedule: crate::config::Schedule,
+    ) {
+        let source = "struct Item { value: i32 } enum Choice<T> { Some(T), None } \
+            fn make() -> Choice<i32> { return Choice<i32>::Some(7); } \
+            fn address(p: *const Choice<i32>) -> *const Choice<i32> { return p; }";
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = crate::parser::Parser::new(&tokens, source);
+        let mut modules = vec![parser.parse().unwrap()];
+        modules[0].module_path = "crate::names".into();
+        let symbols = crate::resolver::build_symbol_map(&modules);
+        modules[0].resolve_names(&symbols, &[]);
+        let registry = crate::pipeline::build_frozen_registry(&modules).unwrap();
+        let session = Arc::new(GlobalSession::with_registry(1, registry));
+        let registry = &session.registry;
+        let env_modules = modules.clone();
+        let env = crate::hir::GlobalAstEnv::build(&env_modules);
+        {
+            let mut scratch = LocalWorkerState::new(session.clone());
+            let mut checker = crate::hir::TypeChecker::new(&env, &mut scratch);
+            for function in &mut modules[0].functions {
+                checker.check_function(function);
+            }
+            assert_eq!(checker.errors.error_count(), 0, "enum program type-checks");
+        }
+        let make = modules[0]
+            .functions
+            .iter()
+            .find(|function| function.name.as_ref() == "make")
+            .unwrap();
+        let mut worker = LocalWorkerState::new(session.clone());
+        lower_function_to_hir(make, &mut worker).expect("enum construction lowers");
+        let enum_id = worker
+            .local_agg_layouts
+            .iter()
+            .find(|layout| layout.name == "Choice")
+            .unwrap()
+            .type_id;
+        let mut ctx = EmitCtx::from_registry(registry, schedule);
+        let names = ctx.agg_names.clone();
+        let name_buffer = ctx.agg_names.get_key_value("Item").unwrap().0.as_ptr();
+        let return_metadata = |ctx: &EmitCtx| {
+            let make = ctx
+                .callees
+                .values()
+                .find(|callee| callee.name == "make")
+                .unwrap();
+            let address = ctx
+                .callees
+                .values()
+                .find(|callee| callee.name == "address")
+                .unwrap();
+            (make.ret_agg, address.ret_pointee)
+        };
+        assert_eq!(
+            return_metadata(&ctx),
+            (None, None),
+            "callee metadata starts without enum storage"
+        );
+        ctx.install_generated_layouts(registry, &worker.local_agg_layouts, schedule)
+            .unwrap();
+        assert_eq!(
+            ctx.agg_names, names,
+            "new enum storage keeps nominal names unchanged"
+        );
+        assert_eq!(
+            ctx.agg_names.get_key_value("Item").unwrap().0.as_ptr(),
+            name_buffer,
+            "new enum storage must not rebuild names"
+        );
+        assert_eq!(
+            return_metadata(&ctx),
+            (Some(enum_id), Some(enum_id)),
+            "callee results and pointer targets must use new enum storage"
+        );
+    }
+
+    #[rstest::rstest]
+    fn newly_completed_registry_storage_can_make_a_name_ambiguous(
+        #[values(crate::config::Schedule::Sequential, crate::config::Schedule::Parallel)]
+        schedule: crate::config::Schedule,
+    ) {
+        let (mut registry, layout) = registry_overlap_fixture();
+        let definitions = registry
+            .layouts
+            .values()
+            .cloned()
+            .map(|mut definition| {
+                if definition.id == layout.type_id {
+                    definition.name = "Node".into();
+                    definition.align_bytes = 0;
+                    definition.fields.clear();
+                }
+                definition
+            })
+            .collect();
+        let mut rebuilt = ImmutableGlobalRegistry::build_and_validate(definitions).unwrap();
+        rebuilt.structs = std::mem::take(&mut registry.structs);
+        rebuilt.fn_sigs = std::mem::take(&mut registry.fn_sigs);
+        let registry = rebuilt;
+        let mut ctx = EmitCtx::from_registry(&registry, schedule);
+        assert!(
+            ctx.agg_names.contains_key("Node"),
+            "one usable Node layout starts with a name"
+        );
+        ctx.install_generated_layouts(&registry, &[layout], schedule)
+            .unwrap();
+        assert!(
+            !ctx.agg_names.contains_key("Node"),
+            "two usable Node layouts must remove the ambiguous name"
         );
     }
 
