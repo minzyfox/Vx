@@ -1528,6 +1528,15 @@ fn assert_enum_variants_with_different_structs_run(jobs: Option<usize>) {
 }
 
 fn assert_generated_aggregate_runs(fixture: &str, expected: &[&str], jobs: Option<usize>) {
+    assert_generated_aggregate_runs_at_optimization(fixture, expected, jobs, 0);
+}
+
+fn assert_generated_aggregate_runs_at_optimization(
+    fixture: &str,
+    expected: &[&str],
+    jobs: Option<usize>,
+    optimization: u8,
+) {
     let dir = tempfile::tempdir().expect("create fixture directory");
     let path = dir.path().join("enum_metadata.vx");
     let source = std::fs::read(
@@ -1538,7 +1547,11 @@ fn assert_generated_aggregate_runs(fixture: &str, expected: &[&str], jobs: Optio
     .expect("read fixture");
     std::fs::write(&path, source).expect("write fixture");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vxc"));
-    command.arg(&path).arg("--run").env("VX_FLAT_DBG", "1");
+    command
+        .arg(&path)
+        .arg("--run")
+        .arg(format!("-O{optimization}"))
+        .env("VX_FLAT_DBG", "1");
     if let Some(jobs) = jobs {
         command.arg("-j").arg(jobs.to_string());
     }
@@ -4120,4 +4133,18 @@ fn flat_lowers_iterator_with_payload_in_second_variant() {
         "enum Option<T> { None, Some(T) }",
     );
     assert_flat_exit(&format!("{source}\nfn main() -> i32 {{ let mut v = Vec<i32>::new(); v.push(10); v.push(20); v.push(30); let mut sum: i32 = 0; for value in v.iter() {{ sum = sum + value; }} return sum; }}"), 60);
+}
+
+#[rstest::rstest]
+#[case::normal(None, 0)]
+#[case::parallel(Some(2), 0)]
+#[case::optimized_normal(None, 2)]
+#[case::optimized_parallel(Some(2), 2)]
+fn enum_payloads_keep_size_and_alignment(#[case] jobs: Option<usize>, #[case] optimization: u8) {
+    assert_generated_aggregate_runs_at_optimization(
+        "enum_payloads_have_different_size_and_alignment.vx",
+        &["119", "120", "139", "140", "-1", "-2"],
+        jobs,
+        optimization,
+    );
 }

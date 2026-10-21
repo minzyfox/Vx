@@ -2707,6 +2707,128 @@ mod tests {
     use crate::session::{GlobalSession, LocalWorkerState};
     use std::sync::Arc;
 
+    // These LLVM target-layout functions are not included in mlir-sys's generated bindings.
+    unsafe extern "C" {
+        fn LLVMCreateTargetData(layout: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        fn LLVMDisposeTargetData(data: *mut std::ffi::c_void);
+        fn LLVMABISizeOfType(data: *mut std::ffi::c_void, ty: mlir_sys::LLVMTypeRef) -> u64;
+        fn LLVMABIAlignmentOfType(data: *mut std::ffi::c_void, ty: mlir_sys::LLVMTypeRef) -> u32;
+        fn LLVMOffsetOfElement(
+            data: *mut std::ffi::c_void,
+            ty: mlir_sys::LLVMTypeRef,
+            field: u32,
+        ) -> u64;
+    }
+
+    fn llvm_storage_layout(storage: &str, data_layout: &str) -> (u64, u64, Vec<u64>) {
+        let registry = melior::dialect::DialectRegistry::new();
+        melior::utility::register_all_dialects(&registry);
+        let context = melior::Context::new();
+        context.append_dialect_registry(&registry);
+        context.load_all_available_dialects();
+        melior::utility::register_all_llvm_translations(&context);
+        let text = format!("module {{ llvm.func @inspect({storage}) }}");
+        let module = melior::ir::Module::parse(&context, &text).expect("storage type parses");
+        let data_layout = std::ffi::CString::new(data_layout).unwrap();
+        // SAFETY: the parsed module owns valid types. LLVM objects remain live until all queries finish.
+        unsafe {
+            let llvm_context = mlir_sys::LLVMContextCreate();
+            let llvm_module =
+                mlir_sys::mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_context);
+            assert!(!llvm_module.is_null(), "storage translates to LLVM");
+            let function = mlir_sys::LLVMGetNamedFunction(llvm_module, c"inspect".as_ptr());
+            let ty = mlir_sys::LLVMTypeOf(mlir_sys::LLVMGetParam(function, 0));
+            let data = LLVMCreateTargetData(data_layout.as_ptr());
+            let offsets = (0..mlir_sys::LLVMCountStructElementTypes(ty))
+                .map(|i| LLVMOffsetOfElement(data, ty, i))
+                .collect();
+            let result = (
+                LLVMABISizeOfType(data, ty),
+                u64::from(LLVMABIAlignmentOfType(data, ty)),
+                offsets,
+            );
+            LLVMDisposeTargetData(data);
+            mlir_sys::LLVMDisposeModule(llvm_module);
+            mlir_sys::LLVMContextDispose(llvm_context);
+            result
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::byte(1, 1)]
+    #[case::two_byte_alignment(4, 2)]
+    #[case::four_byte_alignment(8, 4)]
+    #[case::eight_byte_alignment(16, 8)]
+    #[case::sixteen_byte_alignment(32, 16)]
+    fn enum_layout_storage_agrees_with_llvm(
+        #[case] size: u64,
+        #[case] align: u64,
+        #[values(
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
+            "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
+        )]
+        target: &str,
+    ) {
+        let slot = crate::layout::EnumPayloadSlot {
+            offset: 0,
+            size,
+            align,
+        };
+        let field = crate::layout::enum_slot_storage(&slot).expect("supported slot");
+        let outer = format!("!llvm.struct<(i32, {field}, i8)>");
+        let expected = crate::layout::enum_storage_layout(&[vec![(size, align), (1, 1)]]).unwrap();
+        assert_eq!(
+            llvm_storage_layout(&outer, target),
+            (
+                expected.size,
+                expected.align,
+                vec![0, expected.slots[0].offset, expected.slots[1].offset]
+            ),
+            "LLVM must provide the slot's size, alignment, and offsets for {size}/{align}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::larger_first("Big(Wide), Small(Aligned)")]
+    #[case::aligned_first("Small(Aligned), Big(Wide)")]
+    fn enum_layout_generated_storage_has_both_size_and_alignment(#[case] variants: &str) {
+        let source = format!("struct Wide {{ a: i32, b: i32, c: i32 }}
+            struct Aligned {{ value: i64 }}
+            enum Choice {{ {variants} }}
+            fn read(value: Choice) -> i64 {{ match value {{ Choice::Big(v) => {{ return (v.a + v.b + v.c) as i64; }}, Choice::Small(v) => {{ return v.value; }} }} }}
+            fn main() -> i32 {{ return read(Choice::Big(Wide {{ a: 1, b: 2, c: 3 }})) as i32; }}");
+        emit_module_with_layouts_and_verify(&source, |layouts| {
+            let layout = layouts
+                .iter()
+                .find(|l| l.name == "Choice")
+                .expect("Choice layout");
+            assert_eq!(
+                (
+                    layout.size_bytes,
+                    layout.align_bytes,
+                    layout.field_offsets(),
+                    layout.fields[1].layout.size
+                ),
+                (24, 8, vec![0, 8], 16),
+                "generated enum metadata must retain maximum size and maximum alignment"
+            );
+            assert_eq!(
+                llvm_storage_layout(&generated_storage_type(layout), "e-i64:64"),
+                (24, 8, vec![0, 8]),
+                "generated LLVM storage must supply the promised capacity and alignment"
+            );
+        });
+    }
+
+    #[test]
+    fn enum_layout_zero_sized_storage_agrees_with_llvm() {
+        assert_eq!(
+            llvm_storage_layout("!llvm.struct<(i32, !llvm.struct<()>, i8)>", "e-i64:64"),
+            (8, 4, vec![0, 4, 4]),
+            "zero-sized fields retain their index and share an offset"
+        );
+    }
+
     #[test]
     fn memref_lead_dim_answers_only_for_rank_one() {
         // The reduction loads a slice with a single-index `vector.load`, so anything but rank 1

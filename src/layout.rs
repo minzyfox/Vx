@@ -203,6 +203,83 @@ pub struct TypeLayout {
     pub fields: Vec<FieldLayout>,
 }
 
+/// Storage requirements for one shared enum payload position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumPayloadSlot {
+    pub offset: u64,
+    pub size: u64,
+    pub align: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumStorageLayout {
+    pub size: u64,
+    pub align: u64,
+    pub slots: Vec<EnumPayloadSlot>,
+}
+
+/// Each position must fit every variant's value and satisfy every variant's alignment.
+pub fn enum_storage_layout(variants: &[Vec<(u64, u64)>]) -> Option<EnumStorageLayout> {
+    fn round(size: u64, align: u64) -> Option<u64> {
+        if !align.is_power_of_two() {
+            return None;
+        }
+        Some(size.checked_add(align - 1)? & !(align - 1))
+    }
+    let mut result = EnumStorageLayout {
+        size: 4,
+        align: 4,
+        slots: Vec::new(),
+    };
+    for field in 0..variants.iter().map(Vec::len).max().unwrap_or(0) {
+        let (mut size, mut align) = (0, 1);
+        for variant in variants {
+            if let Some(&(s, a)) = variant.get(field) {
+                if !a.is_power_of_two() {
+                    return None;
+                }
+                size = size.max(s);
+                align = align.max(a);
+            }
+        }
+        let size = round(size, align)?;
+        let offset = round(result.size, align)?;
+        result.size = offset.checked_add(size)?;
+        result.align = result.align.max(align);
+        result.slots.push(EnumPayloadSlot {
+            offset,
+            size,
+            align,
+        });
+    }
+    result.size = round(result.size, result.align)?;
+    usize::try_from(result.size).ok()?;
+    Some(result)
+}
+
+/// One physical field supplies both the slot's alignment and its padded capacity.
+/// Integer storage preserves bits during whole-enum copies.
+pub fn enum_slot_storage(slot: &EnumPayloadSlot) -> Option<String> {
+    let anchor = match slot.align {
+        1 => "i8",
+        2 => "i16",
+        4 => "i32",
+        8 => "i64",
+        16 => "vector<2xi64>",
+        _ => return None,
+    };
+    if slot.size == 0 || !slot.size.is_multiple_of(slot.align) {
+        return None;
+    }
+    if slot.size == slot.align {
+        return Some(anchor.into());
+    }
+    let tail = slot.size.checked_sub(slot.align)?;
+    Some(format!(
+        "!llvm.struct<({anchor}, !llvm.array<{tail} x i8>)>"
+    ))
+}
+
 /// Round `n` up to the next multiple of `align` (a power of two, `>= 1`).
 pub fn align_up(n: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
@@ -444,6 +521,88 @@ impl<'a> LayoutComputer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::size_and_alignment(vec![vec![(12, 4)], vec![(8, 8)]], (24, 8, vec![(8, 16, 8)]))]
+    #[case::reversed(vec![vec![(8, 8)], vec![(12, 4)]], (24, 8, vec![(8, 16, 8)]))]
+    #[case::later_position(vec![vec![(1, 1), (12, 4)], vec![(2, 2), (8, 8)]], (24, 8, vec![(4, 2, 2), (8, 16, 8)]))]
+    #[case::missing_position(vec![vec![(1, 1), (4, 4)], vec![]], (12, 4, vec![(4, 1, 1), (8, 4, 4)]))]
+    #[case::empty(vec![vec![], vec![]], (4, 4, vec![]))]
+    #[case::zero_sized(vec![vec![(0, 1), (1, 1)]], (8, 4, vec![(4, 0, 1), (4, 1, 1)]))]
+    #[case::sixteen_byte_alignment(vec![vec![(17, 1)], vec![(16, 16)]], (48, 16, vec![(16, 32, 16)]))]
+    fn enum_layout_slot_requirements(
+        #[case] variants: Vec<Vec<(u64, u64)>>,
+        #[case] expected: (u64, u64, Vec<(u64, u64, u64)>),
+    ) {
+        let layout = enum_storage_layout(&variants).expect("valid enum requirements");
+        assert_eq!(
+            (
+                layout.size,
+                layout.align,
+                layout
+                    .slots
+                    .iter()
+                    .map(|s| (s.offset, s.size, s.align))
+                    .collect::<Vec<_>>()
+            ),
+            expected,
+            "enum storage must satisfy every payload's size and alignment"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::zero_alignment(vec![vec![(1, 0)]])]
+    #[case::invalid_alignment(vec![vec![(1, 3)]])]
+    #[case::slot_rounding_overflow(vec![vec![(u64::MAX, 8)]])]
+    #[case::end_overflow(vec![vec![(u64::MAX - 3, 4)]])]
+    #[case::tail_rounding_overflow(vec![vec![(u64::MAX - 4, 1)]])]
+    fn enum_layout_invalid_requirements_decline(#[case] variants: Vec<Vec<(u64, u64)>>) {
+        assert!(
+            enum_storage_layout(&variants).is_none(),
+            "invalid or overflowing enum requirements must decline"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::zero_alignment(8, 0)]
+    #[case::invalid_alignment(9, 3)]
+    #[case::unverified_alignment(64, 32)]
+    #[case::zero_capacity(0, 1)]
+    #[case::partial_alignment(12, 8)]
+    #[case::too_small(4, 8)]
+    fn enum_layout_invalid_storage_declines(#[case] size: u64, #[case] align: u64) {
+        assert!(
+            enum_slot_storage(&EnumPayloadSlot {
+                offset: 0,
+                size,
+                align
+            })
+            .is_none(),
+            "an invalid or unverified physical slot must decline"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn enum_layout_matches_an_independent_byte_oracle(variants in proptest::collection::vec(proptest::collection::vec((0u64..64, 0u32..5), 0..5), 0..5)) {
+            let variants: Vec<Vec<_>> = variants.into_iter().map(|v| v.into_iter().map(|(s, power)| (s, 1u64 << power)).collect()).collect();
+            let mut end = 4;
+            let mut alignment = 4;
+            let mut slots = Vec::new();
+            for i in 0..variants.iter().map(Vec::len).max().unwrap_or(0) {
+                let present: Vec<_> = variants.iter().filter_map(|v| v.get(i)).collect();
+                let align = present.iter().map(|p| p.1).max().unwrap();
+                let mut size = present.iter().map(|p| p.0).max().unwrap();
+                while size % align != 0 { size += 1; }
+                while end % align != 0 { end += 1; }
+                slots.push(EnumPayloadSlot { offset: end, size, align });
+                end += size;
+                alignment = alignment.max(align);
+            }
+            while end % alignment != 0 { end += 1; }
+            proptest::prop_assert_eq!(enum_storage_layout(&variants), Some(EnumStorageLayout { size: end, align: alignment, slots }));
+        }
+    }
 
     fn comparison_record() -> (GeneratedAggregateLayout, identity::AggregateIdentities) {
         let node = TypeId::new(10, 1, 0, 0);

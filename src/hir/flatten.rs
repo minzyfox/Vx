@@ -3717,33 +3717,26 @@ impl<'r> Lowerer<'r> {
         for (g, a) in data.generics.iter().zip(args) {
             mapping.insert(g.clone(), a.clone());
         }
-        // One payload slot per position, wide enough for whichever variant needs the most
-        // room. Taking the first variant's types instead gave `Result<T, E>` an `Err` slot
-        // shaped like `Ok` (Vx#570): the store then wrote the wrong width, or the right
-        // width under the wrong name, and the emitted MLIR did not parse.
-        //
-        // Variants may disagree about the type at a position as well as the width, so the
-        // slot is a place to put bits rather than a typed field. The store and the load
-        // each name the type they are actually moving.
-        let arity = data.variants.iter().map(|(_, p)| p.len()).max()?;
-        let mut payload: Vec<Type> = Vec::with_capacity(arity);
-        for i in 0..arity {
-            let mut widest: Option<(u64, u64, Type)> = None;
-            for (_, p) in &data.variants {
-                let Some(t) = p.get(i) else { continue };
-                let t = t.substitute(&mapping);
-                // A missing payload can be skipped; an unsupported one invalidates the layout.
-                let (sz, al, _) = self.payload_field(&t)?;
-                let better = match &widest {
-                    None => true,
-                    Some((bsz, bal, _)) => (sz, al) > (*bsz, *bal),
-                };
-                if better {
-                    widest = Some((sz, al, t));
-                }
+        let mut variants = Vec::new();
+        for (_, types) in &data.variants {
+            let mut payloads = Vec::new();
+            for ty in types {
+                let ty = ty.substitute(&mapping);
+                let (size, align, mlir) = self.payload_field(&ty)?;
+                payloads.push((size, align, ty, mlir));
             }
-            payload.push(widest?.2);
+            variants.push(payloads);
         }
+        let requirements: Vec<_> = variants
+            .iter()
+            .map(|payloads| {
+                payloads
+                    .iter()
+                    .map(|(size, align, _, _)| (*size, *align))
+                    .collect()
+            })
+            .collect();
+        let storage = crate::layout::enum_storage_layout(&requirements)?;
         let mut fields = vec![crate::layout::GeneratedFieldLayout {
             layout: crate::layout::FieldLayout {
                 name: "tag".into(),
@@ -3755,44 +3748,53 @@ impl<'r> Lowerer<'r> {
             aggregate_id: None,
             pointer_target_id: None,
         }];
-        let mut align = 4u64;
-        let mut off = 4u64;
-        for pt in &payload {
-            let (sz, al, mlir) = self.payload_field(pt)?;
-            off = crate::layout::align_up(off as usize, al as usize) as u64;
-            // A payload slot holds bits, so it is declared as an integer of the right
-            // width rather than as whichever variant's type happened to be widest. The
-            // struct is loaded and passed whole, and a float field does not carry integer
-            // bits through that: 7 stored as an `i32` and copied through an `f32` field is
-            // a denormal, which the copy is free to flush to zero (Vx#570). A pointer
-            // keeps its own type, which is what carries it.
-            let metadata = self.payload_metadata(pt.clone())?;
-            let kind = match &metadata.ty {
-                Type::Scalar(e) => FieldTy::Scalar(e.clone()),
-                _ => metadata
-                    .aggregate_id
-                    .map(FieldTy::Nominal)
-                    .unwrap_or_else(|| {
-                        if mlir == "i32" {
-                            FieldTy::Scalar(ElementType::I32)
-                        } else {
-                            FieldTy::Opaque
-                        }
-                    }),
-            };
+        for (index, slot) in storage.slots.iter().enumerate() {
+            // Preserve existing storage when one payload supplies both capacity and alignment.
+            let representative = variants
+                .iter()
+                .filter_map(|v| v.get(index))
+                .find(|(size, align, _, _)| *size == slot.size && *align == slot.align);
+            let (mlir, kind, aggregate_id, pointer_target_id) =
+                if let Some((_, _, ty, mlir)) = representative {
+                    let metadata = self.payload_metadata(ty.clone())?;
+                    let kind = match &metadata.ty {
+                        Type::Scalar(e) => FieldTy::Scalar(e.clone()),
+                        _ => metadata
+                            .aggregate_id
+                            .map(FieldTy::Nominal)
+                            .unwrap_or_else(|| {
+                                if mlir == "i32" {
+                                    FieldTy::Scalar(ElementType::I32)
+                                } else {
+                                    FieldTy::Opaque
+                                }
+                            }),
+                    };
+                    (
+                        mlir.clone(),
+                        kind,
+                        metadata.aggregate_id,
+                        metadata.pointer_target_id,
+                    )
+                } else {
+                    (
+                        crate::layout::enum_slot_storage(slot)?,
+                        FieldTy::Opaque,
+                        None,
+                        None,
+                    )
+                };
             fields.push(crate::layout::GeneratedFieldLayout {
                 layout: crate::layout::FieldLayout {
-                    name: format!("payload_{}", fields.len() - 1).into(),
-                    offset: off as usize,
-                    size: sz as usize,
+                    name: format!("payload_{index}").into(),
+                    offset: usize::try_from(slot.offset).ok()?,
+                    size: usize::try_from(slot.size).ok()?,
                     ty: kind,
                 },
                 mlir_type: mlir,
-                aggregate_id: metadata.aggregate_id,
-                pointer_target_id: metadata.pointer_target_id,
+                aggregate_id,
+                pointer_target_id,
             });
-            off += sz;
-            align = align.max(al);
         }
         if !self.agg_layout_indices.contains_key(&gid) {
             let variant_payloads = data
@@ -3808,8 +3810,8 @@ impl<'r> Lowerer<'r> {
             self.record_generated_layout(crate::layout::GeneratedAggregateLayout {
                 type_id: gid,
                 name: base.to_string(),
-                size_bytes: crate::layout::align_up(off as usize, align as usize) as u64,
-                align_bytes: align,
+                size_bytes: storage.size,
+                align_bytes: storage.align,
                 fields,
                 variant_payloads,
             });
