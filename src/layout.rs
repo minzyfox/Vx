@@ -35,47 +35,32 @@ pub struct GeneratedAggregateLayout {
     pub name: String,
     pub size_bytes: u64,
     pub align_bytes: u64,
-    pub logical_fields: Vec<GeneratedFieldLayout>,
-    pub storage_fields: Vec<GeneratedStorageField>,
+    pub fields: Vec<GeneratedFieldLayout>,
     /// Actual payload types and metadata in declaration order for each enum variant.
     /// Struct layouts have no variants.
     pub variant_payloads: Vec<Vec<GeneratedPayloadLayout>>,
 }
 
-/// One logical field and its physical storage index.
+/// One generated field, in LLVM struct field order.
 /// Enum fields describe shared storage slots. Actual values belong to `variant_payloads`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratedFieldLayout {
     pub layout: FieldLayout,
-    pub storage_index: usize,
+    pub mlir_type: String,
     pub aggregate_id: Option<TypeId>,
     pub pointer_target_id: Option<TypeId>,
 }
 
-/// One physical field in the generated LLVM struct, including explicit padding when needed.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GeneratedStorageField {
-    pub mlir_type: String,
-    pub is_padding: bool,
-}
-
 impl GeneratedAggregateLayout {
-    pub fn logical_offsets(&self) -> Vec<u64> {
-        self.logical_fields
-            .iter()
-            .map(|f| f.layout.offset as u64)
-            .collect()
+    pub fn field_offsets(&self) -> Vec<u64> {
+        self.fields.iter().map(|f| f.layout.offset as u64).collect()
     }
 
     pub fn type_layout(&self) -> TypeLayout {
         TypeLayout {
             size: self.size_bytes as usize,
             align: self.align_bytes as usize,
-            fields: self
-                .logical_fields
-                .iter()
-                .map(|f| f.layout.clone())
-                .collect(),
+            fields: self.fields.iter().map(|f| f.layout.clone()).collect(),
         }
     }
 
@@ -89,7 +74,7 @@ impl GeneratedAggregateLayout {
             align_bytes: layout.align,
             fields: layout.fields,
             by_value_dependencies: self
-                .logical_fields
+                .fields
                 .iter()
                 .filter_map(|f| match f.layout.ty {
                     FieldTy::Nominal(id) => Some(id),

@@ -39,6 +39,38 @@ use std::collections::HashMap;
 
 mod emit;
 
+/// An unsupported construct permits AST fallback. Conflicting layouts stop compilation.
+#[derive(Debug)]
+pub enum ModuleEmitError {
+    Declined(Decline),
+    ConflictingLayouts {
+        first: Box<crate::layout::GeneratedAggregateLayout>,
+        second: Box<crate::layout::GeneratedAggregateLayout>,
+    },
+}
+
+impl From<Decline> for ModuleEmitError {
+    fn from(why: Decline) -> Self {
+        Self::Declined(why)
+    }
+}
+
+impl std::fmt::Display for ModuleEmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Declined(why) => write!(f, "{why}"),
+            Self::ConflictingLayouts { first, second } => write!(
+                f,
+                "Internal compiler error: generated layouts disagree for type {:?}.\n\
+                 First layout:\n{first:#?}\nSecond layout:\n{second:#?}",
+                first.type_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModuleEmitError {}
+
 /// The MLIR type string for a scalar element type. Integers are signless (signedness lives in the
 /// op, e.g. `divsi`/`divui`); `bool` is `i1`.
 /// Format a float so MLIR can parse it back: Rust's `{:?}` prints `0.00001` as `1e-5`,
@@ -655,8 +687,6 @@ pub fn build_callee_map(
 pub struct AggLayout {
     pub struct_ty: String,
     pub offsets: Vec<u64>,
-    /// The physical storage index for each logical field.
-    pub field_indices: Vec<usize>,
     /// Each field's MLIR type (`"i32"`, `"!llvm.ptr"`, …) in declaration order, index-aligned with
     /// `offsets`. A field op loads/stores at `field_tys[field_idx]`.
     pub field_tys: Vec<String>,
@@ -675,57 +705,25 @@ pub struct AggLayout {
     pub variant_payloads: Vec<Vec<crate::layout::GeneratedPayloadLayout>>,
 }
 
-/// Convert physical storage descriptions to an LLVM struct type.
+/// Build an LLVM struct type from the generated fields in declaration order.
 pub(crate) fn generated_storage_type(layout: &crate::layout::GeneratedAggregateLayout) -> String {
-    let types: Vec<&str> = layout
-        .storage_fields
-        .iter()
-        .map(|f| f.mlir_type.as_str())
-        .collect();
+    let types: Vec<&str> = layout.fields.iter().map(|f| f.mlir_type.as_str()).collect();
     format!("!llvm.struct<({})>", types.join(", "))
 }
 
 impl AggLayout {
     /// Derive the emitter's storage view from the shared generated layout.
     fn from_generated(layout: &crate::layout::GeneratedAggregateLayout) -> Self {
-        let field_tys = layout
-            .logical_fields
-            .iter()
-            .map(|field| {
-                let storage = layout
-                    .storage_fields
-                    .get(field.storage_index)
-                    .expect("a logical field must have a physical storage field");
-                assert!(
-                    !storage.is_padding,
-                    "a logical field cannot use a padding field"
-                );
-                storage.mlir_type.clone()
-            })
-            .collect();
         Self {
             struct_ty: generated_storage_type(layout),
             offsets: layout
-                .logical_fields
+                .fields
                 .iter()
                 .map(|f| f.layout.offset as u64)
                 .collect(),
-            field_indices: layout
-                .logical_fields
-                .iter()
-                .map(|f| f.storage_index)
-                .collect(),
-            field_tys,
-            field_pointee: layout
-                .logical_fields
-                .iter()
-                .map(|f| f.pointer_target_id)
-                .collect(),
-            field_agg: layout
-                .logical_fields
-                .iter()
-                .map(|f| f.aggregate_id)
-                .collect(),
+            field_tys: layout.fields.iter().map(|f| f.mlir_type.clone()).collect(),
+            field_pointee: layout.fields.iter().map(|f| f.pointer_target_id).collect(),
+            field_agg: layout.fields.iter().map(|f| f.aggregate_id).collect(),
             variant_payloads: layout.variant_payloads.clone(),
         }
     }
@@ -771,7 +769,6 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
                 AggLayout {
                     struct_ty: "!llvm.struct<()>".to_string(),
                     offsets: Vec::new(),
-                    field_indices: Vec::new(),
                     field_tys: Vec::new(),
                     field_pointee: Vec::new(),
                     field_agg: Vec::new(),
@@ -862,7 +859,6 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
             *gid,
             AggLayout {
                 struct_ty: format!("!llvm.struct<({})>", field_tys.join(", ")),
-                field_indices: (0..offsets.len()).collect(),
                 offsets,
                 field_tys,
                 field_pointee,
@@ -1160,14 +1156,16 @@ impl EmitCtx {
         registry: &ImmutableGlobalRegistry,
         layouts: &[crate::layout::GeneratedAggregateLayout],
         sched: crate::config::Schedule,
-    ) {
+    ) -> Result<(), ModuleEmitError> {
         let mut generated = HashMap::new();
         for layout in layouts {
             if let Some(previous) = generated.insert(layout.type_id, layout) {
-                assert_eq!(
-                    previous, layout,
-                    "generated layouts for the same type must agree"
-                );
+                if previous != layout {
+                    return Err(ModuleEmitError::ConflictingLayouts {
+                        first: Box::new(previous.clone()),
+                        second: Box::new(layout.clone()),
+                    });
+                }
             } else {
                 self.aggs
                     .insert(layout.type_id, AggLayout::from_generated(layout));
@@ -1178,6 +1176,7 @@ impl EmitCtx {
             self.agg_names = build_agg_names(registry, &self.aggs);
             self.callees = build_callee_map(registry, &self.aggs, &self.agg_names, sched);
         }
+        Ok(())
     }
 
     /// Build the callee + struct-layout maps from the registry. The tensor map is *not* in the
@@ -1385,11 +1384,10 @@ fn mlir_block_error(text: &str, location: &str, message: &str) -> Option<String>
     None
 }
 
-/// Emit a whole module — every function as a concatenated bare `func.func` — or `None` if *any*
-/// function is outside the current subset (module-level keep-green atomicity: a partially lowered
-/// module is never emitted, so the AST path stays the oracle for the whole program). Callees + struct
-/// layouts resolve through the frozen registry; `tensor_types` is the concatenation of each function's
-/// lowerer side table (`LocalWorkerState::local_tensor_types`). Wrap the result in `module { … }`.
+/// Generate MLIR for all functions, wrapped in `module { … }`.
+/// Unsupported constructs permit AST fallback. Conflicting layouts stop compilation and report both records.
+/// Callees and declared layouts resolve through the frozen registry.
+/// `tensor_types` combines each function's `LocalWorkerState::local_tensor_types` table.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_module_mlir(
     funcs: &[(&Function, &[HirInstruction], &[TypeId])],
@@ -1404,7 +1402,7 @@ pub fn emit_module_mlir(
     local_devices: &[(i32, i32)],
     sched: crate::config::Schedule,
     describe_params: bool,
-) -> Lowered<String> {
+) -> Result<String, ModuleEmitError> {
     let setup = std::time::Instant::now();
     let mut ctx = EmitCtx::from_registry(registry, sched);
     ctx.describe_params = describe_params;
@@ -1431,7 +1429,7 @@ pub fn emit_module_mlir(
     }
     // Generated struct and enum instance layouts are local to the lowerer, outside the frozen registry.
     // Install their storage shapes so aggregate allocation and field access can find them.
-    ctx.install_generated_layouts(registry, agg_layouts, sched);
+    ctx.install_generated_layouts(registry, agg_layouts, sched)?;
     // Function GID → (param MLIR types, ret MLIR type), for a `FuncConst`'s `func.constant @name : sig`.
     // Built from the module's own functions (each `Function` carries its params); the target must be a
     // function whose whole signature is modelled (else the FuncConst declines at emit). (#242)
@@ -1599,7 +1597,7 @@ pub fn emit_module_mlir(
                         funcs[fi].0.name.as_ref()
                     );
                 }
-                return Err(why.clone());
+                return Err(why.clone().into());
             }
         };
         calls.append(fn_calls);
@@ -2686,6 +2684,28 @@ mod tests {
         src: &str,
         change_layouts: impl FnOnce(&mut Vec<crate::layout::GeneratedAggregateLayout>),
     ) -> String {
+        let mlir = emit_module_with_layouts(src, change_layouts).expect("emits flat module");
+
+        use melior::ir::operation::OperationLike;
+        let dialects = melior::dialect::DialectRegistry::new();
+        melior::utility::register_all_dialects(&dialects);
+        let context = melior::Context::new();
+        context.append_dialect_registry(&dialects);
+        context.load_all_available_dialects();
+        crate::codegen::register_vx_dialect(&context); // for `vx.transfer`
+        let module = melior::ir::Module::parse(&context, &mlir)
+            .unwrap_or_else(|| panic!("emitted MLIR failed to parse:\n{mlir}"));
+        assert!(
+            module.as_operation().verify(),
+            "emitted MLIR failed to verify:\n{mlir}"
+        );
+        mlir
+    }
+
+    fn emit_module_with_layouts(
+        src: &str,
+        change_layouts: impl FnOnce(&mut Vec<crate::layout::GeneratedAggregateLayout>),
+    ) -> Result<String, ModuleEmitError> {
         let mut lexer = crate::lexer::Lexer::new(src);
         let tokens = lexer.tokenize();
         let mut parser = crate::parser::Parser::new(&tokens, src);
@@ -2750,7 +2770,7 @@ mod tests {
             .iter()
             .map(|w| w.local_place_alias_stores.as_slice())
             .collect();
-        let mlir = emit_module_mlir(
+        emit_module_mlir(
             &funcs,
             &session.registry,
             &tensor_types,
@@ -2764,139 +2784,62 @@ mod tests {
             crate::config::Schedule::Parallel,
             false,
         )
-        .expect("emits flat module");
-
-        use melior::ir::operation::OperationLike;
-        let dialects = melior::dialect::DialectRegistry::new();
-        melior::utility::register_all_dialects(&dialects);
-        let context = melior::Context::new();
-        context.append_dialect_registry(&dialects);
-        context.load_all_available_dialects();
-        crate::codegen::register_vx_dialect(&context); // for `vx.transfer`
-        let module = melior::ir::Module::parse(&context, &mlir)
-            .unwrap_or_else(|| panic!("emitted MLIR failed to parse:\n{mlir}"));
-        assert!(
-            module.as_operation().verify(),
-            "emitted MLIR failed to verify:\n{mlir}"
-        );
-        mlir
-    }
-
-    fn add_explicit_padding(layouts: &mut Vec<crate::layout::GeneratedAggregateLayout>) {
-        for layout in layouts {
-            if layout.name == "Pair" {
-                layout.storage_fields.insert(
-                    1,
-                    crate::layout::GeneratedStorageField {
-                        mlir_type: "!llvm.array<3 x i8>".into(),
-                        is_padding: true,
-                    },
-                );
-                layout.logical_fields[1].storage_index = 2;
-            }
-        }
     }
 
     #[test]
-    fn generated_layout_views_separate_padding_from_logical_fields() {
-        let _ = emit_module_with_layouts_and_verify(
-            "struct Pair<T> { flag: i8, value: T }\n\
-             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return p.value; }",
-            |layouts| {
-                add_explicit_padding(layouts);
-                let layout = layouts
-                    .iter()
-                    .find(|l| l.name == "Pair")
-                    .expect("Pair layout exists");
-                let lowerer = layout.type_definition();
-                assert_eq!(
-                    (lowerer.size_bytes, lowerer.align_bytes, lowerer.fields),
-                    (
-                        8,
-                        4,
-                        vec![
-                            crate::layout::FieldLayout {
-                                name: "flag".into(),
-                                offset: 0,
-                                size: 1,
-                                ty: crate::layout::FieldTy::Scalar(ElementType::I8)
-                            },
-                            crate::layout::FieldLayout {
-                                name: "value".into(),
-                                offset: 4,
-                                size: 4,
-                                ty: crate::layout::FieldTy::Scalar(ElementType::I32)
-                            },
-                        ]
-                    ),
-                    "the lowerer view must contain only the two logical fields"
-                );
-                let emitter = AggLayout::from_generated(layout);
-                assert_eq!(
-                    (
-                        emitter.struct_ty,
-                        emitter.offsets,
-                        emitter.field_indices,
-                        emitter.field_tys
-                    ),
-                    (
-                        "!llvm.struct<(i8, !llvm.array<3 x i8>, i32)>".into(),
-                        vec![0, 4],
-                        vec![0, 2],
-                        vec!["i8".into(), "i32".into()]
-                    ),
-                    "the emitter view must keep padding and the explicit field mapping"
-                );
-            },
+    fn repeated_enum_layouts_compile() {
+        emit_module_with_layouts_and_verify(
+            "enum Value { Number(i64), Empty }\n\
+             fn main() -> i32 { let value = Value::Number(5); return 0; }",
+            |layouts| layouts.push(layouts[0].clone()),
         );
     }
 
     #[test]
-    fn generated_layout_field_store_uses_the_physical_field_index() {
-        let mlir = emit_module_with_layouts_and_verify(
-            "struct Pair<T> { flag: i8, value: T }\n\
-             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return 0; }",
-            add_explicit_padding,
+    fn conflicting_enum_layouts_return_both_records_without_panicking() {
+        let result = std::panic::catch_unwind(|| {
+            emit_module_with_layouts(
+                "struct Node { value: i64 }\n\
+                 enum Value { Number(i64), Pointer(*const Node) }\n\
+                 fn main() -> i32 { let value = Value::Number(5); return 0; }",
+                |layouts| {
+                    let mut conflicting = layouts
+                        .iter()
+                        .find(|layout| layout.name == "Value")
+                        .expect("the enum has a generated layout")
+                        .clone();
+                    // Keep the same storage and ID, but describe a different pointer target.
+                    conflicting.variant_payloads[1][0].ty = Type::Pointer(
+                        Box::new(Type::Struct("OtherNode".into(), None)),
+                        None,
+                        false,
+                    );
+                    layouts.push(conflicting);
+                },
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "conflicting layouts must return an error without panicking"
+        );
+        let error = result
+            .unwrap()
+            .expect_err("conflicting layouts stop code generation");
+        let ModuleEmitError::ConflictingLayouts { first, second } = &error else {
+            panic!("expected a layout conflict, got {error:?}");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Internal compiler error: generated layouts disagree"),
+            "the message must identify a compiler error: {message}"
         );
         assert!(
-            mlir.lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("llvm.store")),
-            "the value store must address physical field 2:\n{mlir}"
-        );
-    }
-
-    #[test]
-    fn generated_layout_field_load_uses_the_physical_field_index() {
-        let mlir = emit_module_with_layouts_and_verify(
-            "struct Pair<T> { flag: i8, value: T }\n\
-             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return p.value; }",
-            add_explicit_padding,
+            message.contains(&format!("First layout:\n{first:#?}")),
+            "the message must include the first complete layout: {message}"
         );
         assert!(
-            mlir.lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("llvm.load")),
-            "the value load must address physical field 2:\n{mlir}"
-        );
-    }
-
-    #[test]
-    fn generated_layout_field_address_uses_the_physical_field_index() {
-        let mlir = emit_module_with_layouts_and_verify(
-            "struct Pair<T> { flag: i8, value: T }\n\
-             fn read(value: &i32) -> i32 { return *value; }\n\
-             fn main() -> i32 { let p = Pair<i32> { flag: 1, value: 7 }; return read(&p.value); }",
-            add_explicit_padding,
-        );
-        assert!(
-            mlir.lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|lines| lines[0].contains("[0, 2]") && lines[1].contains("func.call @read")),
-            "the borrowed value must address physical field 2:\n{mlir}"
+            message.contains(&format!("Second layout:\n{second:#?}")),
+            "the message must include the second complete layout: {message}"
         );
     }
 
@@ -2913,7 +2856,7 @@ mod tests {
                     .find(|l| l.name == "Holder")
                     .expect("Holder layout");
                 let emitter = AggLayout::from_generated(layout);
-                let item = layout.logical_fields[0]
+                let item = layout.fields[0]
                     .aggregate_id
                     .expect("Item aggregate ID");
                 assert_eq!(
@@ -2956,15 +2899,11 @@ mod tests {
             name: def.name.clone(),
             size_bytes: 4,
             align_bytes: 4,
-            logical_fields: vec![crate::layout::GeneratedFieldLayout {
+            fields: vec![crate::layout::GeneratedFieldLayout {
                 layout: def.fields[0].clone(),
-                storage_index: 0,
+                mlir_type: "i32".into(),
                 aggregate_id: None,
                 pointer_target_id: None,
-            }],
-            storage_fields: vec![crate::layout::GeneratedStorageField {
-                mlir_type: "i32".into(),
-                is_padding: false,
             }],
             variant_payloads: vec![],
         };
@@ -2983,7 +2922,8 @@ mod tests {
             ctx.callees.values().all(|c| c.ret_agg.is_none()),
             "callee starts without a layout"
         );
-        ctx.install_generated_layouts(&registry, &[layout], crate::config::Schedule::Sequential);
+        ctx.install_generated_layouts(&registry, &[layout], crate::config::Schedule::Sequential)
+            .expect("the generated layout is consistent");
         assert_eq!(
             ctx.agg_names.get("Item"),
             Some(&def.id),
@@ -3036,9 +2976,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "generated layouts for the same type must agree")]
-    fn generated_layout_conflicting_duplicates_are_rejected() {
-        emit_module_with_layouts_and_verify(
+    fn conflicting_struct_alignment_returns_an_error() {
+        let result = emit_module_with_layouts(
             "struct Holder<T> { value: T }\n\
              fn main() -> i32 { let h = Holder<i32> { value: 7 }; return h.value; }",
             |layouts| {
@@ -3047,12 +2986,15 @@ mod tests {
                 layouts.push(conflict);
             },
         );
+        assert!(
+            matches!(&result, Err(ModuleEmitError::ConflictingLayouts { .. })),
+            "different alignments must return a layout conflict: {result:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "generated layouts for the same type must agree")]
-    fn generated_layout_conflicting_metadata_is_rejected() {
-        emit_module_with_layouts_and_verify(
+    fn conflicting_struct_pointer_targets_return_an_error() {
+        let result = emit_module_with_layouts(
             "struct Item { value: i32 }\n\
              struct Holder<T> { value: T, pointer: *const Item }\n\
              fn main() -> i32 { let target = Item { value: 9 }; \
@@ -3063,12 +3005,13 @@ mod tests {
                     .find(|l| l.name == "Holder")
                     .expect("Holder layout")
                     .clone();
-                assert!(conflict.logical_fields[1]
-                    .pointer_target_id
-                    .take()
-                    .is_some());
+                assert!(conflict.fields[1].pointer_target_id.take().is_some());
                 layouts.push(conflict);
             },
+        );
+        assert!(
+            matches!(&result, Err(ModuleEmitError::ConflictingLayouts { .. })),
+            "different pointer targets must return a layout conflict: {result:?}"
         );
     }
 

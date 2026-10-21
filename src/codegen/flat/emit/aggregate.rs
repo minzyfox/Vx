@@ -28,12 +28,7 @@ impl FnEmit<'_> {
             .iter()
             .position(|&o| o == ins.imm)
             .ok_or(crate::emitter_gap!())?;
-        let storage_idx = *agg
-            .field_indices
-            .get(field_idx)
-            .ok_or(crate::emitter_gap!())?;
-        // The field's declared MLIR type (a scalar element or `!llvm.ptr`), so a pointer field
-        // (`Vec`'s `data`) stores an `!llvm.ptr` value and a scalar field its element (#242).
+        // Tensor descriptors use the storage field's declared type.
         let fty = agg
             .field_tys
             .get(field_idx)
@@ -50,7 +45,7 @@ impl FnEmit<'_> {
             .clone();
         let p = format!("%p{idx}");
         self.body += &format!(
-            "  {p} = llvm.getelementptr {slot}[0, {storage_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
             agg.struct_ty
         );
         // A tensor value goes in as its descriptor. A rank the field does not have (a rank-0
@@ -88,10 +83,7 @@ impl FnEmit<'_> {
             .get(&idx)
             .map(|(own, sibs)| alias_store_attrs(*own, sibs))
             .unwrap_or_default();
-        // The value's own scalar type, not the slot's. They differ only for an enum payload,
-        // whose slot is sized for the widest variant and holds whichever one was built
-        // (Vx#570); a pointer is left to the declared type, which is what carries it.
-        // A struct stored into a payload slot sized for another variant is typed as itself too.
+        // Enum variants share storage but can store different types. Use the value's own type.
         let value_agg = self
             .agg_val_of
             .get(ins.operand2.0 as usize)
@@ -107,11 +99,15 @@ impl FnEmit<'_> {
             .cloned()
             .flatten()
             .is_some();
-        let store_ty = match self.etypes.get(ins.operand2.0 as usize).cloned().flatten() {
-            Some(e) if is_scalar_field(&fty) || (fty.starts_with("!llvm.struct") && !is_tensor) => {
-                crate::mlir_ty::mlir_scalar(&e).unwrap_or(&fty).to_string()
+        let store_ty = if self.is_pointer_value(ins.operand2.0 as usize)? {
+            "!llvm.ptr".to_string()
+        } else {
+            match self.etypes.get(ins.operand2.0 as usize).cloned().flatten() {
+                Some(e) if !is_tensor => crate::mlir_ty::mlir_scalar(&e)
+                    .ok_or(crate::emitter_gap!())?
+                    .to_string(),
+                _ => value_agg.unwrap_or_else(|| fty.clone()),
             }
-            _ => value_agg.unwrap_or_else(|| fty.clone()),
         };
         self.body += &format!("  llvm.store {val}, {p}{attrs} : {store_ty}, !llvm.ptr\n");
         Ok(())
@@ -131,10 +127,6 @@ impl FnEmit<'_> {
             .offsets
             .iter()
             .position(|&o| o == ins.imm)
-            .ok_or(crate::emitter_gap!())?;
-        let storage_idx = *agg
-            .field_indices
-            .get(field_idx)
             .ok_or(crate::emitter_gap!())?;
         // The field's declared MLIR type drives the load: a scalar field yields its element
         // (tracked in `etypes`), a pointer field (`Vec`'s `data`) an `!llvm.ptr` value
@@ -180,7 +172,7 @@ impl FnEmit<'_> {
         let p = format!("%p{idx}");
         let n = format!("%v{idx}");
         self.body += &format!(
-            "  {p} = llvm.getelementptr {slot}[0, {storage_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+            "  {p} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
             agg.struct_ty
         );
         // Read back at the type this instruction says it produces, for the same reason the
@@ -268,10 +260,6 @@ impl FnEmit<'_> {
             .iter()
             .position(|&o| o == ins.imm)
             .ok_or(crate::emitter_gap!())?;
-        let storage_idx = *agg
-            .field_indices
-            .get(field_idx)
-            .ok_or(crate::emitter_gap!())?;
         let field_gid = *self
             .types
             .get(ins.type_idx.0 as usize)
@@ -282,7 +270,7 @@ impl FnEmit<'_> {
             .ok_or(crate::emitter_gap!())?;
         let n = format!("%v{idx}");
         self.body += &format!(
-            "  {n} = llvm.getelementptr {slot}[0, {storage_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
+            "  {n} = llvm.getelementptr {slot}[0, {field_idx}] : (!llvm.ptr) -> !llvm.ptr, {}\n",
             agg.struct_ty
         );
         self.names[idx] = n;

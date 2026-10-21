@@ -100,7 +100,7 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
             name: "Holder".into(),
             size_bytes: 24,
             align_bytes: 8,
-            logical_fields: vec![
+            fields: vec![
                 crate::layout::GeneratedFieldLayout {
                     layout: crate::layout::FieldLayout {
                         name: "flag".into(),
@@ -108,7 +108,7 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
                         size: 1,
                         ty: FieldTy::Scalar(ElementType::I8)
                     },
-                    storage_index: 0,
+                    mlir_type: "i8".into(),
                     aggregate_id: None,
                     pointer_target_id: None,
                 },
@@ -119,7 +119,7 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
                         size: 8,
                         ty: FieldTy::Nominal(inner)
                     },
-                    storage_index: 1,
+                    mlir_type: "!llvm.struct<(i64)>".into(),
                     aggregate_id: Some(inner),
                     pointer_target_id: None,
                 },
@@ -130,18 +130,11 @@ fn generated_struct_layout_records_nested_values_and_pointer_targets() {
                         size: 8,
                         ty: FieldTy::Opaque
                     },
-                    storage_index: 2,
+                    mlir_type: "!llvm.ptr".into(),
                     aggregate_id: None,
                     pointer_target_id: Some(inner),
                 },
             ],
-            storage_fields: ["i8", "!llvm.struct<(i64)>", "!llvm.ptr"]
-                .into_iter()
-                .map(|ty| crate::layout::GeneratedStorageField {
-                    mlir_type: ty.into(),
-                    is_padding: false
-                })
-                .collect(),
             variant_payloads: vec![],
         },
         "the worker must retain the struct's complete generated layout"
@@ -224,9 +217,7 @@ fn aggregate_identity_keeps_nested_field_layouts_registered() {
         .iter()
         .find(|layout| layout.name == "Holder")
         .expect("Holder layout");
-    let inner = holder.logical_fields[0]
-        .aggregate_id
-        .expect("nested struct ID");
+    let inner = holder.fields[0].aggregate_id.expect("nested struct ID");
     assert!(
         worker
             .local_agg_layouts
@@ -437,7 +428,7 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
             name: "Number".into(),
             size_bytes: 16,
             align_bytes: 8,
-            logical_fields: vec![
+            fields: vec![
                 crate::layout::GeneratedFieldLayout {
                     layout: crate::layout::FieldLayout {
                         name: "tag".into(),
@@ -445,7 +436,7 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
                         size: 4,
                         ty: FieldTy::Scalar(ElementType::I32)
                     },
-                    storage_index: 0,
+                    mlir_type: "i32".into(),
                     aggregate_id: None,
                     pointer_target_id: None,
                 },
@@ -456,18 +447,11 @@ fn generated_enum_layout_keeps_variant_types_separate_from_storage() {
                         size: 8,
                         ty: FieldTy::Scalar(ElementType::U64)
                     },
-                    storage_index: 1,
+                    mlir_type: "i64".into(),
                     aggregate_id: None,
                     pointer_target_id: None,
                 },
             ],
-            storage_fields: ["i32", "i64"]
-                .into_iter()
-                .map(|ty| crate::layout::GeneratedStorageField {
-                    mlir_type: ty.into(),
-                    is_padding: false
-                })
-                .collect(),
             variant_payloads: vec![
                 vec![payload(ElementType::I8)],
                 vec![payload(ElementType::U64)],

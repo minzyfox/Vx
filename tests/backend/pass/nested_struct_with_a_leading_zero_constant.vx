@@ -5,8 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// Loading a nested struct and passing it by value must keep the same layout.
-// The constant argument 03 has the same value as 3.
+// Read a nested struct by value with the constant argument written as 03 throughout.
+// Compilation must use flat code generation.
 // REQUIRES: flat-codegen
 // EXPECT: 17
 

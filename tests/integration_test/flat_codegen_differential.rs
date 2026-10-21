@@ -1519,9 +1519,9 @@ fn parallel_driver_falls_back_for_an_unsupported_enum_layout() {
     assert_enum_layout_falls_back(Some(2));
 }
 
-fn assert_enum_variant_metadata_runs(jobs: Option<usize>) {
+fn assert_enum_variants_with_different_structs_run(jobs: Option<usize>) {
     assert_generated_aggregate_runs(
-        "enum_variants_keep_their_own_field_metadata.vx",
+        "enum_variants_with_different_structs.vx",
         &["17", "25", "17", "25", "29"],
         jobs,
     );
@@ -1571,27 +1571,49 @@ fn assert_generated_aggregate_runs(fixture: &str, expected: &[&str], jobs: Optio
     }
 }
 
-#[test]
-fn enum_variant_metadata_survives_normal_compilation() {
-    assert_enum_variant_metadata_runs(None);
+#[rstest::rstest]
+#[case::i64_before_pointer("enum_with_integer_and_pointer_variants.vx")]
+#[case::pointer_before_i64("enum_with_pointer_before_i64.vx")]
+#[case::i32_before_pointer("enum_with_i32_before_pointer.vx")]
+#[case::pointer_before_i32("enum_with_pointer_before_i32.vx")]
+fn enum_with_integer_and_pointer_variants_runs(#[case] fixture: &str) {
+    assert_generated_aggregate_runs(fixture, &["5", "7"], None);
 }
 
-#[test]
-fn enum_variant_metadata_survives_parallel_compilation() {
+#[rstest::rstest]
+#[case::i64_before_pointer("enum_with_integer_and_pointer_variants.vx")]
+#[case::pointer_before_i64("enum_with_pointer_before_i64.vx")]
+#[case::i32_before_pointer("enum_with_i32_before_pointer.vx")]
+#[case::pointer_before_i32("enum_with_pointer_before_i32.vx")]
+fn enum_with_integer_and_pointer_variants_runs_in_parallel(#[case] fixture: &str) {
     if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
         eprintln!("two-worker compilation requires leaving two CPU cores idle");
         return;
     }
-    assert_enum_variant_metadata_runs(Some(2));
+    assert_generated_aggregate_runs(fixture, &["5", "7"], Some(2));
 }
 
 #[test]
-fn aggregate_identity_keeps_tensor_placements_separate() {
+fn enum_variants_with_different_structs_run() {
+    assert_enum_variants_with_different_structs_run(None);
+}
+
+#[test]
+fn enum_variants_with_different_structs_run_in_parallel() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_enum_variants_with_different_structs_run(Some(2));
+}
+
+#[test]
+fn enum_parameters_with_host_and_gpu_tensor_pointers_compile() {
     assert_generated_aggregate_runs("enum_pointer_tensor_placements.vx", &["3"], None);
 }
 
 #[test]
-fn aggregate_identity_keeps_tensor_placements_separate_in_parallel() {
+fn enum_parameters_with_host_and_gpu_tensor_pointers_compile_in_parallel() {
     if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
         eprintln!("two-worker compilation requires leaving two CPU cores idle");
         return;
@@ -1600,7 +1622,7 @@ fn aggregate_identity_keeps_tensor_placements_separate_in_parallel() {
 }
 
 #[test]
-fn aggregate_identity_preserves_a_nested_struct_with_a_leading_zero_constant() {
+fn nested_struct_with_a_leading_zero_constant_runs() {
     assert_generated_aggregate_runs(
         "nested_struct_with_a_leading_zero_constant.vx",
         &["17"],
@@ -1609,7 +1631,7 @@ fn aggregate_identity_preserves_a_nested_struct_with_a_leading_zero_constant() {
 }
 
 #[test]
-fn aggregate_identity_preserves_a_nested_struct_with_a_leading_zero_constant_in_parallel() {
+fn nested_struct_with_a_leading_zero_constant_runs_in_parallel() {
     if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
         eprintln!("two-worker compilation requires leaving two CPU cores idle");
         return;

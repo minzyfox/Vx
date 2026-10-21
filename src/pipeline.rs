@@ -33,6 +33,7 @@ pub enum PipelineError {
     IO(String),
     Parse(String),
     Semantic(String),
+    Codegen(String),
     /// Checking found `count` errors, which it has printed. `in_declarations` says the check of
     /// the whole program's declarations found them, before any body was checked. The driver
     /// ends a failed compile with the same line whether it ran in parallel or not.
@@ -48,6 +49,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::IO(msg) => write!(f, "IO Error: {}", msg),
             PipelineError::Parse(msg) => write!(f, "Parse Error: {}", msg),
             PipelineError::Semantic(msg) => write!(f, "Semantic Error: {}", msg),
+            PipelineError::Codegen(msg) => write!(f, "{msg}"),
             PipelineError::Failed { count, .. } => {
                 write!(f, "Semantic check failed: {count} error(s) emitted")
             }
@@ -398,7 +400,7 @@ pub fn compile_modules_mlir_in(
             merged_arenas,
             sched,
         )
-    });
+    })?;
     // Only now, once codegen has answered, are the warnings this frontend found printed. A
     // decline means the driver recompiles the program through the sequential path, which finds
     // them again -- printing here as well would show every one of them twice.
@@ -1945,7 +1947,7 @@ fn codegen_mlir_phase(
     global_session: &std::sync::Arc<GlobalSession>,
     merged_arenas: MergedArenas,
     sched: Schedule,
-) -> Option<String> {
+) -> Result<Option<String>, PipelineError> {
     let (module_buckets, _struct_buckets) = route_monomorphs(parsed_modules, check_results, sched);
     let monos: Vec<syntax::Function> = module_buckets.into_iter().flatten().collect();
     let session2 = epoch_2_session(global_session, merged_arenas, &monos);
@@ -1964,7 +1966,7 @@ fn codegen_mlir_phase(
                     func.name
                 );
             }
-            return None;
+            return Ok(None);
         }
     }
 
@@ -2009,7 +2011,7 @@ fn codegen_mlir_phase(
         .flat_map(|(w, _)| w.local_agg_layouts.iter().cloned())
         .collect();
 
-    let text = crate::codegen::flat::emit_module_mlir(
+    let text = match crate::codegen::flat::emit_module_mlir(
         &funcs,
         &session2.registry,
         &tensor_types,
@@ -2022,15 +2024,18 @@ fn codegen_mlir_phase(
         local_devices,
         sched,
         false,
-    )
-    .ok()?;
+    ) {
+        Ok(text) => text,
+        Err(crate::codegen::flat::ModuleEmitError::Declined(_)) => return Ok(None),
+        Err(error) => return Err(PipelineError::Codegen(error.to_string())),
+    };
     chatter!(
         "Emitted MLIR for {} functions ({} monomorphized, {} shadowed by an earlier definition)",
         funcs.len(),
         monos.len(),
         shadowed
     );
-    Some(text)
+    Ok(Some(text))
 }
 
 fn codegen_and_metadata_phase(
