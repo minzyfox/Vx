@@ -1962,10 +1962,7 @@ impl CompilerDriver {
 
         // `emit_module_mlir` returns a complete `module { … }`; wrapping it here would copy the
         // whole body again (#311).
-        let parsed = match crate::codegen::flat::parse_emitted_module(context, &text) {
-            Ok(parsed) => parsed,
-            Err(why) => return Err(why),
-        };
+        let parsed = crate::codegen::flat::parse_emitted_module(context, &text)?;
         if parsed.is_none() {
             // `emit_module_mlir` returned `Some(text)` — it *claimed* to handle this module — yet the
             // text does not parse. That is an emitter **bug** (a construct emitted invalid MLIR, e.g.
