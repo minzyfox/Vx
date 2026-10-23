@@ -1,6 +1,6 @@
 # TODO: implement Vx formatting and optional linting
 
-Status: tasks 01 and 02 complete. Tasks 03 through 25 remain incomplete.
+Status: tasks 01 through 03 complete. Tasks 04 through 25 remain incomplete.
 
 Prepared on 2026-10-23 from the local
 [lint architecture research](vx_lint_architecture_research.md) and
@@ -306,24 +306,56 @@ Prerequisites: Task 02.
 
 Change: `src/formatter.rs` and its unit tests.
 
-- [ ] Add one failing test for a multiline function signature.
-- [ ] Identify function parameter parentheses from tokens and their declaration context.
-- [ ] Track matching parentheses without counting parentheses inside strings or comments.
-- [ ] Save the declaration's base indentation for each relevant parameter list.
-- [ ] Indent continuation lines according to Task 02.
-- [ ] Restore indentation when the matching parameter parenthesis closes.
-- [ ] Handle nested parentheses and square brackets inside parameter types.
-- [ ] Keep function calls and other parentheses under their existing formatting policy.
-- [ ] Preserve the current unchanged-output behavior for unknown lexer tokens.
-- [ ] Preserve formatter-off behavior.
-- [ ] Check whether earlier token normalization passes affect disabled text.
-- [ ] Fix only regressions caused by this change.
+- [x] Add one failing test for a multiline function signature.
+- [x] Identify function parameter parentheses from tokens and their declaration context.
+- [x] Track matching parentheses without counting parentheses inside strings or comments.
+- [x] Save the declaration's base indentation for each relevant parameter list.
+- [x] Indent continuation lines according to Task 02.
+- [x] Restore indentation when the matching parameter parenthesis closes.
+- [x] Handle nested parentheses and square brackets inside parameter types.
+- [x] Keep function calls and other parentheses under their existing formatting policy.
+- [x] Preserve the current unchanged-output behavior for unknown lexer tokens.
+- [x] Preserve formatter-off behavior.
+- [x] Check whether earlier token normalization passes affect disabled text.
+- [x] Fix only regressions caused by this change. None were found.
 
 Do not treat every `(` as a parameter indentation level.
 Do not replace the token formatter with a new parser-based formatter.
 Do not format the entire repository to demonstrate this change.
 
 Done when: the new test passes and existing formatter tests still pass.
+
+Task: 03, add parameter indentation state.
+Status: complete.
+Files changed: `src/formatter.rs` and this task record.
+Behavior implemented: multiline declaration parameters gain one indentation level.
+The matching closing parenthesis restores the declaration's indentation.
+Commands run and selected test counts:
+
+- The new test first failed its exact indentation assertion. One test was selected.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo test -p vxc --lib formatter::tests -- --test-threads=12`
+  passed all 11 selected formatter tests after the change.
+- The same command passed all 11 formatter tests after the mutation was restored.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo test -p vxc --lib -- --test-threads=12`
+  passed 608 tests. One test was ignored.
+- `source config.local && cargo fmt --all -- --check` passed.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo clippy -p vxc --lib -- -D warnings`
+  passed.
+- Built `vx-format`. Temporary inputs checked a nested type, an `impl` method,
+  an `extern` declaration, a multiline call, a disabled signature, delimiters in
+  comments and strings, and `--indent 4`.
+  The formatted temporary input also passed `vxc --parse-only`.
+
+Mutation check and failing assertion: changing the new indentation step from one
+level to zero made `multiline_function_parameters_use_one_extra_indent_level` fail.
+The assertion showed the parameter lines at column zero. The code was restored.
+Checks not run and reason: the full workspace suite has three recorded baseline
+failures. Task 04 adds the complete formatter regression matrix.
+Remaining problem: repeated formatting adds spaces before a formatter-off end
+marker. The existing whitespace and comment handling causes this behavior.
+Earlier normalization also runs before disabled-region handling. Task 04 must
+check those existing behaviors while testing repeated formatting.
+Next task: 04, complete formatter regression coverage.
 
 ### Task 04: complete formatter regression coverage
 

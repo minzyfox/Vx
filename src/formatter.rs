@@ -336,6 +336,20 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
     let mut formatted = String::with_capacity(original_len + original_len / 10);
     let mut indent_level: isize = 0;
 
+    let mut multiline_parens = vec![false; tokens.len()];
+    let mut open_parens = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenType::LeftParen => open_parens.push(index),
+            TokenType::RightParen => {
+                if let Some(open) = open_parens.pop() {
+                    multiline_parens[open] = tokens[open].line != token.line;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn write_indent(out: &mut String, level: isize, spaces: usize) {
         if level > 0 {
             for _ in 0..(level as usize * spaces) {
@@ -348,14 +362,63 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
     let mut format_enabled = true;
     // For each open `[`, whether its line ends after it, so its rows are indented one level.
     let mut brackets: Vec<bool> = Vec::new();
+    let mut parameter_parens: Vec<Option<isize>> = Vec::new();
+    let mut waiting_for_function_params = false;
+    let mut generic_depth = 0;
 
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(token) = tokens.next() {
+    let mut tokens = tokens.into_iter().enumerate().peekable();
+    while let Some((index, token)) = tokens.next() {
         if token.kind == TokenType::Eof {
             break;
         }
 
         match token.kind {
+            TokenType::Fn if format_enabled => {
+                waiting_for_function_params = true;
+                generic_depth = 0;
+            }
+            TokenType::LeftAngle if waiting_for_function_params => generic_depth += 1,
+            TokenType::RightAngle if waiting_for_function_params && generic_depth > 0 => {
+                generic_depth -= 1;
+            }
+            TokenType::LeftBrace | TokenType::Semicolon if waiting_for_function_params => {
+                waiting_for_function_params = false;
+            }
+            _ => {}
+        }
+
+        match token.kind {
+            TokenType::LeftParen => {
+                let is_function_params = waiting_for_function_params && generic_depth == 0;
+                if is_function_params {
+                    waiting_for_function_params = false;
+                }
+                let base_indent = if is_function_params && multiline_parens[index] && format_enabled
+                {
+                    Some(indent_level)
+                } else {
+                    None
+                };
+                parameter_parens.push(base_indent);
+                if format_enabled && is_new_line {
+                    write_indent(&mut formatted, indent_level, indent_spaces);
+                }
+                is_new_line = false;
+                formatted.push('(');
+                if base_indent.is_some() {
+                    indent_level += 1;
+                }
+            }
+            TokenType::RightParen => {
+                if let Some(Some(base)) = parameter_parens.pop() {
+                    indent_level = base;
+                }
+                if format_enabled && is_new_line {
+                    write_indent(&mut formatted, indent_level, indent_spaces);
+                }
+                is_new_line = false;
+                formatted.push(')');
+            }
             TokenType::LeftBracket => {
                 if format_enabled && is_new_line {
                     write_indent(&mut formatted, indent_level, indent_spaces);
@@ -363,7 +426,7 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
                 is_new_line = false;
                 formatted.push('[');
                 let rows_below = matches!(
-                    tokens.peek().map(|t| &t.kind),
+                    tokens.peek().map(|(_, t)| &t.kind),
                     Some(TokenType::Whitespace(ws)) if ws.contains('\n')
                 );
                 if rows_below {
@@ -463,6 +526,13 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_function_parameters_use_one_extra_indent_level() {
+        let input = "fn choose(\nfirst: i32,\nsecond: i32\n) -> i32 {\nfirst + second\n}";
+        let expected = "fn choose(\n  first: i32,\n  second: i32\n) -> i32 {\n  first + second\n}";
+        assert_eq!(format_file(input, 2), expected);
+    }
 
     #[test]
     fn test_format_off_top_level() {
