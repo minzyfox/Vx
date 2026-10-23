@@ -24,6 +24,54 @@ fn main() -> i32 {
 > [!NOTE]
 > **Implicit Returns**: Vx supports Rust-style implicit returns. The final expression in a block (such as a function body, `comptime` block, or `unsafe` block) can omit the trailing semicolon, causing the block to evaluate to the value of that expression. This avoids boilerplate `return` statements.
 
+### 1.1 Function parameter layout
+
+The following layout is the target for `vx-format`. The formatter does not yet apply
+this rule to multiline parameters.
+
+Keep a parameter list on one line if it was written on one line. Keep existing line
+breaks in a multiline list. Indent each continuation line one `--indent` level beyond
+the `fn` declaration. If `)` starts its own line, align it with `fn`. The function
+body uses its normal block indentation. Do not add a trailing parameter comma or
+wrap a line only because it is long.
+
+```vx
+fn choose(
+  values: Tensor<i32, [2, 2]>,
+  // Use this when no value is selected.
+  fallback: i32
+) -> i32 {
+  fallback
+}
+```
+
+The same layout applies to methods, trait methods, and declarations in an `extern`
+block. Each declaration uses its own indentation as the base:
+
+```vx
+struct Counter { value: i32 }
+
+impl Counter {
+  fn add(
+    self: &Counter,
+    step: i32
+  ) -> i32 {
+    self.value + step
+  }
+}
+
+extern "C" {
+  fn vx_add(
+    left: i32,
+    right: i32
+  ) -> i32;
+}
+```
+
+Keep parameter names, types, commas, nested brackets, and comments with their source lines.
+Keep text inside a formatter-disabled region unchanged. With `--indent 4`, each
+continuation line is four spaces beyond its declaration instead of two.
+
 ## 2. Spatial Execution Scopes: `spawn on`
 
 To explicitly route computation to a specific physical topology, Vx uses the `spawn on` block. This overrides the compiler's default cost-model inferred routing.
@@ -147,7 +195,7 @@ are comma-separated.
 ```rust
 fn move_between<S: Topology, D: Topology>(
     src: Pinned<i32, Topology::S>,
-    dst: Pinned<i32, Topology::D>,
+    dst: Pinned<i32, Topology::D>
 ) -> i32 where Reachable<S, D> {
     let staged = transfer(src, Memory::CPU_DRAM);
     return 0;
