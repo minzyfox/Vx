@@ -8,8 +8,7 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 This document describes `enum-layout-records-step-one` through `783e3c10`, dated October 21, 2026.
 It is a code walkthrough of the current branch. It does not mark future nested-layout work complete.
-The [enum layout task plan](enum-layout.md) and [nested layout proposal](nested_enum_and_struct_layouts.md) describe that future work.
-Those plans also contain historical implementation notes. The source pointers below identify the current behavior.
+The source pointers below identify the current behavior.
 
 ## 1. The overall flow
 
@@ -322,7 +321,7 @@ Generated layout records describe representation. They do not independently esta
 There is an existing cleanup restriction when variants mix scalar-like and aggregate payload kinds at one position.
 `drops_enum_glue` returns no glue for that case because of legacy generator limitations.
 The source documents the resulting leak. The layout-record changes do not remove that restriction.
-Nested-owner cleanup remains separate validation work in the linked task plan.
+Nested-owner cleanup remains separate validation work.
 
 ## 10. Current limits and artifact compatibility
 
@@ -335,8 +334,8 @@ Similarly, [Lowerer::lower_ty_synth](../../src/hir/flatten.rs#L3118) handles sup
 Do not skip unsupported fields, substitute a smaller layout, or read inactive payloads to extend this support.
 Future changes must preserve the storage contract, variant metadata, and conflict checks together.
 
-[VXLIB_FORMAT_TAG](../../src/metadata.rs#L98) currently identifies `vxlib-interface-v18`.
-The explicit payload opcode, revised carriers, and structural key encoding required artifact format changes on this branch.
+[VXLIB_FORMAT_TAG](../../src/metadata.rs#L98) currently identifies `vxlib-interface-v17`.
+The explicit payload opcode, revised carriers, and structural key encoding require one format bump from main’s v16.
 Older interface versions are rejected. Affected module artifacts and compiled objects require rebuilding.
 Version compatibility does not establish complete export dependencies.
 Exported bodies currently omit their generated layout records, so importing an enum-using body can fail even with scalar public signatures.
@@ -377,13 +376,9 @@ The architecture described above is the default flat path. Unifying the two layo
 
 Native regression helpers check the flat-path marker and expected values in normal and parallel compilation.
 The alignment fixture also runs at `-O0` and `-O2`.
-The local [PR review notes](../discussions/pr1931_enum_layout_review.md) record focused checks and mutation evidence for the implemented decisions.
-Those checks do not establish completion of every nested-layout or ownership task.
+These regression checks do not establish completion of every nested-layout or ownership task.
 
 For future nested-layout work, start at payload resolution and match binding resolution.
 For a new physical carrier, update the storage calculation and prove its LLVM layout.
 For a new access encoding, update bytecode, verification, register-use analysis, and artifact compatibility together.
 For a new semantic type distinction, update identity, retained metadata, comparison, and function specialization consistently.
-
-The [architecture cross-validation report](../discussions/enum_lowering_architecture_cross_validation.md) records the discovered carrier failures and key-growth defect.
-Its immediate-fix status distinguishes the fixes committed in `783e3c10` from the deferred ownership, declaration-table, specialization, artifact, and resolver work.
