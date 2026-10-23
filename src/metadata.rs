@@ -1221,7 +1221,7 @@ mod tests {
             TypeIdx(3),
             0x0000_000b_0000_0007,
         );
-        let bytes: Vec<_> = [64_u64, 5, 0, 3, 0x0000_000b_0000_0007]
+        let bytes: Vec<_> = [70_u64, 5, 0, 3, 0x0000_000b_0000_0007]
             .into_iter()
             .flat_map(u64::to_le_bytes)
             .collect();

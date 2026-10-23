@@ -556,8 +556,8 @@ mod enum_payload_tests {
     #[test]
     fn enum_payload_load_has_a_distinct_wire_opcode() {
         assert_eq!(
-            (Opcode::EnumPayloadLoad as u32, Opcode::from_u32(64)),
-            (64, Some(Opcode::EnumPayloadLoad)),
+            (Opcode::EnumPayloadLoad as u32, Opcode::from_u32(70)),
+            (70, Some(Opcode::EnumPayloadLoad)),
             "enum payload loads must retain their own wire opcode"
         );
     }
