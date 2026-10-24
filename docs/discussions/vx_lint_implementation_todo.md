@@ -1,6 +1,6 @@
 # TODO: implement Vx formatting and optional linting
 
-Status: tasks 01 through 03 complete. Tasks 04 through 25 remain incomplete.
+Status: tasks 01 through 05 complete. Tasks 06 through 25 remain incomplete.
 
 Prepared on 2026-10-23 from the local
 [lint architecture research](vx_lint_architecture_research.md) and
@@ -378,13 +378,41 @@ Add focused cases to the unit tests in `src/formatter.rs`:
 | Two-space and four-space settings | The selected indentation width controls continuation lines. |
 | Each new valid example formatted twice | The second result exactly equals the first result. |
 
-- [ ] Check token preservation for representative valid examples.
-- [ ] Exclude whitespace and end-of-file tokens when comparing token sequences.
-- [ ] Compare token content rather than source positions.
-- [ ] Parse representative formatted examples to check that formatting preserves valid syntax.
-- [ ] Mutation-check indentation, delimiter matching, and repeated-formatting assertions separately.
+- [x] Check token preservation for representative valid examples.
+- [x] Exclude whitespace and end-of-file tokens when comparing token sequences.
+- [x] Compare token content rather than source positions.
+- [x] Parse representative formatted examples to check that formatting preserves valid syntax.
+- [x] Mutation-check indentation, delimiter matching, and repeated-formatting assertions separately.
 
 Done when: every applicable matrix row has an assertion and the formatter diff stays focused.
+
+Task: 04, complete formatter regression coverage.
+Status: complete.
+Files changed: `src/formatter.rs` and this task record.
+Behavior implemented: repeated formatting keeps the existing indentation before a
+formatter-off end marker. The formatter does not add a second indentation level.
+Commands run and selected test counts:
+
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo test -p vxc --lib -- --test-threads=12`
+  passed 610 tests. One test was ignored.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo clippy -p vxc --lib -- -D warnings`
+  passed.
+- `source config.local && cargo fmt --all` passed.
+- `source config.local && target/debug/vxc --parse-only /private/tmp/vx-lint-task-04-parse.vx`
+  parsed a temporary file with a method, foreign declaration, generic tensor,
+  tuple type, comments, string, and multiline call.
+- `source config.local && CARGO_BUILD_JOBS=12 cargo run --bin vx-format -- /private/tmp/vx-lint-task-04-parse.vx`
+  reported the formatted temporary file unchanged.
+
+Mutation checks and failing assertions: disabling parameter indentation failed
+`layout: top level`. Counting a comment's `)` as a delimiter failed
+`layout: delimiters in comments and strings`. Removing the end-marker whitespace
+guard failed the disabled-signature repeat assertion. Each mutation was restored.
+Checks not run and reason: the full workspace suite retains three recorded
+baseline failures. The focused library suite covers all formatter unit tests.
+Remaining problem: brace normalization occurs before disabled-region handling.
+It can expand a one-line block inside a disabled region. This predates Task 03.
+Next task: 05, retain source identity and original text.
 
 ## Phase: shared analysis
 
@@ -396,18 +424,18 @@ Read: `src/module_loader.rs`, `src/lexer.rs`, `src/diagnostic.rs`, and `src/ide/
 
 Proposed home: `src/analysis/source.rs`, exported through `src/analysis.rs`.
 
-- [ ] Add a per-analysis source store.
-- [ ] Give each source file an identifier independent of its module name.
-- [ ] Keep its real path, original text, and line-start byte offsets.
-- [ ] Record each loaded module's source identifier.
-- [ ] Support an in-memory source override for a real file path.
-- [ ] Consult overrides before reading that path from disk.
-- [ ] Keep import resolution relative to the real project paths.
-- [ ] Support overrides for imported files as well as the entry file.
-- [ ] Keep source ownership local to one analysis request.
-- [ ] Add explicit conversions between byte offsets and source line/column positions.
-- [ ] Add a separate conversion for LSP UTF-16 positions.
-- [ ] Check UTF-8 boundaries before constructing source slices.
+- [x] Add a per-analysis source store.
+- [x] Give each source file an identifier independent of its module name.
+- [x] Keep its real path, original text, and line-start byte offsets.
+- [x] Record each loaded module's source identifier.
+- [x] Support an in-memory source override for a real file path.
+- [x] Consult overrides before reading that path from disk.
+- [x] Keep import resolution relative to the real project paths.
+- [x] Support overrides for imported files as well as the entry file.
+- [x] Keep source ownership local to one analysis request.
+- [x] Add explicit conversions between byte offsets and source line/column positions.
+- [x] Add a separate conversion for LSP UTF-16 positions.
+- [x] Check UTF-8 boundaries before constructing source slices.
 
 Lexer columns currently advance by Unicode characters.
 Some token lengths use bytes.
@@ -420,6 +448,35 @@ Check two files with identical text and different paths.
 Check that two simultaneous analyses cannot exchange source text.
 
 Done when: analysis can identify original sources and resolve unsaved files without changing their project paths.
+
+Task: 05, retain source identity and original text.
+Status: complete.
+Files changed: `src/analysis.rs`, `src/analysis/source.rs`, `src/lib.rs`,
+`src/module_loader.rs`, and this task record.
+Behavior implemented: each loader owns its source store and records a source ID
+for each parsed module. Source overrides use real paths and can supply unsaved
+entry files and imports. Renamed modules reparse their saved original text.
+Byte, lexer-style character, and LSP UTF-16 positions use separate conversions.
+Commands run and selected test counts:
+
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo test -p vxc --lib -- --test-threads=12`
+  passed 616 tests. One test was ignored.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo clippy -p vxc --lib -- -D warnings`
+  passed.
+- `source config.local && CARGO_BUILD_JOBS=12 cargo build -p vxc --bin vxc`
+  passed.
+- `source config.local && CARGO_BUILD_JOBS=12 RAYON_NUM_THREADS=12 cargo test -p vxc --test integration_test integration_test::flat_corpus_sweep::flat_path_coverage_of_the_backend_corpus_holds -- --exact`
+  passed its one selected test.
+- `source config.local && cargo fmt --all` passed.
+
+Mutation checks and failing assertions: counting Unicode characters instead of
+UTF-16 units failed the emoji position assertion. Ignoring the source override
+failed the existing-file override assertion. Both mutations were restored.
+Checks not run and reason: the full workspace suite retains three recorded
+baseline failures. The library suite and imported-module backend coverage passed.
+Remaining problem: the IDE diagnostics path still stages text in a temporary
+file. Task 16 replaces that path after the shared analysis API is available.
+Next task: 06, collect diagnostics without printing.
 
 ### Task 06: collect diagnostics without printing
 

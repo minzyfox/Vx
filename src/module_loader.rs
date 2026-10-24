@@ -12,6 +12,7 @@
 // module registry.
 //
 //===----------------------------------------------------------------------===//
+use crate::analysis::source::{SourceFile, SourceId, SourceStore};
 use crate::config::Schedule;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
@@ -65,6 +66,8 @@ pub struct ModuleLoader {
     paths: HashMap<Symbol, PathBuf>,
     /// The modules loaded as roots rather than imported, in load order.
     roots: Vec<Symbol>,
+    sources: SourceStore,
+    module_sources: HashMap<Symbol, SourceId>,
 }
 
 impl ModuleLoader {
@@ -104,7 +107,25 @@ impl ModuleLoader {
             returned_modules_directly: false,
             paths: HashMap::new(),
             roots: Vec::new(),
+            sources: SourceStore::new(),
+            module_sources: HashMap::new(),
         }
+    }
+
+    pub fn sources(&self) -> &SourceStore {
+        &self.sources
+    }
+
+    pub fn set_source_override(&mut self, path: &Path, text: String) -> std::io::Result<()> {
+        self.sources.set_override(path, text)
+    }
+
+    pub fn source_id(&self, module_path: &Symbol) -> Option<SourceId> {
+        self.module_sources.get(module_path).copied()
+    }
+
+    pub fn source_file(&self, module_path: &Symbol) -> Option<&SourceFile> {
+        self.sources.get(self.source_id(module_path)?)
     }
 
     /// Read imports that start with `name` from `dir`: `import name::a::b` is `dir/a/b.vx`. The
@@ -114,7 +135,13 @@ impl ModuleLoader {
     }
 
     pub fn load_main(&mut self, filename: &str) -> Result<(), ModuleError> {
-        let main_program = Self::parse_file(Path::new(filename), filename.into())?;
+        let path = Path::new(filename);
+        let (main_program, source) = self.parse_file(path, filename.into())?;
+        let source_id = self
+            .sources
+            .insert(path, source)
+            .map_err(|e| ModuleError::IO(filename.into(), e))?;
+        self.module_sources.insert(filename.into(), source_id);
         self.paths.insert(filename.into(), PathBuf::from(filename));
         self.roots.push(filename.into());
 
@@ -158,17 +185,22 @@ impl ModuleLoader {
         }
         while !wave.is_empty() {
             let parse = |(module_path, path): &(Symbol, PathBuf)| {
-                Self::parse_file(path, module_path.clone())
+                self.parse_file(path, module_path.clone())
             };
-            let parsed: Vec<Result<Program, ModuleError>> = if sched.is_seq() {
+            let parsed: Vec<Result<(Program, String), ModuleError>> = if sched.is_seq() {
                 wave.iter().map(parse).collect()
             } else {
                 wave.par_iter().map(parse).collect()
             };
             // The next wave's imports, in source order, each once.
             let mut pending: Vec<(Symbol, Vec<Symbol>)> = Vec::new();
-            for result in parsed {
-                let program = result?;
+            for (result, (module_name, path)) in parsed.into_iter().zip(&wave) {
+                let (program, source) = result?;
+                let source_id = self
+                    .sources
+                    .insert(path, source)
+                    .map_err(|e| ModuleError::IO(path.to_string_lossy().into_owned(), e))?;
+                self.module_sources.insert(module_name.clone(), source_id);
                 for import in &program.imports {
                     let module_name = Self::module_name(&import.path);
                     if seen.insert(module_name.clone()) {
@@ -210,7 +242,11 @@ impl ModuleLoader {
                 continue;
             };
             let path = &self.paths[&program.module_path];
-            let renamed = Self::parse_file_renaming(path, program.module_path.clone(), renames)?;
+            let source = self
+                .source_file(&program.module_path)
+                .expect("loaded module has no source");
+            let renamed =
+                Self::parse_source(path, program.module_path.clone(), renames, source.text())?;
             // The imports were already followed as first parsed.
             assert_eq!(
                 renamed.imports, program.imports,
@@ -225,6 +261,11 @@ impl ModuleLoader {
     /// preferred when both sit where the source would and is read here so nothing about
     /// resolution is left for the caller to do serially.
     fn resolve_import(&self, path: &[Symbol]) -> Result<Resolved, ModuleError> {
+        if let Some(source) = self.resolve_module_path(path) {
+            if self.sources.has_override(&source) {
+                return Ok(Resolved::Source(source));
+            }
+        }
         if let Some(artifact) = self.resolve_artifact_path(path) {
             let buf = fs::read(&artifact)
                 .map_err(|e| ModuleError::IO(artifact.to_string_lossy().into_owned(), e))?;
@@ -268,29 +309,38 @@ impl ModuleLoader {
     }
 
     /// Read and parse one file as the module `module_path`.
-    fn parse_file(path: &Path, module_path: Symbol) -> Result<Program, ModuleError> {
-        Self::parse_file_renaming(path, module_path, &HashMap::new())
+    fn parse_file(
+        &self,
+        path: &Path,
+        module_path: Symbol,
+    ) -> Result<(Program, String), ModuleError> {
+        let name = path.to_string_lossy().into_owned();
+        let source = self
+            .sources
+            .read_text(path)
+            .map_err(|e| ModuleError::IO(name, e))?;
+        let program = Self::parse_source(path, module_path, &HashMap::new(), &source)?;
+        Ok((program, source))
     }
 
-    fn parse_file_renaming(
+    fn parse_source(
         path: &Path,
         module_path: Symbol,
         renames: &HashMap<Symbol, crate::name_clashes::Rename>,
+        source: &str,
     ) -> Result<Program, ModuleError> {
         let name = path.to_string_lossy().into_owned();
-        let source = fs::read_to_string(path).map_err(|e| ModuleError::IO(name.clone(), e))?;
-
-        let mut lexer = Lexer::new(&source);
+        let mut lexer = Lexer::new(source);
         let mut tokens = lexer.tokenize();
         if !renames.is_empty() {
             crate::name_clashes::rename_tokens(&mut tokens, renames)
                 .map_err(|e| ModuleError::Resolution(format!("{name}: {e}")))?;
         }
-        let mut parser = Parser::new(&tokens, &source);
+        let mut parser = Parser::new(&tokens, source);
 
         let mut program = parser
             .parse()
-            .map_err(|e| ModuleError::Parse(name, crate::error::Error(e.format(&source))))?;
+            .map_err(|e| ModuleError::Parse(name, crate::error::Error(e.format(source))))?;
         program.module_path = module_path;
         Ok(program)
     }
@@ -305,7 +355,9 @@ impl ModuleLoader {
                     current_path.push(component.as_ref());
                 }
                 current_path.set_extension(ext);
-                return current_path.exists().then_some(current_path);
+                return (current_path.exists()
+                    || (ext == "vx" && self.sources.has_override(&current_path)))
+                .then_some(current_path);
             }
         }
         for search_path in &self.search_paths {
@@ -321,7 +373,7 @@ impl ModuleLoader {
             }
             current_path.set_extension(ext);
 
-            if current_path.exists() {
+            if current_path.exists() || (ext == "vx" && self.sources.has_override(&current_path)) {
                 return Some(current_path);
             }
         }
@@ -361,7 +413,12 @@ impl ModuleLoader {
             Resolved::Source(p) => p,
         };
 
-        let program = Self::parse_file(&resolved_path, module_name.clone())?;
+        let (program, source) = self.parse_file(&resolved_path, module_name.clone())?;
+        let source_id = self
+            .sources
+            .insert(&resolved_path, source)
+            .map_err(|e| ModuleError::IO(resolved_path.to_string_lossy().into_owned(), e))?;
+        self.module_sources.insert(module_name.clone(), source_id);
         self.paths.insert(module_name.clone(), resolved_path);
 
         let imports = program.imports.clone();
@@ -448,5 +505,148 @@ mod tests {
             !loader.into_programs().unwrap().is_empty(),
             "load_main kept nothing, so a compile through this loader would be empty"
         );
+    }
+
+    #[test]
+    fn source_overrides_load_an_unsaved_root_and_import() {
+        let dir = std::env::temp_dir().join("vx-loader-unsaved-source-test");
+        let entry = dir.join("main.vx");
+        let imported = dir.join("helper.vx");
+        let mut loader = ModuleLoader::new();
+        loader.add_package("pkg", &dir);
+        loader
+            .set_source_override(
+                &entry,
+                "import pkg::helper;\nfn main() -> i32 { return 0; }".into(),
+            )
+            .unwrap();
+        loader
+            .set_source_override(&imported, "fn helper() -> i32 { return 1; }".into())
+            .unwrap();
+        let entry_name = entry.to_string_lossy().into_owned();
+        let programs = loader
+            .load_all(&[entry_name.clone()], Schedule::Parallel)
+            .expect("both unsaved sources should load");
+        assert_eq!(programs.len(), 2);
+        let root = loader.source_file(&entry_name.as_str().into()).unwrap();
+        let helper = loader.source_file(&"pkg::helper".into()).unwrap();
+        assert_eq!(root.path(), entry);
+        assert_eq!(helper.path(), imported);
+        assert!(root.text().contains("import pkg::helper"));
+        assert!(helper.text().contains("return 1"));
+        assert_ne!(
+            loader.source_id(&entry_name.as_str().into()),
+            loader.source_id(&"pkg::helper".into())
+        );
+
+        let mut recursive = ModuleLoader::new();
+        recursive.add_package("pkg", &dir);
+        recursive
+            .set_source_override(
+                &entry,
+                "import pkg::helper;\nfn main() -> i32 { return 0; }".into(),
+            )
+            .unwrap();
+        recursive
+            .set_source_override(&imported, "fn helper() -> i32 { return 1; }".into())
+            .unwrap();
+        recursive.load_main(&entry_name).unwrap();
+        assert_eq!(recursive.loaded_modules.len(), 2);
+        assert_eq!(
+            recursive.source_file(&"pkg::helper".into()).unwrap().path(),
+            imported
+        );
+    }
+
+    #[test]
+    fn source_override_wins_over_an_existing_disk_file() {
+        let path = Path::new("tests/modules/jobs_wave_b.vx");
+        let mut loader = ModuleLoader::new();
+        let text = "fn changed() -> i32 { return 3; }";
+        loader.set_source_override(path, text.into()).unwrap();
+        loader.load_main(path.to_str().unwrap()).unwrap();
+        let source = loader.source_file(&path.to_str().unwrap().into()).unwrap();
+        assert_eq!(source.text(), text);
+        assert_eq!(source.path(), SourceStore::path_key(path).unwrap());
+    }
+
+    #[test]
+    fn renamed_imports_reparse_the_saved_override() {
+        let dir = std::env::temp_dir().join("vx-loader-rename-override-test");
+        let entry = dir.join("main.vx");
+        let first = dir.join("first.vx");
+        let second = dir.join("second.vx");
+        let mut loader = ModuleLoader::new();
+        loader.add_package("pkg", &dir);
+        loader
+            .set_source_override(
+                &entry,
+                "import pkg::first;\nimport pkg::second;\nfn main() -> i32 { return 0; }".into(),
+            )
+            .unwrap();
+        let shared = "fn value() -> i32 { return 1; }";
+        loader.set_source_override(&first, shared.into()).unwrap();
+        loader.set_source_override(&second, shared.into()).unwrap();
+        let programs = loader
+            .load_all(&[entry.to_string_lossy().into_owned()], Schedule::Parallel)
+            .expect("the loader should reparse a saved source without a disk file");
+        let names: Vec<_> = programs
+            .iter()
+            .flat_map(|program| {
+                program
+                    .functions
+                    .iter()
+                    .map(|function| function.name.to_string())
+            })
+            .collect();
+        assert!(names.contains(&"value".to_string()));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with("__value"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            loader.source_file(&"pkg::first".into()).unwrap().text(),
+            shared
+        );
+        assert_eq!(
+            loader.source_file(&"pkg::second".into()).unwrap().text(),
+            shared
+        );
+    }
+
+    #[test]
+    fn simultaneous_loaders_keep_their_own_source_text() {
+        let path = std::env::temp_dir().join("vx-loader-shared-path-test.vx");
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let mut loader = ModuleLoader::new();
+                loader
+                    .set_source_override(&path, "fn first() -> i32 { return 1; }".into())
+                    .unwrap();
+                loader.load_main(path.to_str().unwrap()).unwrap();
+                loader
+                    .source_file(&path.to_str().unwrap().into())
+                    .unwrap()
+                    .text()
+                    .to_string()
+            });
+            let second = scope.spawn(|| {
+                let mut loader = ModuleLoader::new();
+                loader
+                    .set_source_override(&path, "fn second() -> i32 { return 2; }".into())
+                    .unwrap();
+                loader.load_main(path.to_str().unwrap()).unwrap();
+                loader
+                    .source_file(&path.to_str().unwrap().into())
+                    .unwrap()
+                    .text()
+                    .to_string()
+            });
+            assert_eq!(first.join().unwrap(), "fn first() -> i32 { return 1; }");
+            assert_eq!(second.join().unwrap(), "fn second() -> i32 { return 2; }");
+        });
     }
 }

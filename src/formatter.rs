@@ -493,7 +493,10 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
                     format_enabled = true;
                 }
 
-                if (format_enabled || turning_off) && is_new_line {
+                if (format_enabled || turning_off)
+                    && is_new_line
+                    && (formatted.is_empty() || formatted.ends_with('\n'))
+                {
                     write_indent(&mut formatted, indent_level, indent_spaces);
                 }
                 is_new_line = false;
@@ -526,6 +529,102 @@ fn emit_formatted_string(tokens: Vec<Token>, indent_spaces: usize, original_len:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content_tokens(source: &str) -> Vec<TokenType<'_>> {
+        Lexer::new_with_comments(source)
+            .tokenize()
+            .into_iter()
+            .map(|token| token.kind)
+            .filter(|kind| !matches!(kind, TokenType::Whitespace(_) | TokenType::Eof))
+            .collect()
+    }
+
+    #[test]
+    fn function_parameter_layout_covers_declarations_and_calls() {
+        let cases = [
+            (
+                "top level",
+                "fn add(\nfirst: i32,\nsecond: i32\n) -> i32 {\nreturn first + second;\n}",
+                "fn add(\n  first: i32,\n  second: i32\n) -> i32 {\n  return first + second;\n}",
+                2,
+            ),
+            (
+                "method",
+                "struct Counter { value: i32 }\nimpl Counter {\nfn add(\nself: &Counter,\namount: i32\n) -> i32 {\nreturn self.value + amount;\n}\n}",
+                "struct Counter {\n  value: i32\n}\nimpl Counter {\n  fn add(\n    self: &Counter,\n    amount: i32\n  ) -> i32 {\n    return self.value + amount;\n  }\n}",
+                2,
+            ),
+            (
+                "foreign declaration",
+                "extern {\nfn add(\nfirst: i32,\nsecond: i32\n) -> i32;\n}",
+                "extern {\n  fn add(\n    first: i32,\n    second: i32\n  ) -> i32;\n}",
+                2,
+            ),
+            (
+                "first parameter on opening line",
+                "fn add(first: i32,\nsecond: i32\n) -> i32 {\nreturn first + second;\n}",
+                "fn add(first: i32,\n  second: i32\n) -> i32 {\n  return first + second;\n}",
+                2,
+            ),
+            (
+                "nested type",
+                "fn use_tensor<T>(\nvalue: Tensor<T, [2, 2]>,\npair: (i32, i32),\nother: Tensor<T, [2, 2]>\n) -> T {\nreturn value[0][0];\n}",
+                "fn use_tensor<T>(\n  value: Tensor<T, [2, 2]>,\n  pair: (i32, i32),\n  other: Tensor<T, [2, 2]>\n) -> T {\n  return value[0][0];\n}",
+                2,
+            ),
+            (
+                "comments between parameters",
+                "fn add(\nfirst: i32,\n// the second value\nsecond: i32\n) -> i32 {\nreturn first + second;\n}",
+                "fn add(\n  first: i32,\n  // the second value\n  second: i32\n) -> i32 {\n  return first + second;\n}",
+                2,
+            ),
+            (
+                "delimiters in comments and strings",
+                "fn show(\nfirst: i32, // ) ]\nsecond: i32\n) -> i32 {\nlet text = \"( ) [ ]\";\nreturn first + second;\n}",
+                "fn show(\n  first: i32, // ) ]\n  second: i32\n) -> i32 {\n  let text = \"( ) [ ]\";\n  return first + second;\n}",
+                2,
+            ),
+            (
+                "single line signature",
+                "fn add(first: i32, second: i32) -> i32 {\nreturn first + second;\n}",
+                "fn add(first: i32, second: i32) -> i32 {\n  return first + second;\n}",
+                2,
+            ),
+            (
+                "multiline call",
+                "fn main() -> i32 {\nreturn add(\n1,\n2\n);\n}",
+                "fn main() -> i32 {\n  return add(\n  1,\n  2\n  );\n}",
+                2,
+            ),
+            (
+                "four space setting",
+                "fn add(\nfirst: i32,\nsecond: i32\n) -> i32 {\nreturn first + second;\n}",
+                "fn add(\n    first: i32,\n    second: i32\n) -> i32 {\n    return first + second;\n}",
+                4,
+            ),
+        ];
+
+        for (name, input, expected, width) in cases {
+            let formatted = format_file(input, width);
+            assert_eq!(formatted, expected, "layout: {name}");
+            assert_eq!(
+                content_tokens(input),
+                content_tokens(&formatted),
+                "tokens: {name}"
+            );
+            assert_eq!(format_file(&formatted, width), formatted, "repeat: {name}");
+        }
+    }
+
+    #[test]
+    fn disabled_signature_keeps_its_text_and_formats_following_code() {
+        let input = "fn main() -> i32 {\n// vx-format-begin: OFF\nfn   add(\nfirst: i32,\nsecond: i32\n) -> i32 {\nreturn first + second;\n}\n// vx-format-end: OFF\nreturn 0;\n}";
+        let expected = "fn main() -> i32 {\n  // vx-format-begin: OFF\nfn   add(\nfirst: i32,\nsecond: i32\n) -> i32 {\nreturn first + second;\n}\n  // vx-format-end: OFF\n  return 0;\n}";
+        let formatted = format_file(input, 2);
+        assert_eq!(formatted, expected);
+        assert_eq!(content_tokens(input), content_tokens(&formatted));
+        assert_eq!(format_file(&formatted, 2), formatted);
+    }
 
     #[test]
     fn multiline_function_parameters_use_one_extra_indent_level() {

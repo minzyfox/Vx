@@ -12,6 +12,7 @@
 // be embedded or tested modularly.
 //
 //===----------------------------------------------------------------------===//
+pub mod analysis;
 pub mod arch;
 pub mod borrow;
 pub mod bytecode;
