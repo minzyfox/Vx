@@ -1458,6 +1458,17 @@ fn flat_declines_an_enum_with_an_unsupported_generic_payload() {
     );
 }
 
+#[rstest::rstest]
+#[case::normal(None)]
+#[case::parallel(Some(2))]
+fn non_generic_struct_with_an_option_field_runs(#[case] jobs: Option<usize>) {
+    assert_generated_aggregate_runs(
+        "error_with_an_optional_code.vx",
+        &["-7", "99", "-7", "99"],
+        jobs,
+    );
+}
+
 fn assert_enum_layout_falls_back(jobs: Option<usize>) {
     use melior::ir::operation::OperationLike;
 

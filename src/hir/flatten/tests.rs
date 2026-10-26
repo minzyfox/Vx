@@ -87,6 +87,342 @@ fn lower_with_registry(src: &str, fn_name: &str) -> (bool, LocalWorkerState) {
     (did, worker)
 }
 
+fn optional_code_registry() -> ImmutableGlobalRegistry {
+    let mut lexer = crate::lexer::Lexer::new(
+        "enum Maybe<T> { Some(T), None } struct Error { code: Maybe<i32> } struct Plain { value: i32 }",
+    );
+    let tokens = lexer.tokenize();
+    let mut parser = crate::parser::Parser::new(&tokens, "");
+    let mut mods = vec![parser.parse().expect("parse declarations")];
+    mods[0].module_path = "crate::layouts".into();
+    let symbols = crate::resolver::build_symbol_map(&mods);
+    mods[0].resolve_names(&symbols, &[]);
+    crate::pipeline::build_frozen_registry(&mods).expect("freeze declarations")
+}
+
+#[test]
+fn enum_layout_non_generic_struct_keeps_its_nominal_id() {
+    let registry = optional_code_registry();
+    let id = registry.resolve_unique_nominal(&"Error".into()).unwrap();
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = Type::Struct("Error".into(), Some(id));
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&ty),
+        Some(id),
+        "retain the nominal struct ID"
+    );
+    let layout = lowerer
+        .generated_layout(id)
+        .expect("complete struct layout");
+    let field = &layout.fields[0];
+    let nested_id = field
+        .aggregate_id
+        .expect("the option field retains its aggregate identity");
+    assert_eq!(
+        field.layout.ty,
+        FieldTy::Nominal(nested_id),
+        "field storage and value identity agree"
+    );
+    let nested = lowerer
+        .generated_layout(nested_id)
+        .expect("complete option layout");
+    for (id, layout) in [(nested_id, nested), (id, layout)] {
+        let allocation = lowerer
+            .instance_layouts
+            .get(&id)
+            .expect("allocation layout exists");
+        assert_eq!(
+            (
+                allocation.id,
+                allocation.size_bytes as u64,
+                allocation.align_bytes as u64,
+                &allocation.fields
+            ),
+            (
+                id,
+                layout.size_bytes,
+                layout.align_bytes,
+                &layout.type_definition().fields
+            ),
+            "allocation and storage layouts agree for {}",
+            layout.name
+        );
+    }
+    assert_eq!(
+        registry.layouts[&id].align_bytes, 0,
+        "the frozen struct layout remains unchanged"
+    );
+}
+
+#[test]
+fn enum_layout_reuses_complete_records_and_frozen_storage() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = Type::Struct("Error".into(), None);
+    let id = lowerer.resolve_concrete_layout(&ty).unwrap();
+    let records = lowerer.agg_layouts.clone();
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&ty),
+        Some(id),
+        "reuse the same identity"
+    );
+    assert_eq!(
+        lowerer.agg_layouts, records,
+        "cache reuse must not add records"
+    );
+    let plain = registry.resolve_unique_nominal(&"Plain".into()).unwrap();
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&Type::Struct("Plain".into(), Some(plain))),
+        Some(plain),
+        "reuse complete frozen storage"
+    );
+    assert_eq!(
+        lowerer.agg_layouts, records,
+        "complete frozen storage needs no generated record"
+    );
+    assert!(
+        lowerer.resolving_layouts.is_empty(),
+        "successful resolution clears the active stack"
+    );
+}
+
+#[test]
+fn enum_layout_failure_does_not_publish_an_incomplete_struct() {
+    let mut registry = optional_code_registry();
+    let id = registry.resolve_unique_nominal(&"Error".into()).unwrap();
+    registry
+        .structs
+        .get_mut(&id)
+        .unwrap()
+        .fields
+        .push(("unsupported".into(), Type::Generic("Missing".into(), None)));
+    let mut lowerer = Lowerer::new(&registry);
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&Type::Struct("Error".into(), Some(id))),
+        None,
+        "an unsupported field rejects the whole struct"
+    );
+    assert!(
+        lowerer.generated_layout(id).is_none(),
+        "failed structs have no generated record"
+    );
+    assert!(
+        !lowerer.instance_layouts.contains_key(&id),
+        "failed structs have no allocation layout"
+    );
+    assert!(
+        !lowerer.completed_layout_identities.contains_key(&id),
+        "failed structs have no completed identity"
+    );
+    assert!(
+        lowerer.resolving_layouts.is_empty(),
+        "failure clears the active stack"
+    );
+    let child_count = lowerer.instance_layouts.len();
+    assert_eq!(
+        child_count, 1,
+        "only the completed option child has an allocation layout"
+    );
+}
+
+#[test]
+fn enum_layout_rejects_value_cycles_without_expanding_pointer_targets() {
+    let mut registry = optional_code_registry();
+    let id = registry.resolve_unique_nominal(&"Error".into()).unwrap();
+    let ty = Type::Struct("Error".into(), Some(id));
+    registry.structs.get_mut(&id).unwrap().fields = vec![("cycle".into(), ty.clone())];
+    let mut lowerer = Lowerer::new(&registry);
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&ty),
+        None,
+        "a direct value cycle declines"
+    );
+    assert!(
+        lowerer.resolving_layouts.is_empty(),
+        "a cycle clears the active stack"
+    );
+    assert!(
+        lowerer.agg_layouts.is_empty(),
+        "a value cycle publishes no records"
+    );
+    registry.structs.get_mut(&id).unwrap().fields = vec![(
+        "next".into(),
+        Type::Pointer(Box::new(ty.clone()), None, false),
+    )];
+    let mut lowerer = Lowerer::new(&registry);
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&ty),
+        Some(id),
+        "a pointer cycle needs no recursive storage expansion"
+    );
+    let field = &lowerer.generated_layout(id).unwrap().fields[0];
+    assert_eq!(
+        field.pointer_target_id,
+        Some(id),
+        "the recursive pointer keeps its nominal target"
+    );
+}
+
+fn maybe_layout_type(argument: Type) -> Type {
+    Type::GenericInstance(Box::new(Type::Enum("Maybe".into(), None)), vec![argument])
+}
+
+#[rstest::rstest]
+#[case::generated(false)]
+#[case::frozen(true)]
+#[should_panic(expected = "conflicting concrete layout identities")]
+fn enum_layout_cache_rejects_another_declaration(#[case] frozen: bool) {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = if frozen {
+        Type::Struct("Plain".into(), None)
+    } else {
+        maybe_layout_type(Type::Scalar(ElementType::I32))
+    };
+    let id = lowerer.resolve_concrete_layout(&ty).unwrap();
+    // Simulate two declarations receiving the same layout ID.
+    lowerer
+        .completed_layout_identities
+        .get_mut(&id)
+        .unwrap()
+        .declaration = registry.resolve_unique_nominal(&"Error".into()).unwrap();
+    lowerer.resolve_concrete_layout(&ty);
+}
+
+#[test]
+#[should_panic(expected = "a cached layout must retain its concrete identity")]
+fn enum_layout_cache_requires_a_structural_identity() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = maybe_layout_type(Type::Scalar(ElementType::I32));
+    let id = lowerer.resolve_concrete_layout(&ty).unwrap();
+    lowerer.completed_layout_identities.remove(&id);
+    lowerer.resolve_concrete_layout(&ty);
+}
+
+#[test]
+#[should_panic(expected = "conflicting concrete layout identities")]
+fn enum_layout_cache_rejects_other_arguments() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let ty = maybe_layout_type(Type::Scalar(ElementType::I32));
+    let id = lowerer.resolve_concrete_layout(&ty).unwrap();
+    // Simulate distinct arguments receiving the same layout ID.
+    lowerer
+        .completed_layout_identities
+        .get_mut(&id)
+        .unwrap()
+        .arguments = vec![Type::Scalar(ElementType::I64)];
+    lowerer.resolve_concrete_layout(&ty);
+}
+
+#[rstest::rstest]
+#[case::declaration(true)]
+#[case::arguments(false)]
+#[should_panic(expected = "conflicting active layout identities")]
+fn enum_layout_active_stack_rejects_conflicting_identity(#[case] other_declaration: bool) {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let declaration = registry.resolve_unique_nominal(&"Maybe".into()).unwrap();
+    let args = vec![Type::Scalar(ElementType::I32)];
+    let id = super::enum_instance_gid(declaration, &args, registry.aggregate_identities()).unwrap();
+    let identity = ConcreteLayoutIdentity {
+        declaration: if other_declaration {
+            registry.resolve_unique_nominal(&"Error".into()).unwrap()
+        } else {
+            declaration
+        },
+        arguments: if other_declaration {
+            args
+        } else {
+            vec![Type::Scalar(ElementType::I64)]
+        },
+    };
+    lowerer.resolving_layouts.push((id, identity));
+    lowerer.resolve_concrete_layout(&maybe_layout_type(Type::Scalar(ElementType::I32)));
+}
+
+#[test]
+fn enum_layout_stack_recognizes_structural_cycles_independently_of_ids() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let declaration = registry.resolve_unique_nominal(&"Maybe".into()).unwrap();
+    lowerer.resolving_layouts.push((
+        TypeId::new(99, 99, 0, 0),
+        ConcreteLayoutIdentity {
+            declaration,
+            arguments: vec![Type::Scalar(ElementType::I32)],
+        },
+    ));
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&maybe_layout_type(Type::Scalar(ElementType::I32))),
+        None,
+        "a repeated structural identity is a cycle even under another ID"
+    );
+    assert!(
+        lowerer
+            .resolve_concrete_layout(&maybe_layout_type(Type::Scalar(ElementType::I64)))
+            .is_some(),
+        "different arguments of the same declaration are not a cycle"
+    );
+}
+
+#[test]
+fn enum_layout_cache_retains_normalized_structural_arguments() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let borrowed = |region_id| Type::Borrow {
+        inner: Box::new(Type::Scalar(ElementType::I32)),
+        mem_space: None,
+        is_mut: false,
+        region_id,
+    };
+    let id = lowerer
+        .resolve_concrete_layout(&maybe_layout_type(borrowed(17)))
+        .unwrap();
+    let identity = &lowerer.completed_layout_identities[&id];
+    assert_eq!(
+        identity.arguments,
+        vec![borrowed(0)],
+        "cache arguments must discard function-local borrow regions"
+    );
+    assert_eq!(
+        lowerer.resolve_concrete_layout(&maybe_layout_type(borrowed(29))),
+        Some(id),
+        "equivalent normalized arguments reuse their layout"
+    );
+}
+
+#[test]
+#[should_panic(expected = "conflicting generated layouts")]
+fn enum_layout_records_reject_conflicting_storage() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let id = lowerer
+        .resolve_concrete_layout(&Type::Struct("Error".into(), None))
+        .unwrap();
+    let mut conflicting = lowerer.generated_layout(id).unwrap().clone();
+    conflicting.fields[0].layout.size += 1;
+    lowerer.record_generated_layout(conflicting);
+}
+
+#[test]
+fn enum_layout_records_accept_equivalent_storage() {
+    let registry = optional_code_registry();
+    let mut lowerer = Lowerer::new(&registry);
+    let id = lowerer
+        .resolve_concrete_layout(&Type::Struct("Error".into(), None))
+        .unwrap();
+    let records = lowerer.agg_layouts.clone();
+    let mut equivalent = lowerer.generated_layout(id).unwrap().clone();
+    equivalent.name = "Alias".into();
+    lowerer.record_generated_layout(equivalent);
+    assert_eq!(
+        lowerer.agg_layouts, records,
+        "equivalent duplicate records preserve the original cache"
+    );
+}
+
 #[test]
 fn enum_type_arguments_substitute_trait_self() {
     let concrete = Type::Scalar(ElementType::I32);
@@ -2180,14 +2516,11 @@ fn call_to_unknown_fn_declines() {
 
 #[test]
 fn unmodelled_aggregate_param_is_declined() {
-    // `Buf` holds an enum with a payload by value, which the frozen layouts do not model, so
-    // its layout stays the 0/0 stub; a function taking `Buf` by value cannot be sized, and
-    // lowering is declined atomically (worker untouched). This used to use a `<4 x f32>` field,
-    // then a generic struct instance, and each stopped being unmodelled when it got a layout.
+    // An enum inside another payload enum still has no supported storage layout.
     let (did, w) = lower_with_registry(
-            "enum Maybe<T> { Some(T), Nothing }\nstruct Buf { data: Maybe<i32> }\nfn f(b: Buf) -> i32 { return 0; }",
-            "f",
-        );
+        "enum Inner { Code(i32), Empty } enum Outer { Nested(Inner), Empty } fn f(value: Outer) -> i32 { return 0; }",
+        "f",
+    );
     assert!(
         !did,
         "an unmodelled aggregate param should decline lowering"
