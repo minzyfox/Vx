@@ -291,7 +291,10 @@ fn stmt_kind(s: &Statement) -> &'static str {
     }
 }
 
-/// The declaration and normalized structural arguments behind a concrete layout ID.
+/// Stop recursive generic declarations whose type arguments continually grow.
+const MAX_LAYOUT_RESOLUTION_DEPTH: usize = 128;
+
+/// The declaration and normalized type arguments that identify a layout.
 #[derive(Clone, Debug)]
 struct ConcreteLayoutIdentity {
     declaration: TypeId,
@@ -3627,7 +3630,7 @@ impl<'r> Lowerer<'r> {
         if let Some(existing) = self.completed_layout_identities.get(&gid) {
             assert!(
                 existing.semantically_eq(&identity, self.registry.aggregate_identities()),
-                "conflicting concrete layout identities for {gid:?}: cached {existing:#?}, requested {identity:#?}"
+                "a cached layout ID must keep the same declaration and type arguments for {gid:?}: cached {existing:#?}, requested {identity:#?}"
             );
         }
         let mut cycle = false;
@@ -3635,10 +3638,10 @@ impl<'r> Lowerer<'r> {
             if *active_id == gid {
                 assert!(
                     active.semantically_eq(&identity, self.registry.aggregate_identities()),
-                    "conflicting active layout identities for {gid:?}: active {active:#?}, requested {identity:#?}"
+                    "a layout ID being resolved must keep the same declaration and type arguments for {gid:?}: current {active:#?}, requested {identity:#?}"
                 );
             }
-            // Value cycles repeat a structural identity, independently of the generated ID.
+            // The same declaration and type arguments form a value cycle, even with different IDs.
             cycle |= active.semantically_eq(&identity, self.registry.aggregate_identities());
         }
         if cycle {
@@ -3647,7 +3650,7 @@ impl<'r> Lowerer<'r> {
         if self.instance_layouts.contains_key(&gid) || self.generated_layout(gid).is_some() {
             assert!(
                 self.completed_layout_identities.contains_key(&gid),
-                "a cached layout must retain its concrete identity"
+                "a cached layout must keep its declaration and type arguments"
             );
             return Some(gid);
         }
@@ -3655,8 +3658,7 @@ impl<'r> Lowerer<'r> {
             self.completed_layout_identities.insert(gid, identity);
             return Some(gid);
         }
-        // This also bounds recursive generic declarations whose arguments continually grow.
-        if self.resolving_layouts.len() >= 128 {
+        if self.resolving_layouts.len() >= MAX_LAYOUT_RESOLUTION_DEPTH {
             return None;
         }
         self.resolving_layouts.push((gid, identity.clone()));
@@ -3668,7 +3670,7 @@ impl<'r> Lowerer<'r> {
         };
         self.resolving_layouts.pop();
         if let Some(id) = result {
-            assert_eq!(id, gid, "layout construction must preserve the concrete ID");
+            assert_eq!(id, gid, "building a layout must keep the requested ID");
             self.completed_layout_identities.insert(gid, identity);
         }
         result
@@ -3684,7 +3686,7 @@ impl<'r> Lowerer<'r> {
         if let Some(existing) = self.generated_layout(layout.type_id) {
             assert!(
                 existing.semantically_eq(&layout, self.registry.aggregate_identities()),
-                "conflicting generated layouts: existing {existing:#?}, requested {layout:#?}"
+                "a layout ID must keep the same fields, size, and alignment: existing {existing:#?}, requested {layout:#?}"
             );
             return;
         }
@@ -4126,6 +4128,7 @@ impl<'r> Lowerer<'r> {
                 }
             },
         };
+        // Zero alignment marks an incomplete layout that this worker must resolve before construction.
         let gid = if self.layout_of(&gid).is_some_and(|def| def.align_bytes == 0) {
             let ty = Type::Struct(si.name.clone(), Some(gid));
             self.resolve_concrete_layout(&ty)
