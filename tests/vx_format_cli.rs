@@ -46,7 +46,7 @@ fn prints_defaults_without_reading_project_config_or_changing_files() -> Result<
     ensure!(output.status.success(), "{output:?}");
     ensure!(output.stderr.is_empty(), "{output:?}");
     let text = String::from_utf8(output.stdout)?;
-    check_equal(&text, &"[format]\nindent = 2\nfn_signature_width = 100\nspace_before_colon = false\nformat_function_headers = true\n")?;
+    check_equal(&text, &"[format]\nindent = 2\n")?;
     check_equal(
         &vx_config::parse_format_config(Path::new("vx-format.toml"), &text)?,
         &vx_config::FormatConfig::default(),
@@ -67,16 +67,9 @@ fn rejects_unsupported_print_modes_and_conflicting_arguments() -> Result<()> {
         vec!["--print-config"],
         vec!["--print-config", "unknown"],
         vec!["--print-config", "default", "--indent", "4"],
-        vec!["--print-config", "default", "--space-before-colon", "true"],
         vec!["--print-config", "default", "--config", "vx-format.toml"],
         vec!["--print-config", "default", "main.vx"],
         vec!["--print-config", "default", "--check"],
-        vec![
-            "--print-config",
-            "default",
-            "--format-function-headers",
-            "false",
-        ],
     ] {
         let output = formatter(directory.path(), &args)?;
         ensure!(!output.status.success(), "accepted {args:?}");
@@ -117,73 +110,6 @@ fn check_shows_unicode_and_missing_final_newlines() -> Result<()> {
     check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
     check_equal(&String::from_utf8(output.stdout)?, &"--- main.vx\n+++ main.vx (formatted)\n@@ -1,3 +1,3 @@\n fn message() -> i32 {\n-return \"café\";\n+  return \"café\";\n }\n\\ No newline at end of file\n")?;
     check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    Ok(())
-}
-
-#[test]
-fn signature_width_controls_wrapping_and_check_mode() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(
-        directory.path(),
-        "project",
-        Some("[format]\nindent = 4\nfn_signature_width = 39\n"),
-    )?;
-    let source = "fn add(first: i32, second: i32) -> i32 {\n  first + second\n}\n";
-    fs::write(project.join("main.vx"), source)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    let diff = String::from_utf8(output.stdout)?;
-    ensure!(diff.contains("@@ -1,3 +1,6 @@"), "{diff}");
-    ensure!(diff.contains("+    second: i32\n+) -> i32 {\n"), "{diff}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    let output = formatter(&project, &["main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    check_equal(
-        &fs::read_to_string(project.join("main.vx"))?,
-        &"fn add(\n    first: i32,\n    second: i32\n) -> i32 {\n    first + second\n}\n",
-    )?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    Ok(())
-}
-
-#[test]
-fn colon_spacing_configuration_and_cli_override_apply_in_both_modes() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(
-        directory.path(),
-        "project",
-        Some("[format]\nindent = 2\nspace_before_colon = true\n"),
-    )?;
-    let spaced = "fn value(x : i32) -> i32 {\n  x\n}\n";
-    let compact = "fn value(x: i32) -> i32 {\n  x\n}\n";
-    fs::write(project.join("main.vx"), compact)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &compact)?;
-    let output = formatter(&project, &["main.vx"])?;
-    ensure!(output.status.success(), "{output:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &spaced)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-
-    let output = formatter(
-        &project,
-        &["--check", "--space-before-colon", "false", "main.vx"],
-    )?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &spaced)?;
-    let output = formatter(&project, &["--space-before-colon", "false", "main.vx"])?;
-    ensure!(output.status.success(), "{output:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &compact)?;
-
-    fs::write(
-        project.join("vx-format.toml"),
-        "[format]\nindent = 2\nspace_before_colon = false\n",
-    )?;
-    let output = formatter(&project, &["--space-before-colon", "true", "main.vx"])?;
-    ensure!(output.status.success(), "{output:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &spaced)?;
     Ok(())
 }
 
@@ -336,113 +262,6 @@ fn configuration_errors_prevent_writes_to_every_input() -> Result<()> {
 }
 
 #[test]
-fn unsupported_syntax_warns_without_failing_or_writing() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(directory.path(), "project", None)?;
-    let source = "fn future(value: i32) -> i32 effects Read { value }\n";
-    fs::write(project.join("main.vx"), source)?;
-    for args in [vec!["--check", "main.vx"], vec!["main.vx"]] {
-        let output = formatter(&project, &args)?;
-        check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-        ensure!(output.stdout.is_empty(), "{output:?}");
-        let warnings = String::from_utf8(output.stderr)?;
-        ensure!(warnings.contains("WARN: main.vx:1:"), "{warnings}");
-        ensure!(warnings.contains("preserve"), "{warnings}");
-        check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    }
-    Ok(())
-}
-
-#[test]
-fn warnings_do_not_hide_supported_differences_in_the_same_file() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(directory.path(), "project", None)?;
-    let source =
-        "fn future() -> i32 {\nfuture_binding value;\n}\nfn known(value: i32) -> i32 {\nvalue\n}\n";
-    fs::write(project.join("main.vx"), source)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    ensure!(String::from_utf8_lossy(&output.stderr).contains("WARN: main.vx:1:"));
-    ensure!(
-        String::from_utf8_lossy(&output.stdout).contains("--- main.vx\n+++ main.vx (formatted)\n")
-    );
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    let output = formatter(&project, &["main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    let formatted = fs::read_to_string(project.join("main.vx"))?;
-    ensure!(formatted.starts_with("fn future() -> i32 {\nfuture_binding value;\n}\n"));
-    ensure!(
-        formatted.ends_with("fn known(value: i32) -> i32 {\n  value\n}\n"),
-        "{formatted}"
-    );
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    ensure!(String::from_utf8_lossy(&output.stderr).contains("WARN:"));
-    Ok(())
-}
-
-#[test]
-fn exclusions_do_not_hide_diffs_in_check_mode() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(directory.path(), "project", None)?;
-    let excluded = "// vx-format-begin: OFF\nfuture_binding value;\n// vx-format-end: OFF\n";
-    for source in [
-        format!("{excluded}fn   known(value:i32)->i32 {{\nreturn value;\n}}\n"),
-        format!("fn   known(value:i32)->i32 {{\n{excluded}return value;\n}}\n"),
-    ] {
-        fs::write(project.join("main.vx"), &source)?;
-        let output = formatter(&project, &["--check", "main.vx"])?;
-        check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-        ensure!(output.stderr.is_empty(), "{output:?}");
-        let diff = String::from_utf8(output.stdout)?;
-        ensure!(diff.contains("+fn known(value: i32) -> i32 {"), "{diff}");
-        ensure!(diff.contains("+  return value;"), "{diff}");
-        check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    }
-    Ok(())
-}
-
-#[test]
-fn disabled_headers_preserve_their_style_and_still_format_bodies() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(
-        directory.path(),
-        "project",
-        Some("[format]\nindent = 2\nfn_signature_width = 20\nformat_function_headers = false\n"),
-    )?;
-    let original = "fn   keep(a: i32, b : i32) -> i32 {\nreturn a;\n}\n";
-    let preserved = "fn   keep(a: i32, b : i32) -> i32 {\n  return a;\n}\n";
-    fs::write(project.join("main.vx"), original)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &original)?;
-    let output = formatter(&project, &["--space-before-colon", "true", "main.vx"])?;
-    ensure!(output.status.success(), "{output:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &preserved)?;
-    let output = formatter(&project, &["--check", "main.vx"])?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    ensure!(output.stdout.is_empty(), "{output:?}");
-    let output = formatter(
-        &project,
-        &["--check", "--format-function-headers", "true", "main.vx"],
-    )?;
-    check_equal(&output.status.code(), &Some(1)).with_context(|| format!("{output:?}"))?;
-    ensure!(String::from_utf8_lossy(&output.stdout).contains("+fn keep("));
-    fs::write(
-        project.join("vx-format.toml"),
-        "[format]\nindent = 2\nformat_function_headers = true\n",
-    )?;
-    let output = formatter(
-        &project,
-        &["--check", "--format-function-headers", "false", "main.vx"],
-    )?;
-    check_equal(&output.status.code(), &Some(0)).with_context(|| format!("{output:?}"))?;
-    ensure!(output.stdout.is_empty(), "{output:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &preserved)?;
-    Ok(())
-}
-
-#[test]
 fn repository_configuration_matches_hook_and_ci_formatting() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let project = project(
@@ -459,32 +278,5 @@ fn repository_configuration_matches_hook_and_ci_formatting() -> Result<()> {
     let write = formatter(&project, &["main.vx"])?;
     ensure!(write.status.success(), "{write:?}");
     check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    Ok(())
-}
-
-#[test]
-fn enabled_headers_preserve_contract_layout_in_check_and_write_modes() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let project = project(directory.path(), "project", None)?;
-    let source = "fn   check(n : i32) -> i32\nrequires n > 0\nensures return > 0 {\nreturn n;\n}\n";
-    let expected =
-        "fn check(n: i32) -> i32\nrequires n > 0\nensures return > 0 {\n  return n;\n}\n";
-    fs::write(project.join("main.vx"), source)?;
-    let check = formatter(
-        &project,
-        &["--check", "--format-function-headers", "true", "main.vx"],
-    )?;
-    check_equal(&check.status.code(), &Some(1)).with_context(|| format!("{check:?}"))?;
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &source)?;
-    let write = formatter(&project, &["--format-function-headers", "true", "main.vx"])?;
-    ensure!(write.status.success(), "{write:?}");
-    check_equal(&fs::read_to_string(project.join("main.vx"))?, &expected)?;
-    let check = formatter(
-        &project,
-        &["--check", "--format-function-headers", "true", "main.vx"],
-    )?;
-    check_equal(&check.status.code(), &Some(0)).with_context(|| format!("{check:?}"))?;
-    ensure!(check.stdout.is_empty(), "{check:?}");
-    ensure!(check.stderr.is_empty(), "{check:?}");
     Ok(())
 }

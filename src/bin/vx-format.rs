@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use vx_config::{default_format_config_toml, resolve_format_config, FormatConfig};
-use vxc::formatter::format_file_with_report;
+use vxc::formatter::format_file;
 
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
@@ -32,7 +32,7 @@ enum PrintConfig {
 #[command(author, version, about = "Vx Code Formatter")]
 struct Cli {
     /// Print built-in configuration as TOML without formatting files
-    #[arg(long, value_enum, conflicts_with_all = ["indent", "space_before_colon", "format_function_headers", "config", "files", "check"])]
+    #[arg(long, value_enum, conflicts_with_all = ["indent", "config", "files", "check"])]
     print_config: Option<PrintConfig>,
 
     /// Show formatting differences without modifying files
@@ -42,14 +42,6 @@ struct Cli {
     /// Override indentation width (defaults to two spaces without configuration)
     #[arg(long)]
     indent: Option<usize>,
-
-    /// Override spacing before single colons in function headers (true or false)
-    #[arg(long, action = clap::ArgAction::Set)]
-    space_before_colon: Option<bool>,
-
-    /// Enable or disable function header formatting (true or false)
-    #[arg(long, action = clap::ArgAction::Set)]
-    format_function_headers: Option<bool>,
 
     /// Configuration file for all inputs (otherwise discover vx-format.toml per input)
     #[arg(long)]
@@ -71,11 +63,7 @@ fn process_file(
         anyhow::bail!("File not found: {}", file_path);
     }
 
-    let outcome = format_file_with_report(content, config);
-    for warning in &outcome.warnings {
-        eprintln!("{}", warning.render(file_path, content));
-    }
-    let formatted = outcome.text;
+    let formatted = format_file(content, config.indent);
     let changed = formatted != content;
     if changed {
         if check {
@@ -91,7 +79,7 @@ fn process_file(
                 .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))?;
             println!("Formatted {}", file_path);
         }
-    } else if !check && outcome.warnings.is_empty() {
+    } else if !check {
         println!("Unchanged {}", file_path);
     }
     Ok(changed)
@@ -111,13 +99,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         .iter()
         .map(|file_path| {
             let path = Path::new(file_path);
-            let mut config = resolve_format_config(path, cli.config.as_deref(), cli.indent)?;
-            if let Some(space_before_colon) = cli.space_before_colon {
-                config.settings.space_before_colon = space_before_colon;
-            }
-            if let Some(format_function_headers) = cli.format_function_headers {
-                config.settings.format_function_headers = format_function_headers;
-            }
+            let config = resolve_format_config(path, cli.config.as_deref(), cli.indent)?;
             let content = fs::read_to_string(path)
                 .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))?;
             Ok((file_path, content, config.settings))
