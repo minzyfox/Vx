@@ -286,8 +286,9 @@ The following names describe proposed interfaces, not existing APIs:
 | `MacroDefinitionView` | Definition envelope, matcher and transcriber token trees, and opaque ownership boundaries. |
 | `OpaqueView` | A confidently bounded structure that remains unchanged. |
 
-The first version must cover the type spacing already handled by the signature formatter before claiming output compatibility.
-Opaque preservation is not an interchangeable implementation of that existing spacing policy.
+The prototype's signature formatter already handles a type-spacing policy that this branch does not implement.
+Compatibility with that prototype requires reproducing its policy rather than substituting opaque preservation.
+Introducing that policy changes behavior relative to the configuration-only baseline.
 Extend shared views when adding support for another construct.
 Do not add a new recognizer inside each formatting rule.
 
@@ -319,7 +320,8 @@ Do not identify the function body by taking the next brace or semicolon without 
 Treat macro token trees inside expressions as atomic owned ranges under the macro policy below.
 
 The width calculation must include every recognized header clause and its required separators.
-Initially reproduce the current complete-header layout policy, without introducing new clause-wrapping styles during the refactor.
+Record the prototype's complete-header layout policy separately from the configuration-only baseline.
+Introducing signature layout changes requires explicit behavior-change fixtures.
 Any new contract or constraint wrapping policy requires a separate behavior change and expected-output fixtures.
 Existing header-boundary bugs require separate correctness changes rather than reproducing a parsing error for compatibility.
 
@@ -334,9 +336,11 @@ If declaration boundaries cannot be established, preserve a larger enclosing str
 
 ### Minimum initial type support and compatibility
 
-The current signature formatter normalizes whitespace inside parameter and return types.
+The earlier signature-formatting prototype normalizes whitespace inside parameter and return types.
 For example, it turns `Tensor< f32, [2, 2] >` into `Tensor<f32, [2, 2]>`.
-Copying that type as an exact opaque span would change existing output during an architectural refactor.
+The configuration-only baseline does not implement that normalization.
+Introducing it in the follow-up engine changes formatting behavior and requires expected-output tests.
+Exact opaque preservation differs from the prototype's output, not from the configuration-only baseline.
 
 Before migrating a declaration, provide the following syntax and spacing support for every applicable type in that declaration:
 
@@ -350,9 +354,9 @@ Before migrating a declaration, provide the following syntax and spacing support
 | Function types, where accepted | Distinguish their parameter list from the enclosing declaration and retain current arrow spacing. |
 | Expressions within types, where accepted | Preserve their syntax and adjacency, including shifts and macro invocation boundaries. |
 
-Inventory actual accepted forms using the parser, current formatter, and baseline fixtures.
+Inventory actual accepted forms using the parser, prototype formatter, and prototype fixtures.
 This table is a migration minimum, not permission to claim unsupported grammar coverage.
-Behavioral parity must cover parameter types, return types, and generic declarations that the current rule formats.
+Prototype parity must cover parameter types, return types, and generic declarations that the prototype rule formats.
 
 Use three distinct ownership categories:
 
@@ -465,8 +469,10 @@ The function formatter keeps a flat declaration when it fits.
 Otherwise, it requests or selects the multiline parameter layout.
 Parameter and type formatters return nested layout instructions rather than editing the source separately.
 
-The existing `fn_signature_width` remains the declaration's preferred width.
-This migration does not introduce a global width setting or rename existing configuration.
+The prototype uses `fn_signature_width` as the declaration's preferred width.
+The configuration-only baseline supports only `indent` and rejects `fn_signature_width` as an unknown setting.
+The follow-up introduces the width setting and signature wrapping as explicit behavior changes.
+The proposal does not add a global width setting or rename the existing indentation setting.
 Unbreakable names and types can still exceed a preferred limit.
 
 Start with explicit flat and expanded alternatives.
@@ -627,6 +633,10 @@ The same principle applies to function calls when their formatting enters scope 
 
 ## Migration plan and gates
 
+These gates describe migration from the earlier token-rule prototype to syntax-owned formatting.
+Record configuration-only formatter output separately from prototype output.
+Signature wrapping and type-spacing normalization are behavior changes relative to the configuration-only baseline.
+
 | Step | Scope | Completion evidence |
 | --- | --- | --- |
 | 0. Establish a baseline | Run existing configuration, formatter, CLI, and framework tests when authorized. | Record actual results and required mutation checks; keep existing failures distinct. |
@@ -667,7 +677,7 @@ Required checks include:
 - Rejection of inserted spaces or newlines in `MustTouch` gaps and unsafe joins in `MustSeparate` gaps.
 - No silent repair of invalid separated shifts or macro names, and no shift classification based only on generic closing delimiters.
 - Preserved adjacency across child layouts, legacy handoffs, opaque boundaries, and final cleanup.
-- Type-spacing parity, including `Tensor< f32, [2, 2] >` becoming `Tensor<f32, [2, 2]>` on the compatible path.
+- Explicit type-spacing behavior-change fixtures, including `Tensor< f32, [2, 2] >` becoming `Tensor<f32, [2, 2]>`, plus prototype-parity checks.
 - Whole-declaration legacy fallback when a child type lacks compatible formatting support.
 - Complete-header fixtures for `on`, repeated `requires`, repeated `ensures`, and `where` constraints, including accepted combinations and order.
 - Clause expressions with nested delimiters, shifts, comments, and opaque macro children, without mistaking their delimiters for the function body.
@@ -715,7 +725,7 @@ Review these decisions before implementation:
 
 1. Is incremental source-preserving syntax recognition the preferred path over a complete syntax tree immediately?
 1. Which existing parser helpers can be reused without source transformations or semantic analysis?
-1. Does the minimum type coverage preserve all existing signature normalization, with whole-declaration legacy fallback for remaining forms?
+1. Does the minimum type coverage reproduce prototype signature normalization, with explicit behavior-change fixtures against the configuration-only baseline?
 1. Does eligibility cover the complete accepted header, with whole-header or whole-declaration fallback for unsupported clauses?
 1. Are macro invocation envelopes, trailing blocks, matchers, and transcribers opaque by default before ordinary declaration recognition?
 1. Is one owning formatter per syntax kind the intended extension model?
