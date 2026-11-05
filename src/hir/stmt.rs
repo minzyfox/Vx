@@ -47,6 +47,8 @@ pub(crate) struct InvariantLoop {
     next: Option<(crate::symbol::Symbol, Option<Expr>)>,
     /// Whether the body declares a variable with the name of the loop variable.
     hides_the_variable: bool,
+    /// An invariant can describe the loop's result only when every `break` preserves it.
+    break_invariants: Vec<bool>,
 }
 
 /// Where the checker proves a loop invariant, for its error.
@@ -546,6 +548,7 @@ impl<'a> TypeChecker<'a> {
             Statement::Break(b) => {
                 self.check_task_exit(&Statement::Break(b.clone()));
                 self.pointer_facts_at_break();
+                self.record_invariants_at_break();
                 self.drops_exit("break", &b.span, crate::hir::check::drops::ExitTo::Loop)
             }
             Statement::Continue(c) => {
@@ -817,21 +820,105 @@ impl<'a> TypeChecker<'a> {
         // In `let y = y + 1`, the `y` on the right is the old variable, and the fact
         // `y == y + 1` would be false. Each change of a `let mut` ends its facts. Its fact
         // must be one that the prover can model, so that no new program warns.
-        let recorded = !*_is_mut || crate::hir::prover::is_modelled(&value);
+        let recorded = if *_is_mut {
+            crate::hir::prover::is_modelled(&value)
+        } else {
+            let value = self.abstract_calls(&value, &mut 0, &mut Vec::new());
+            hir::prover::SmtProver::new()
+                .lower_term(&value, &|n| self.prover_int_type(n))
+                .is_ok()
+        };
         if recorded && !crate::hir::check::raw::expr_mentions(&value, name.as_ref()) {
-            let id_expr = Expr::Identifier(IdentifierExpr {
+            // A call can change its arguments. Re-evaluating it in a later proof would use
+            // their new values, not the values from when the result was returned.
+            if !matches!(&value, Expr::FunctionCall(_)) {
+                let id_expr = Expr::Identifier(IdentifierExpr {
+                    name: name.clone(),
+                    span: Span::default(),
+                });
+                let eq_expr = Expr::RelationalOp(RelationalOpExpr {
+                    lhs: Box::new(id_expr),
+                    op: RelationalOp::Eq,
+                    rhs: Box::new(value),
+                    span: Span::default(),
+                    operand_ty: None,
+                });
+                self.consteval.constraints.push(eq_expr);
+            }
+            self.keep_call_result_ensures(name, expr);
+        }
+    }
+
+    /// A returned number keeps its postconditions even when a later call changes an input
+    /// buffer. Retaining only `name == call(args)` would tie that number to the old buffer.
+    fn keep_call_result_ensures(&mut self, name: &crate::symbol::Symbol, value: &Expr) {
+        let Expr::FunctionCall(call) = crate::syntax::bare_unsafe_value(value) else {
+            return;
+        };
+        let callee = self
+            .env
+            .syntax_functions
+            .get(call.name.as_ref())
+            .copied()
+            .or_else(|| {
+                self.mono
+                    .functions
+                    .iter()
+                    .find(|(f, _)| f.name == call.name)
+                    .map(|(f, _)| f)
+            });
+        let Some(callee) = callee else {
+            return;
+        };
+        let changed: Vec<_> = call
+            .args
+            .iter()
+            .filter(|arg| {
+                matches!(arg, Expr::Borrow(b) if b.is_mut)
+                    || matches!(
+                        self.check_expr_type_probe(arg),
+                        Type::Borrow { is_mut: true, .. } | Type::Pointer(..) | Type::Ref(..)
+                    )
+            })
+            .filter_map(|arg| Self::arg_reborrow_base(arg).map(|(root, _)| root))
+            .collect();
+        let mut names: HashMap<_, _> = callee
+            .params
+            .iter()
+            .map(|(p, _)| p.clone())
+            .zip(
+                call.args
+                    .iter()
+                    .map(|a| crate::hir::prover::without_borrow(a).clone()),
+            )
+            .collect();
+        names.insert(
+            "return".into(),
+            Expr::Identifier(IdentifierExpr {
                 name: name.clone(),
                 span: Span::default(),
-            });
-            let eq_expr = Expr::RelationalOp(RelationalOpExpr {
-                lhs: Box::new(id_expr),
-                op: RelationalOp::Eq,
-                rhs: Box::new(value),
-                span: Span::default(),
-                operand_ty: None,
-            });
-            self.consteval.constraints.push(eq_expr);
-        }
+            }),
+        );
+        let facts: Vec<_> = callee
+            .ensures
+            .iter()
+            .filter(|e| crate::hir::check::atomic_contracts::is_prover_clause(e))
+            .map(|e| hir::prover::substitute_names(e, &names))
+            .filter(hir::prover::is_modelled)
+            .filter(|e| {
+                !changed
+                    .iter()
+                    .any(|root| crate::hir::check::raw::expr_mentions(e, root))
+            })
+            .filter(|e| {
+                let mut calls_again = false;
+                crate::syntax::visit_expr(e, &mut |part| {
+                    calls_again |= matches!(part, Expr::FunctionCall(_) | Expr::MethodCall(_));
+                });
+                !calls_again
+            })
+            .collect();
+        self.consteval.constraints.extend(facts);
     }
 
     /// Check a `for` loop: type the iterable, bind the induction variable's element type, prove
@@ -1259,6 +1346,7 @@ impl<'a> TypeChecker<'a> {
             scope: self.scopes.len() - 1,
             next: Some((iter.as_str().into(), next)),
             hides_the_variable: crate::hir::check::pointer_facts::body_declares(body, iter),
+            break_invariants: vec![true; invariants.len()],
         });
         self.check_loop_body(body, return_type, header);
         self.pointer_facts_after_a_loop(Some(pointers_at_head));
@@ -1271,7 +1359,10 @@ impl<'a> TypeChecker<'a> {
         if !self.branch_ends_early(body) {
             self.prove_invariants_for_the_next_pass(None);
         }
-        self.invariant_loops.pop();
+        let checked_loop = self
+            .invariant_loops
+            .pop()
+            .expect("the loop is being checked");
 
         let mut after = before.clone();
         let ran = self.run_loop_for_consteval(&mut after, |checker, env| {
@@ -1282,6 +1373,9 @@ impl<'a> TypeChecker<'a> {
 
         self.consteval.constraints.truncate(prev_constraints_len);
         self.pop_scope();
+        if across.is_none() && matches!(&**iterable, Expr::Range(_)) {
+            self.keep_loop_result_invariants(checked_loop);
+        }
         self.borrow.forget(&iterable_borrows);
     }
 
@@ -1471,6 +1565,46 @@ impl<'a> TypeChecker<'a> {
             .extend(invariants.iter().cloned());
     }
 
+    fn record_invariants_at_break(&mut self) {
+        let Some(lp) = self.invariant_loops.last() else {
+            return;
+        };
+        let invariants = lp.invariants.clone();
+        let local_names: Vec<_> = self.scopes[lp.scope..]
+            .iter()
+            .flat_map(|scope| scope.keys().cloned())
+            .collect();
+        let proven: Vec<_> = invariants
+            .iter()
+            .map(|inv| {
+                !local_names
+                    .iter()
+                    .any(|name| crate::hir::check::raw::expr_mentions(inv, name.as_ref()))
+                    && self.prove_expr(inv)
+            })
+            .collect();
+        let lp = self
+            .invariant_loops
+            .last_mut()
+            .expect("the loop is being checked");
+        for (kept, holds) in lp.break_invariants.iter_mut().zip(proven) {
+            *kept &= holds;
+        }
+    }
+
+    /// Only outer variables remain in scope after the loop. The induction variable of a
+    /// range loop needs a separate exit rule, so its invariants are not exported here.
+    fn keep_loop_result_invariants(&mut self, lp: InvariantLoop) {
+        for (inv, holds) in lp.invariants.into_iter().zip(lp.break_invariants) {
+            let names_iterator = lp.next.as_ref().is_some_and(|(name, _)| {
+                crate::hir::check::raw::expr_mentions(&inv, name.as_ref())
+            });
+            if holds && !names_iterator && crate::hir::prover::is_modelled(&inv) {
+                self.consteval.constraints.push(inv);
+            }
+        }
+    }
+
     fn check_loop_stmt(&mut self, lp: &mut LoopStmt, return_type: &Type) {
         let LoopStmt {
             body,
@@ -1511,6 +1645,7 @@ impl<'a> TypeChecker<'a> {
             scope: self.scopes.len() - 1,
             next: None,
             hides_the_variable: false,
+            break_invariants: vec![true; invariants.len()],
         });
         self.check_loop_body(body, return_type, header);
         self.pointer_facts_after_a_loop(None);
@@ -1521,7 +1656,10 @@ impl<'a> TypeChecker<'a> {
         if !self.branch_ends_early(body) {
             self.prove_invariants_for_the_next_pass(None);
         }
-        self.invariant_loops.pop();
+        let checked_loop = self
+            .invariant_loops
+            .pop()
+            .expect("the loop is being checked");
 
         let mut after = before.clone();
         let ran =
@@ -1531,6 +1669,7 @@ impl<'a> TypeChecker<'a> {
 
         self.consteval.constraints.truncate(prev_constraints_len);
         self.pop_scope();
+        self.keep_loop_result_invariants(checked_loop);
     }
 
     /// Check an assignment / compound assignment: type the LHS, then the RHS expecting the LHS
